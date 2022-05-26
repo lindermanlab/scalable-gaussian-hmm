@@ -7,16 +7,15 @@ import chex
 
 from kf.inference import partial_e_step, m_step
 
-from jax import vmap
 from functools import partial
-
+from jax import vmap
 import jax.numpy as np
 import jax.random as jr
+
 from ssm_jax.hmm.models import GaussianHMM
 from ssm_jax.hmm.inference import hmm_smoother
-from tensorflow_probability.substrates.jax.distributions import Dirichlet
 
-# Suppress JAX/TFD warning: ...`check_tpes` is deprecated... message
+# Suppress JAX/TFD warning: ...`check_dtpes` is deprecated... message
 import logging
 class CheckTypesFilter(logging.Filter):
     def filter(self, record):
@@ -25,6 +24,7 @@ class CheckTypesFilter(logging.Filter):
 logger = logging.getLogger()
 logger.addFilter(CheckTypesFilter())
 
+# -----------------------------------------------------------------------------
 
 def standard_e_step(hmm, emissions):
     return hmm_smoother(hmm.initial_probabilities,
@@ -32,6 +32,8 @@ def standard_e_step(hmm, emissions):
                         hmm.emission_distribution.log_prob(emissions[..., None, :]))
 
 def standard_m_step(posterior, emissions):
+    from tensorflow_probability.substrates.jax.distributions import Dirichlet
+
     # Initial distribution
     initial_probs = Dirichlet(1.0001 + posterior.smoothed_probs[0]).mode()
 
@@ -64,46 +66,147 @@ class TestPartialEM(chex.TestCase):
     def setUp(self):
         super().setUp()
 
-        num_states = 6
+        seed_1, seed_2 = jr.split(jr.PRNGKey(60322))
+
         emission_dim = 2
 
-        # Specify parameters of the HMM
-        initial_state_probs = np.ones(num_states) / num_states
-        transition_matrix = 0.95 * np.eye(num_states) \
-                            + 0.05 * np.roll(np.eye(num_states), 1, axis=1)
+        # -------------------------------
+        # Make a true HMM
+        # -------------------------------
+        true_num_states = 6
+
+        # Specify parameters
+        initial_state_probs = np.ones(true_num_states) / true_num_states
+        transition_matrix = 0.95 * np.eye(true_num_states) \
+                            + 0.05 * np.roll(np.eye(true_num_states), 1, axis=1)
         
         emission_means = np.column_stack([
-            np.cos(np.linspace(0, 2 * np.pi, num_states+1))[:-1],
-            np.sin(np.linspace(0, 2 * np.pi, num_states+1))[:-1]
+            np.cos(np.linspace(0, 2 * np.pi, true_num_states+1))[:-1],
+            np.sin(np.linspace(0, 2 * np.pi, true_num_states+1))[:-1]
         ])
-        emission_covs = np.tile(0.1**2 * np.eye(emission_dim), (num_states, 1, 1))
+        emission_covs = np.tile(0.1**2 * np.eye(emission_dim),
+                                (true_num_states, 1, 1))
 
         # Make a true HMM and sample
         true_hmm = GaussianHMM(initial_state_probs,
                                transition_matrix,
                                emission_means, 
                                emission_covs)
-        true_states, emissions = true_hmm.sample(jr.PRNGKey(60322), 5000)
+        true_states, emissions = true_hmm.sample(seed_1, 5000)
 
-        # self.true_hmm = true_hmm
         self.true_states = true_states
-        self.true_num_states = num_states
+        self.true_num_states = true_num_states
         self.emissions = emissions
+
+        # -------------------------------
+        num_states = 10
+        init_hmm = GaussianHMM.random_initialization(seed_2, num_states, emission_dim)
+        self.init_hmm = init_hmm
+        
         
     # @chex.variants(with_jit=True, without_jit=True)
     def testSingleStepEvenSplit(self):
-        num_states = 10
-        emission_dim = self.emissions.shape[-1]
-        init_hmm = GaussianHMM.random_initialization(jr.PRNGKey(381064),
-                                                     num_states, emission_dim)
-
-        # Standard EM
-        ref_hmm, _ = standard_em_step(init_hmm, self.emissions)
+        """All batches have the same number of obs, i.e. (M, T_M, D)
+        for M batches and T_M = num_obs // M"""
         
+        # Standard EM
+        ref_hmm, _ = standard_em_step(self.init_hmm, self.emissions)
+
+        # -------------------------------
         # This EM code
         num_batches = 5
         split_emissions = np.array(np.split(self.emissions, num_batches, axis=0))
-        weighted_suff_stats = vmap(partial(partial_e_step, init_hmm))(split_emissions)
+        
+        # ERROR: GaussianHMM object not recognized as pytree, even though it's registered.
+        # weighted_suff_stats = vmap(partial_e_step, (None, 0))(init_hmm, split_emissions)
+        # WORKAROUND:
+        from functools import partial
+        weighted_suff_stats = vmap(partial(partial_e_step, self.init_hmm))(split_emissions)
+        
+        test_hmm = m_step(*weighted_suff_stats)
+
+        # ----------------------------------------------------------------------
+        self.assertTrue(np.allclose(ref_hmm.emission_means,
+                                    test_hmm.emission_means,
+                                    atol=1e-3))
+        
+        self.assertTrue(np.allclose(ref_hmm.emission_covariance_matrices,
+                                    test_hmm.emission_covariance_matrices,
+                                    atol=1e-3))
+
+    def testSingleStepNearEvenSplit(self):
+        """Batches have non-identical (but similar) number of obs, i.e. (M, T_m, D)
+        for M batches and T_m is the number of obs for batch m.
+        
+        We use the np.array_split(arr, n) function, which returns a list of
+        arrays such that
+            - len(arr) % n subarrays have size len(arr)//n + 1, and
+            - the rest of the subarrays have size l//n
+        """
+        
+        # Standard EM
+        ref_hmm, _ = standard_em_step(self.init_hmm, self.emissions)
+        
+        # -------------------------------
+        # This EM code
+        num_batches = 6
+        i_tmp = len(self.emissions) % num_batches
+        split_emissions = np.array_split(self.emissions, num_batches, axis=0)
+
+        # 2 elements in list, each element has shape (m, K, D)
+        split_suff_stats = [
+                vmap(partial(partial_e_step, self.init_hmm))(np.array(e))       # vmap(partial(...)) is workaround
+                for e in [split_emissions[:i_tmp],split_emissions[i_tmp:]]
+        ]
+
+        # ss elements have shape (M, K, ...)
+        weighted_suff_stats = tuple([
+                np.concatenate([ss0, ss1], axis=0)
+                for ss0, ss1 in zip(*split_suff_stats)
+        ])
+        
+        test_hmm = m_step(*weighted_suff_stats)
+
+        # ----------------------------------------------------------------------
+        self.assertTrue(np.allclose(ref_hmm.emission_means,
+                                    test_hmm.emission_means,
+                                    atol=1e-2))
+        
+        self.assertTrue(np.allclose(ref_hmm.emission_covariance_matrices,
+                                    test_hmm.emission_covariance_matrices,
+                                    atol=1e-2))
+
+    def testSingleStepUnevenSplit(self):
+        """Batches have non-identical and not similiar number of obs, i.e. 
+        (M, T_m, D) for M batches and T_m is the number of obs for batch m.
+        
+        We use the np.array_split(arr, n) function, which returns a list of
+        arrays such that
+            - len(arr) % n subarrays have size len(arr)//n + 1, and
+            - the rest of the subarrays have size l//n
+        """
+        
+        # Standard EM
+        ref_hmm, _ = standard_em_step(self.init_hmm, self.emissions)
+        
+        # -------------------------------
+        # This EM code
+
+        # Results in 5 arrays with lengths (300, 930, 2748, 972, 50)
+        i_splits = np.array([300, 1230, 3978, 4950])
+
+        # M elements in list, each element has shape (K,D)
+        split_suff_stats = [
+                partial_e_step(self.init_hmm, e)
+                for e in np.split(self.emissions, i_splits, axis=0)
+        ]
+
+        # ss elements have shape (M, K, ...)
+        weighted_suff_stats = tuple([
+                np.stack(sss, axis=0)
+                for sss in zip(*split_suff_stats)
+        ])
+        
         test_hmm = m_step(*weighted_suff_stats)
 
         # ----------------------------------------------------------------------
