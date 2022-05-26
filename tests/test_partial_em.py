@@ -104,7 +104,7 @@ class TestPartialEM(chex.TestCase):
         self.init_hmm = init_hmm
         
         
-    # @chex.variants(with_jit=True, without_jit=True)
+    @chex.variants(with_jit=True, without_jit=True)
     def testSingleStepEvenSplit(self):
         """All batches have the same number of obs, i.e. (M, T_M, D)
         for M batches and T_M = num_obs // M"""
@@ -114,16 +114,18 @@ class TestPartialEM(chex.TestCase):
 
         # -------------------------------
         # This EM code
+        e_fn = self.variant(partial_e_step)
+        m_fn = self.variant(m_step)
+
+        # -------------
         num_batches = 5
         split_emissions = np.array(np.split(self.emissions, num_batches, axis=0))
         
         # ERROR: GaussianHMM object not recognized as pytree, even though it's registered.
         # weighted_suff_stats = vmap(partial_e_step, (None, 0))(init_hmm, split_emissions)
-        # WORKAROUND:
-        from functools import partial
-        weighted_suff_stats = vmap(partial(partial_e_step, self.init_hmm))(split_emissions)
+        weighted_suff_stats = vmap(partial(e_fn, self.init_hmm))(split_emissions)
         
-        test_hmm = m_step(*weighted_suff_stats)
+        test_hmm = m_fn(*weighted_suff_stats)
 
         # ----------------------------------------------------------------------
         self.assertTrue(np.allclose(ref_hmm.emission_means,
@@ -134,6 +136,7 @@ class TestPartialEM(chex.TestCase):
                                     test_hmm.emission_covariance_matrices,
                                     atol=1e-3))
 
+    @chex.variants(with_jit=True, without_jit=True)
     def testSingleStepNearEvenSplit(self):
         """Batches have non-identical (but similar) number of obs, i.e. (M, T_m, D)
         for M batches and T_m is the number of obs for batch m.
@@ -149,13 +152,17 @@ class TestPartialEM(chex.TestCase):
         
         # -------------------------------
         # This EM code
+        e_fn = self.variant(partial_e_step)
+        m_fn = self.variant(m_step)
+
+        # -------------
         num_batches = 6
         i_tmp = len(self.emissions) % num_batches
         split_emissions = np.array_split(self.emissions, num_batches, axis=0)
 
         # 2 elements in list, each element has shape (m, K, D)
         split_suff_stats = [
-                vmap(partial(partial_e_step, self.init_hmm))(np.array(e))       # vmap(partial(...)) is workaround
+                vmap(partial(e_fn, self.init_hmm))(np.array(e))       # vmap(partial(...)) is workaround
                 for e in [split_emissions[:i_tmp],split_emissions[i_tmp:]]
         ]
 
@@ -165,7 +172,7 @@ class TestPartialEM(chex.TestCase):
                 for ss0, ss1 in zip(*split_suff_stats)
         ])
         
-        test_hmm = m_step(*weighted_suff_stats)
+        test_hmm = m_fn(*weighted_suff_stats)
 
         # ----------------------------------------------------------------------
         self.assertTrue(np.allclose(ref_hmm.emission_means,
@@ -176,6 +183,7 @@ class TestPartialEM(chex.TestCase):
                                     test_hmm.emission_covariance_matrices,
                                     atol=1e-2))
 
+    @chex.variants(with_jit=True, without_jit=True)
     def testSingleStepUnevenSplit(self):
         """Batches have non-identical and not similiar number of obs, i.e. 
         (M, T_m, D) for M batches and T_m is the number of obs for batch m.
@@ -191,13 +199,16 @@ class TestPartialEM(chex.TestCase):
         
         # -------------------------------
         # This EM code
+        e_fn = self.variant(partial_e_step)
+        m_fn = self.variant(m_step)
 
+        # -------------
         # Results in 5 arrays with lengths (300, 930, 2748, 972, 50)
         i_splits = np.array([300, 1230, 3978, 4950])
 
         # M elements in list, each element has shape (K,D)
         split_suff_stats = [
-                partial_e_step(self.init_hmm, e)
+                e_fn(self.init_hmm, e)
                 for e in np.split(self.emissions, i_splits, axis=0)
         ]
 
@@ -207,7 +218,7 @@ class TestPartialEM(chex.TestCase):
                 for sss in zip(*split_suff_stats)
         ])
         
-        test_hmm = m_step(*weighted_suff_stats)
+        test_hmm = m_fn(*weighted_suff_stats)
 
         # ----------------------------------------------------------------------
         self.assertTrue(np.allclose(ref_hmm.emission_means,
