@@ -1,7 +1,7 @@
 import jax.numpy as np
 
 from ssm_jax.hmm.models import GaussianHMM                                      # probml/ssm-jax : https://github.com/probml/ssm-jax
-from ssm_jax.hmm.inference import hmm_smoother, HMMPosterior
+from ssm_jax.hmm.inference import hmm_smoother
 
 from tensorflow_probability.substrates.jax.distributions import Dirichlet
 
