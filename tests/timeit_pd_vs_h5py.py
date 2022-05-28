@@ -2,6 +2,7 @@
 
 import timeit
 
+import os
 from os import listdir
 from os.path import join, isfile
 
@@ -9,7 +10,7 @@ import pandas as pd
 import h5py
 import numpy as np
 
-DATAPATH = '/home/libi/killifish/data/fish0_137/'
+DATAPATH = join(os.environ['DATAPATH'], 'fish0_137')
 filenames = sorted([
         f for f in listdir(DATAPATH) if isfile(join(DATAPATH, f))
     ])
