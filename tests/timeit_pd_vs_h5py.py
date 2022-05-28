@@ -10,7 +10,7 @@ import pandas as pd
 import h5py
 import numpy as np
 
-DATAPATH = join(os.environ['DATAPATH'], 'fish0_137')
+DATAPATH = join(os.environ['DATADIR'], 'fish0_137')
 filenames = sorted([
         f for f in listdir(DATAPATH) if isfile(join(DATAPATH, f))
     ])

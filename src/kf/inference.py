@@ -28,7 +28,7 @@ def partial_e_step(hmm: GaussianHMM, emissions: np.ndarray):
             hmm_smoother(hmm.initial_probabilities, hmm.transition_matrix, lps)
 
     # Compute expected sufficient statistics
-    w_sum = posterior.smoothed_probs.sum(axis=0)                                # shape (K,)                                           # sum_i w_i, shape (K,)
+    w_sum = posterior.smoothed_probs.sum(axis=0)                                # shape (K,). sum_i w_i, shape (K,)
     weights = posterior.smoothed_probs / w_sum                                  # shape (T,K)
 
     weighted_Ex = np.einsum('tk, ti->ki', weights, emissions)
