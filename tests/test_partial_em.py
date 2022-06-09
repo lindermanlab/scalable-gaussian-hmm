@@ -77,21 +77,19 @@ class TestPartialEM(chex.TestCase):
         """All batches have the same number of obs, i.e. (M, T_M, D)
         for M batches and T_M = num_obs // M"""
         
-        e_fn = self.variant(sharded_e_step)
-        m_fn = self.variant(collective_m_step)
-
         def _em_step(hmm, split_emissions):
             # Since we vmap'd arrays directly, results in a single SuffStats
             # instance with batch shape (M,...). No addt'l transforms req'd.
-            normd_suff_stats = vmap(partial(e_fn, hmm))(split_emissions)
+            normd_suff_stats = vmap(partial(sharded_e_step, hmm))(split_emissions)
             
-            new_hmm = m_fn(normd_suff_stats)
+            new_hmm = collective_m_step(normd_suff_stats)
 
             return new_hmm, normd_suff_stats
+        em_step = self.variant(_em_step)
 
         num_batches = 5
         split_emissions = np.array(np.split(self.emissions, num_batches, axis=0))
-        test_hmm, test_nss = _em_step(self.init_hmm, split_emissions)
+        test_hmm, test_nss = em_step(self.init_hmm, split_emissions)
 
         # ----------------------------------------------------------------------
 
@@ -116,27 +114,25 @@ class TestPartialEM(chex.TestCase):
             - len(arr) % n subarrays have size len(arr)//n + 1, and
             - the rest of the subarrays have size l//n
         """
-        
-        e_fn = self.variant(sharded_e_step)
-        m_fn = self.variant(collective_m_step)
-
         def _em_step(hmm, split_emissions):
             # Since we vmap'd, each SuffStats class has batch shape (m,...).
             # So, concatenate together, resulting in instance with batch shape (M,...)
-            normd_suff_stats_list = \
-                [vmap(partial(e_fn, hmm))(np.array(se)) for se in split_emissions]
+            e_step = partial(sharded_e_step, hmm)
+            _normd_suff_stats = \
+                [vmap(e_step)(np.array(se)) for se in split_emissions]
             normd_suff_stats = \
-                reduce(NormalizedGaussianHMMSuffStats.concat, normd_suff_stats_list)
+                reduce(NormalizedGaussianHMMSuffStats.concat, _normd_suff_stats)
             
-            new_hmm = m_fn(normd_suff_stats)
+            new_hmm = collective_m_step(normd_suff_stats)
 
             return new_hmm, normd_suff_stats
-        
+        em_step = self.variant(_em_step)
+
         num_batches = 6
         i_tmp = len(self.emissions) % num_batches
         split_emissions = np.array_split(self.emissions, num_batches, axis=0)
 
-        test_hmm, test_nss = _em_step(self.init_hmm,
+        test_hmm, test_nss = em_step(self.init_hmm,
                                       [split_emissions[:i_tmp], split_emissions[i_tmp:]])
 
         # ---------------------------------------------------------------------
@@ -164,19 +160,17 @@ class TestPartialEM(chex.TestCase):
             - the rest of the subarrays have size l//n
         """
         
-        e_fn = self.variant(sharded_e_step)
-        m_fn = self.variant(collective_m_step)
-
         def _em_step(hmm, split_emissions):
             # Each SuffStats class has leading shape (K,...) and not (batch, K,...)
             # since we didn't vmap or pmap it. So, stack them together.
-            normd_suff_stats_list = [e_fn(hmm, se) for se in split_emissions]
+            _normd_suff_stats = [sharded_e_step(hmm, se) for se in split_emissions]
             normd_suff_stats = \
-                NormalizedGaussianHMMSuffStats.stack(normd_suff_stats_list)
+                NormalizedGaussianHMMSuffStats.stack(_normd_suff_stats)
             
-            new_hmm = m_fn(normd_suff_stats)
+            new_hmm = collective_m_step(normd_suff_stats)
 
             return new_hmm, normd_suff_stats
+        em_step = self.variant(_em_step)
 
         # Split emissions into 5 (len(i_splits)+1) arrays,
         # of lengths (300, 930, 2748, 972, 50)
@@ -184,7 +178,7 @@ class TestPartialEM(chex.TestCase):
         split_emissions = np.split(self.emissions, i_splits, axis=0)
         num_batches = len(split_emissions)
 
-        test_hmm, test_nss = _em_step(self.init_hmm, split_emissions)
+        test_hmm, test_nss = em_step(self.init_hmm, split_emissions)
 
         # ----------------------------------------------------------------------
         self.assertTrue(np.all(get_leading_dim(test_nss)==num_batches))
