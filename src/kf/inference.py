@@ -1,10 +1,29 @@
 import chex
 import jax.numpy as np
+from jax import tree_map
 
 from ssm_jax.hmm.models import GaussianHMM                                      # probml/ssm-jax : https://github.com/probml/ssm-jax
 from ssm_jax.hmm.inference import hmm_smoother
 
+from functools import reduce
+
 from tensorflow_probability.substrates.jax.distributions import Dirichlet
+
+# ==============================================================================
+# Distributed full-batch EM steps
+# E-step computation is parallelized across multiple processors, then
+# normalized sufficient statistics are combined in M-step
+#
+#   def em_step(hmm, emissions):
+#       posterior = fullbatch_e_step(hmm, emissions)
+#       hmm = fullbatch_m_step(posterior, emissions)
+#       return hmm, posterior
+# ------------------------------------------------------------------------------
+def add_batch_axis(arr, event_ndim):
+    """Add leading batch dim axis if not there."""
+    # np.expand(arr, axis=0) if arr.ndim == event_ndim
+    # np.reshape(...)
+    pass
 
 @chex.dataclass
 class NormalizedGaussianHMMSuffStats:
@@ -16,12 +35,18 @@ class NormalizedGaussianHMMSuffStats:
     normd_ExxT: chex.Array          # shape (K,D,D)
 
     @classmethod
-    def concat(cls, a, b):
+    def concat(cls, a, b, axis=0):
         """Concatenates instances a and b into a new instance of the class."""
         return cls(
-            **{k: np.concatenate([a[k], b[k]], axis=0)
+            **{k: np.concatenate([a[k], b[k]], axis=axis)
                for k in cls.__dataclass_fields__.keys()}
         )
+
+    @classmethod
+    def stack(cls, ss_seq, axis=0):
+        """Stack a sequence of class objects along new axis."""
+        _ss_seq = tree_map(lambda arr: np.expand_dims(arr, axis=axis), ss_seq)
+        return reduce(cls.concat, _ss_seq)
 
 def sharded_e_step(hmm: GaussianHMM, emissions: chex.Array) -> NormalizedGaussianHMMSuffStats:
     """Computes posterior expected sufficient stats given partial batch of emissions.
@@ -146,6 +171,43 @@ def m_step(initial_state_probs, transition_counts, ws, weighted_Ex, weighted_Exx
 
     # Pack the results into a new GaussianHMM
     return GaussianHMM(initial_state_prob,
+                       transition_matrix,
+                       emission_means,
+                       emission_covs)
+
+# ==============================================================================
+# "Standard" full-batch EM steps
+#
+#   def em_step(hmm, emissions):
+#       posterior = fullbatch_e_step(hmm, emissions)
+#       hmm = fullbatch_m_step(posterior, emissions)
+#       return hmm, posterior
+# ------------------------------------------------------------------------------
+def fullbatch_e_step(hmm, emissions):
+    return hmm_smoother(hmm.initial_probabilities,
+                        hmm.transition_matrix,
+                        hmm.emission_distribution.log_prob(emissions[..., None, :]))
+
+def fullbatch_m_step(posterior, emissions):
+    # Initial distribution
+    initial_probs = Dirichlet(1.0001 + posterior.smoothed_probs[0]).mode()
+
+    # Transition distribution
+    transition_matrix = Dirichlet(
+        1.0001 + np.einsum('tij->ij', posterior.smoothed_transition_probs)).mode()
+
+    # Gaussian emission distribution
+    w_sum = np.einsum('tk->k', posterior.smoothed_probs)
+    x_sum = np.einsum('tk, ti->ki', posterior.smoothed_probs, emissions)
+    xxT_sum = np.einsum('tk, ti, tj->kij', posterior.smoothed_probs, emissions, emissions)
+
+    emission_means = x_sum / w_sum[:, None]
+    emission_covs = xxT_sum / w_sum[:, None, None] \
+        - np.einsum('ki,kj->kij', emission_means, emission_means) \
+        + 1e-4 * np.eye(emissions.shape[1])
+    
+    # Pack the results into a new GaussianHMM
+    return GaussianHMM(initial_probs,
                        transition_matrix,
                        emission_means,
                        emission_covs)
