@@ -13,17 +13,18 @@ from tensorflow_probability.substrates.jax.distributions import Dirichlet
 # Distributed full-batch EM steps
 # E-step computation is parallelized across multiple processors, then
 # normalized sufficient statistics are combined in M-step
+# Actual `em_step` which differ based on how emissions are split and thus how
+# normalized sufficient stats should be combined so that all elements have
+# leading batch shape (n_splits, n_hmm_states, ...). Here, no recombination
+# is required.
 #
-#   def em_step(hmm, emissions):
-#       posterior = fullbatch_e_step(hmm, emissions)
-#       hmm = fullbatch_m_step(posterior, emissions)
-#       return hmm, posterior
+#   def em_step(hmm, split_emissions):
+#       # Do this b/c GaussianHMM doesn't register as pytree correctly yet
+#       _e_step = partial(sharded_e_step, hmm)
+#       nss = pmap(_e_step)(split_emissions)
+#       hmm = fullbatch_m_step(nss)
+#       return hmm, nss
 # ------------------------------------------------------------------------------
-def add_batch_axis(arr, event_ndim):
-    """Add leading batch dim axis if not there."""
-    # np.expand(arr, axis=0) if arr.ndim == event_ndim
-    # np.reshape(...)
-    pass
 
 @chex.dataclass
 class NormalizedGaussianHMMSuffStats:
