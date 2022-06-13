@@ -23,8 +23,8 @@ filenames = sorted([
 ])
 
 class TestPCDataset(chex.TestCase):
-    def testPCDataset(self):
-        ds = FishPCDataset(fish_name, DATADIR)
+    def testDataset(self):
+        ds = FishPCDataset(fish_name, DATADIR, min_num_frames=0)
 
         # Length of num_frames list should equal "length" of dataset
         self.assertTrue(len(ds.num_frames)==len(ds))
@@ -54,6 +54,48 @@ class TestPCDataset(chex.TestCase):
         ])
 
         self.assertTrue(np.allclose(arr42[frames,:], true_arr, atol=1e-6))
+
+    def testDataSubsetIndex(self):
+        """Specify index range of files to use."""
+
+        i_range = (10, 15)
+        fnames_ref = ['p3_fish0_137_20210126.h5',
+                      'p3_fish0_137_20210127.h5', 
+                      'p3_fish0_137_20210128.h5', 
+                      'p3_fish0_137_20210129.h5', 
+                      'p3_fish0_137_20210130.h5',]
+
+        ds = FishPCDataset(fish_name, DATADIR,
+                           data_subset=i_range, min_num_frames=0)
+        self.assertTrue(len(ds) == len(fnames_ref),
+                        f'Expected {len(fnames_ref)}, got {len(ds)}')
+        self.assertTrue(ds.filenames == fnames_ref,
+                        'Files and/or file ordering in dataset do not exactly match expected values. ' \
+                        + f'Got {ds.filenames}')
+
+    def testDataSubsetFilename(self):
+        """Specify filenames in non-sequential order and some that do not exist."""
+        
+        fnames_input = ['p3_fish0_137_20210413.h5', 
+                        'p3_fish0_137_20210311.h5',     # Does not exist
+                        'p3_fish0_137_20210205.h5', 
+                        'p3_fish0_137_20210811.h5',
+                        'p3_fish0_137_20210129.h5',
+                        'p3_fish0_137_20210606.h5',]
+        
+        fnames_ref = ['p3_fish0_137_20210129.h5',
+                      'p3_fish0_137_20210205.h5', 
+                      'p3_fish0_137_20210413.h5', 
+                      'p3_fish0_137_20210606.h5', 
+                      'p3_fish0_137_20210811.h5']
+
+        ds = FishPCDataset(fish_name, DATADIR,
+                           data_subset=fnames_input, min_num_frames=0)
+        self.assertTrue(len(ds) == len(fnames_ref),
+                        f'Expected {len(fnames_ref)}, got {len(ds)}')
+        self.assertTrue(ds.filenames == fnames_ref,
+                        'Files and/or file ordering in dataset do not exactly match expected values. ' \
+                        + f'Got {ds.filenames}')
 
 if __name__ == '__main__':
     absltest.main()
