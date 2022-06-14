@@ -4,6 +4,7 @@ from os import listdir
 from os.path import join, split, isfile
 
 import chex
+import warnings
 
 import h5py
 import jax.numpy as np
@@ -196,13 +197,11 @@ class FishPCDataloader():
         self.batch_size = batch_size
         self.num_days_per_batch = num_days_per_batch                            # "batch_size", but renamed for clarity
 
-        print("WARNING: Hard-setting `uniform_batch_size=True`")
+        warnings.warn('Forcing `uniform_batch_size=True`.')
         uniform_batch_size = True
         # See how this variable is used in `collate` function
-        # self.num_frames_per_day = np.min(dataset.num_frames) \
-        #                           if uniform_batch_size else -1
-        print("WARNING: Hard-setting `num_frames_per_day=200`. Remove once done debugging")
-        self.num_frames_per_day = 200
+        self.num_frames_per_day = np.min(dataset.num_frames) \
+                                  if uniform_batch_size else -1
 
         self.drop_last = True if uniform_batch_size else drop_last
 

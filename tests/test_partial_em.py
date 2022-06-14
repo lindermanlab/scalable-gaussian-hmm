@@ -5,7 +5,8 @@ jax.config.update('jax_platform_name', 'cpu')
 from absl.testing import absltest
 import chex
 
-from kf.inference import (sharded_e_step, collective_m_step, NormalizedGaussianHMMSuffStats,
+from kf.inference import (sharded_e_step, collective_m_step,
+                          NormalizedGaussianHMMSuffStats as NGSS,
                           fullbatch_e_step, fullbatch_m_step)
 
 from functools import partial, reduce
@@ -14,7 +15,6 @@ import jax.numpy as np
 import jax.random as jr
 
 from ssm_jax.hmm.models import GaussianHMM
-from ssm_jax.hmm.inference import hmm_smoother
 
 # Suppress JAX/TFD warning: ...`check_dtypes` is deprecated... message
 import logging
@@ -32,7 +32,7 @@ def fullbatch_em_step(hmm: GaussianHMM, emissions: chex.Array):
     hmm = fullbatch_m_step(posterior, emissions)
     return hmm, posterior
 
-def get_leading_dim(nss: NormalizedGaussianHMMSuffStats) -> chex.Array:
+def get_leading_dim(nss: NGSS) -> chex.Array:
     return np.array([len(nss[k]) for k in nss.__dataclass_fields__.keys()])
     
 class TestPartialEM(chex.TestCase):
@@ -120,8 +120,7 @@ class TestPartialEM(chex.TestCase):
             e_step = partial(sharded_e_step, hmm)
             _normd_suff_stats = \
                 [vmap(e_step)(np.array(se)) for se in split_emissions]
-            normd_suff_stats = \
-                reduce(NormalizedGaussianHMMSuffStats.concat, _normd_suff_stats)
+            normd_suff_stats = reduce(NGSS.concat, _normd_suff_stats)
             
             new_hmm = collective_m_step(normd_suff_stats)
 
@@ -164,8 +163,7 @@ class TestPartialEM(chex.TestCase):
             # Each SuffStats class has leading shape (K,...) and not (batch, K,...)
             # since we didn't vmap or pmap it. So, stack them together.
             _normd_suff_stats = [sharded_e_step(hmm, se) for se in split_emissions]
-            normd_suff_stats = \
-                NormalizedGaussianHMMSuffStats.stack(_normd_suff_stats)
+            normd_suff_stats = NGSS.stack(_normd_suff_stats)
             
             new_hmm = collective_m_step(normd_suff_stats)
 
