@@ -1,7 +1,7 @@
 # Helper classes for managing killifish data
 
 from os import listdir
-from os.path import join, isfile, abspath
+from os.path import join, split, isfile
 
 import chex
 
@@ -23,29 +23,28 @@ class FishPCDataset():
         - pandas.read_hdf(...)  1min 43 s +/- 24.7 s
     
     Parameters:
-        fish_name: str
+        name: str
             Name of fish-specific directory
         data_dir: str
             Path to directory contain data
-        min_num_frames: int, default 1.7M.
-            If a recording day has fewer than this many frames, omit. Default
-            value derived from ~20 Hz x 60 s/min x 60 min/hr x 24 hr/day
-        data_range: See options
+        data_subset: See options below
             - Load all data: 'all'
             - Load range of data: (i_start, i_end)
             - Load specified files: [fname_0, fname_1, ...]
+        min_num_frames: int, default 1.7M.
+            If a recording day has fewer than this many frames, omit. Default
+            value derived from ~20 Hz x 60 s/min x 60 min/hr x 24 hr/day
+            NB: file removal is performed AFTER subsetting into directory, so
+            if, for example, data_subset=(i_start, i_end), len(self) may be
+            less than (i_end - i_start - 1).
     """
 
-    def __init__(self, fish_name: str, data_dir: str,
-                 min_num_frames: int=1700000, data_subset='all'
+    def __init__(self, name: str, data_dir: str,
+                 data_subset='all', min_num_frames: int=1700000
                  ):
-        self.name = fish_name
+        self.name = name
 
-        self._dir = join(data_dir, fish_name)
-        # self.filepaths = sorted([
-        #     join(self._dir, f)
-        #     for f in listdir(self._dir) if isfile(join(self._dir, f))
-        # ])
+        self._dir = join(data_dir, name)
         self.filenames = sorted([
             f for f in listdir(self._dir) if isfile(join(self._dir, f))
         ])
@@ -77,6 +76,7 @@ class FishPCDataset():
         ])
         
         # Remove recording days with not enough frames
+        self.min_num_frames = min_num_frames
         if min_num_frames:
             i_keep = (self._num_frames >= min_num_frames)
             self.filenames = [
@@ -142,11 +142,21 @@ class FishPCDataset():
         num_train = num_train if num_train else int(frac_train * len(self))
         num_test = num_test if num_test else int(frac_test * len(self))
 
-        raise NotImplementedError
-        if seed:
-            # Permute
-            pass
+        i_full = np.arange(len(self))
+        if seed is not None:
+            i_full = jr.permutation(seed, i_full)
 
+        # Split dataset by filenames
+        f_train = [self.filenames[i] for i in i_full[0:num_train]]
+        f_test  = [self.filenames[i] for i in i_full[num_train:num_train+num_test]]
+
+        _data_dir = split(self._dir)[0]
+        train_dataset = FishPCDataset(self.name, _data_dir,
+                                      data_subset=f_train,
+                                      min_num_frames=self.min_num_frames)
+        test_dataset  = FishPCDataset(self.name, _data_dir,
+                                      data_subset=f_test,
+                                      min_num_frames=self.min_num_frames)
         return train_dataset, test_dataset
 
 

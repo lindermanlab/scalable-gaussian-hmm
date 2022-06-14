@@ -9,6 +9,7 @@ import chex
 from kf.data_utils import FishPCDataset
 
 import jax.numpy as np
+import jax.random as jr
 
 import os
 from os import listdir
@@ -96,6 +97,75 @@ class TestPCDataset(chex.TestCase):
         self.assertTrue(ds.filenames == fnames_ref,
                         'Files and/or file ordering in dataset do not exactly match expected values. ' \
                         + f'Got {ds.filenames}')
+
+    def testTrainTestSplit(self,):
+        """Split dataset into train and test subsets, deterministic."""
+        
+        # First 5 files and 6th file, respectively
+        train_ref = ['p3_fish0_137_20210116.h5',
+                     'p3_fish0_137_20210117.h5',
+                     'p3_fish0_137_20210118.h5',
+                     'p3_fish0_137_20210119.h5',
+                     'p3_fish0_137_20210120.h5',]
+        test_ref  = ['p3_fish0_137_20210121.h5']
+
+        ds = FishPCDataset(fish_name, DATADIR, data_subset='all', min_num_frames=0)
+        # --------------------
+        # Specify via integers
+        num_train = 5
+        num_test = 1
+        train_ds, test_ds = ds.train_test_split(num_train=num_train, num_test=num_test)
+
+        self.assertTrue(len(train_ds) == num_train)
+        self.assertTrue(len(test_ds) == num_test)
+
+        self.assertTrue(train_ds.filenames == train_ref)
+        self.assertTrue(test_ds.filenames == test_ref)
+
+        # -----------------------------------
+        # Specify via mix of frac and integer. Value of frac_train specified 
+        # such that int(207 * 0.025) ==5, so we can reuse above references
+        frac_train = 0.025 
+        train_ds, test_ds = ds.train_test_split(frac_train=frac_train, num_test=num_test)
+        self.assertTrue(train_ds.filenames == train_ref)
+        self.assertTrue(test_ds.filenames == test_ref)
+
+    def testTrainTestSplitRandom(self,):
+        """Split dataset into train and test subsets, randomized."""
+
+        seed = jr.PRNGKey(519)
+
+        # First 5 files and 6th file, respectively
+        # In this test, make sure that datasets are NOT these files
+        train_ref = ['p3_fish0_137_20210116.h5',
+                     'p3_fish0_137_20210117.h5',
+                     'p3_fish0_137_20210118.h5',
+                     'p3_fish0_137_20210119.h5',
+                     'p3_fish0_137_20210120.h5',]
+        test_ref  = ['p3_fish0_137_20210121.h5']
+
+        ds = FishPCDataset(fish_name, DATADIR, data_subset='all', min_num_frames=0)
+        # --------------------
+        # Specify via integers
+        num_train = 5
+        num_test = 1
+        train_ds, test_ds = \
+            ds.train_test_split(num_train=num_train, num_test=num_test, seed=seed)
+
+        self.assertTrue(len(train_ds) == num_train)
+        self.assertTrue(len(test_ds) == num_test)
+
+        self.assertTrue(train_ds.filenames != train_ref)
+        self.assertTrue(test_ds.filenames != test_ref)
+
+        # -----------------------------------
+        # Specify via mix of frac and integer. Value of frac_train specified 
+        # such that int(207 * 0.025) ==5, so we can reuse above references
+        frac_train = 0.025 
+        train_ds, test_ds = ds.train_test_split(
+            frac_train=frac_train, num_test=num_test, seed=seed)
+        self.assertTrue(train_ds.filenames != train_ref)
+        self.assertTrue(test_ds.filenames != test_ref)
 
 if __name__ == '__main__':
     absltest.main()
