@@ -3,11 +3,36 @@ import jax.numpy as np
 from jax import tree_map
 
 from ssm_jax.hmm.models import GaussianHMM                                      # probml/ssm-jax : https://github.com/probml/ssm-jax
-from ssm_jax.hmm.inference import hmm_smoother
+from ssm_jax.hmm.inference import (hmm_smoother as _hmm_smoother,
+                                   HMMPosterior as _HMMPosterior,
+                                   _compute_sum_transition_probs,)
 
 from functools import reduce
 
 from tensorflow_probability.substrates.jax.distributions import Dirichlet
+
+@chex.dataclass
+class HMMPosterior(_HMMPosterior):
+    """Adds `smoothed_transition_probs_sum` to field.
+    
+    This field was removed from the dataclass 5/27/22, commit 29b59362e3b5454d91dde32862f76511bf600b3a.
+    """
+    smoothed_transition_probs_sum: chex.Array = None    # shape (K,K)
+
+def hmm_smoother(initial_distributions, transition_matrix, log_likelihoods):
+    """Returns HMMPosterior with `smoothed_transition_probs_sum` field."""
+
+    _posterior =  \
+        _hmm_smoother(initial_distributions, transition_matrix, log_likelihoods)
+    
+    smoothed_transition_probs_sum = \
+                    _compute_sum_transition_probs(transition_matrix, _posterior)
+
+    return HMMPosterior(marginal_loglik=_posterior.marginal_loglik,
+                        filtered_probs=_posterior.filtered_probs,
+                        predicted_probs=_posterior.predicted_probs,
+                        smoothed_probs=_posterior.smoothed_probs,
+                        smoothed_transition_probs_sum=smoothed_transition_probs_sum)
 
 # ==============================================================================
 # Distributed full-batch EM steps
@@ -73,7 +98,7 @@ def sharded_e_step(hmm: GaussianHMM, emissions: chex.Array) -> NormalizedGaussia
                               normd_weights, emissions, emissions)
 
     init_state_probs = posterior.smoothed_probs[0]
-    transition_probs = posterior.smoothed_transition_probs.sum(axis=0)
+    transition_probs = posterior.smoothed_transition_probs_sum
     
     return NormalizedGaussianHMMSuffStats(
         init_state_probs=init_state_probs, 
@@ -133,7 +158,7 @@ def fullbatch_m_step(posterior, emissions):
 
     # Transition distribution
     transition_matrix = Dirichlet(
-        1.0001 + np.einsum('tij->ij', posterior.smoothed_transition_probs)).mode()
+        1.0001 + posterior.smoothed_transition_probs_sum).mode()
 
     # Gaussian emission distribution
     w_sum = np.einsum('tk->k', posterior.smoothed_probs)
