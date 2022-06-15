@@ -1,4 +1,6 @@
 # Time EM on real data
+# From killifish directory
+#   python examples/script_em_real_data.py --method vmap --profile mem --batch_size 3 --num_train 6 --num_test 1 --num_em_iters 10
 
 import os
 import argparse
@@ -11,6 +13,7 @@ import jax.random as jr
 import jax.profiler
 
 from functools import partial, reduce
+from operator import mul
 
 from ssm_jax.hmm.models import GaussianHMM
 from kf.inference import (sharded_e_step, collective_m_step,
@@ -52,8 +55,8 @@ parser.add_argument(
     '--seed', type=int, default=45212276,
     help='PRNG seed to split data and intialize HMM.')
 parser.add_argument(
-    '--num_batches', type=int, default=None,
-    help='Size of axis to parallelize over. For vmap and pmap methods.')
+    '--batch_size', type=int, default=None,
+    help='Number of days per batch.')
 parser.add_argument(
     '--num_train', type=int, default=1,
     help='Number of days to train over')
@@ -70,16 +73,8 @@ parser.add_argument(
 
 # -------------------------------------
 
-def vmap_em_step(hmm, split_emissions):
-    # Since we vmap'd arrays directly, results in a single SuffStats
-    # instance with batch shape (M,...). No addt'l transforms req'd.
-    normd_suff_stats = vmap(partial(sharded_e_step, hmm))(split_emissions)
-    
-    new_hmm = collective_m_step(normd_suff_stats)
-
-    return new_hmm, normd_suff_stats
-
-def fit_hmm_vmap(train_dataset, test_dataset, init_hmm, num_iters, num_batches):
+def fit_hmm_vmap(train_dataset, test_dataset, init_hmm,
+                 num_iters, batch_size, num_frames_per_day):
     """Fit HMM to FishPCDataset by vmapping over batches using EM.
 
     Parameters
@@ -87,36 +82,55 @@ def fit_hmm_vmap(train_dataset, test_dataset, init_hmm, num_iters, num_batches):
         test_dataset: FishPCDataset
         init_hmm: GaussianHMM
         num_iters: int. Number of EM steps to run.
-        num_batches: int. Number of batches
+        batch_size: int. Number of days per batch
     """
 
     emissions_dim = train_dataset.dim
 
-    # Load all emissions, shape (num_days*uniform_num_frames_per_day, dim)
-    train_dl = FishPCDataloader(train_dataset, batch_size=len(train_dataset))
-    train_emissions = next(iter(train_dl)).reshape(-1, emissions_dim)
+    # Load all emissions, shape (num_days, num_frames_per_day, dim)
+    train_dl = FishPCDataloader(train_dataset,
+                                batch_size=batch_size,
+                                num_frames_per_day=num_frames_per_day)
 
-    test_dl = FishPCDataloader(test_dataset, batch_size=len(test_dataset))
-    test_emissions = next(iter(test_dl)).reshape(-1, emissions_dim)
+    test_dl  = FishPCDataloader(test_dataset,
+                                batch_size=1,
+                                num_frames_per_day=num_frames_per_day)
 
-    @jit
-    def em_step(hmm, itr):
-        train_posterior = fullbatch_e_step(hmm, train_emissions)
-        new_hmm = fullbatch_m_step(train_posterior, train_emissions)
+    hmm = init_hmm
 
-        avg_train_ll = train_posterior.marginal_loglik / len(train_emissions)
+    print('Anticipated train, test emissions array nbytes [MB]')
+    get_nbytes_32 = lambda shp: reduce(mul, shp) * 4
+    print(get_nbytes_32(train_dl.data_batch_shape)/(1024**2),
+          get_nbytes_32(test_dl.data_batch_shape)/(1024**2),)
 
+    # Computed average marginal loglikelihood, weighted by number of obs
+    # NB: If weird numbers appear, consider int32/float32 overflow issues...
+    compute_avg_marginal_loglik = lambda ngss: \
+        (ngss.num_emissions/ngss.num_emissions.sum() * ngss.marginal_loglik).sum()/ngss.num_emissions.sum()
+
+    train_and_test_lls = -np.ones((num_iters, 2)) * np.inf
+    for itr in range(num_iters):
+        def e_step(hmm, dl):
+            _ngss = [vmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
+            ngss = reduce(NGSS.concat, _ngss)
+            ll = compute_avg_marginal_loglik(ngss)
+            return ngss, ll
+        
+        train_ngss, train_ll = e_step(hmm, train_dl)
+        
+        hmm = collective_m_step(train_ngss)
+        
         # --------------------------------------------------------
-        test_posterior = fullbatch_e_step(new_hmm, test_emissions)
-        avg_test_ll = test_posterior.marginal_loglik / len(test_emissions)
 
-        return new_hmm, np.array([avg_train_ll, avg_test_ll])
+        _, test_ll = e_step(hmm, test_dl)
 
-    fitted_hmm, train_and_test_lls = lax.scan(em_step, init_hmm, np.arange(num_iters))
+        train_and_test_lls = train_and_test_lls.at[itr].set(np.array([train_ll, test_ll]))
 
     return train_and_test_lls[:,0], train_and_test_lls[:,1]
+    
 
-def fit_hmm_nomap(train_dataset, test_dataset, init_hmm, num_iters, num_batches=None):
+def fit_hmm_nomap(train_dataset, test_dataset, init_hmm,
+                  num_iters, batch_size=None, num_frames_per_day=-1):
     """Fit HMM to FishPCDataset using full batch expectation maximization.
 
     Parameters
@@ -124,17 +138,24 @@ def fit_hmm_nomap(train_dataset, test_dataset, init_hmm, num_iters, num_batches=
         test_dataset: FishPCDataset
         init_hmm: GaussianHMM.
         num_iters: int. Number of EM steps to run.
-        num_batches: int. Ignored in this function.
+        batch_size: int. Ignored in this function.
     """
 
     emissions_dim = train_dataset.dim
 
     # Load all emissions, shape (num_days*uniform_num_frames_per_day, dim)
-    train_dl = FishPCDataloader(train_dataset, batch_size=len(train_dataset))
+    train_dl = FishPCDataloader(train_dataset,
+                                batch_size=len(train_dataset),
+                                num_frames_per_day=num_frames_per_day)
     train_emissions = next(iter(train_dl)).reshape(-1, emissions_dim)
 
-    test_dl = FishPCDataloader(test_dataset, batch_size=len(test_dataset))
+    test_dl = FishPCDataloader(test_dataset,
+                               batch_size=len(test_dataset),
+                               num_frames_per_day=num_frames_per_day)
     test_emissions = next(iter(test_dl)).reshape(-1, emissions_dim)
+
+    print('train, test emissions array nbytes [MB]')
+    print(train_emissions.nbytes/(1024**2), test_emissions.nbytes/(1024**2))
 
     @jit
     def em_step(hmm, itr):
@@ -176,16 +197,19 @@ def main():
     logdir = args.logdir
 
     seed = jr.PRNGKey(args.seed)
-    num_batches = args.num_batches
+    batch_size = args.batch_size
     num_train = args.num_train
     num_test = args.num_test
     num_em_iters = args.num_em_iters
     num_hmm_states = args.num_hmm_states
+    num_frames_per_day = 100000 # 100K seems loadable interval
     
     seed_split_data, seed_init_hmm = jr.split(seed, 2)
 
     # Initialize training and testing datasets
-    print('Initializing training and testing datasets...')
+    print(f"Initializing training ({num_train} days) " 
+          + f"and testing ({num_test} days) datasets, "
+          + f"with {num_frames_per_day} frames per day...")
     train_ds, test_ds = \
         FishPCDataset('fish0_137', DATADIR).train_test_split(num_train=num_train,
                                                              num_test=num_test,
@@ -198,11 +222,9 @@ def main():
                                                  num_hmm_states,
                                                  emission_dim)
 
-    # EARLY FAIL
-    tmp = os.path.join(TEMPDIR, "hello")
     # Fit
     if method == 'vmap':
-        raise NotImplementedError
+        fit_fn = fit_hmm_vmap
     elif method =='pmap':
         raise NotImplementedError
     elif method == 'nomap':
@@ -212,14 +234,16 @@ def main():
         raise NotImplementedError
     elif profile == 'mem':
         train_lls, test_lls = \
-                fit_fn(train_ds, test_ds, init_hmm, num_em_iters, num_batches)
+                fit_fn(train_ds, test_ds, init_hmm,
+                       num_em_iters, batch_size, num_frames_per_day)
         train_lls.block_until_ready()
 
-        log_fname = datetime.now().strftime("%Y%m%d_%H%M%S") \
-                    + "-memory_{method}.prof"
+        log_fname = datetime.now().strftime("%y%m%d_%H%M%S") \
+                    + f"-memory_{method}.prof"
         jax.profiler.save_device_memory_profile(os.path.join(TEMPDIR, log_fname))
     else:
-        train_lls, test_lls = fit_fn(train_ds, test_ds, init_hmm, num_em_iters)
+        train_lls, test_lls = fit_fn(train_ds, test_ds, init_hmm,
+                                     num_em_iters, batch_size, num_frames_per_day)
 
     print('train log likelihoods')
     print(train_lls)
