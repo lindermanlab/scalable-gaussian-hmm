@@ -53,12 +53,17 @@ def hmm_smoother(initial_distributions, transition_matrix, log_likelihoods):
 
 @chex.dataclass
 class NormalizedGaussianHMMSuffStats:
-    """Wrapper for normalized sufficient statistics of a GaussianHMM."""
-    init_state_probs: chex.Array    # shape (K,)
-    transition_probs: chex.Array    # shape (K,K)
-    w_normalizer: chex.Array        # shape (K,)
-    normd_Ex: chex.Array            # shape (K,D)
-    normd_ExxT: chex.Array          # shape (K,D,D)
+    """Wrapper for normalized sufficient statistics of a GaussianHMM.
+    
+    marginal_log_likelihood and num_emissions fields added for convenience.
+    """
+    init_state_probs: chex.Array                    # shape ([M],K,)
+    transition_probs: chex.Array                    # shape ([M],K,K)
+    w_normalizer: chex.Array                        # shape ([M],K,)
+    normd_Ex: chex.Array                            # shape ([M],K,D)
+    normd_ExxT: chex.Array                          # shape ([M],K,D,D)
+    marginal_loglik: float=-np.inf                  # shape ([M],)
+    num_emissions: int=0                            # shape ([M],)
 
     @classmethod
     def concat(cls, a, b, axis=0):
@@ -105,7 +110,9 @@ def sharded_e_step(hmm: GaussianHMM, emissions: chex.Array) -> NormalizedGaussia
         transition_probs=transition_probs,
         w_normalizer=w_normalizer,
         normd_Ex=normd_Ex,
-        normd_ExxT=normd_ExxT
+        normd_ExxT=normd_ExxT,
+        marginal_loglik=posterior.marginal_loglik,
+        num_emissions=len(emissions)
     )
 
 def collective_m_step(nss: NormalizedGaussianHMMSuffStats) -> GaussianHMM:
