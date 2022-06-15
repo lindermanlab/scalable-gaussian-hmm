@@ -43,52 +43,44 @@ def vmap_em_step(hmm, split_emissions):
 
     return new_hmm, normd_suff_stats
 
-def fit_hmm_nomap(train_dataset, test_dataset, hmm, num_iters):
+def fit_hmm_nomap(train_dataset, test_dataset, init_hmm, num_iters):
     """Fit HMM to FishPCDataset using expectation maximization.
 
     Parameters
         train_dataset: FishPCDataset
         test_dataset: FishPCDataset
-        hmm: GaussianHMM
+        init_hmm: GaussianHMM
             Randomly initialized or warm-started hmm.
         num_iters: int
             Number of EM steps to run.
     """
-    # @jit
-    def _em_step(hmm, emissions):
-        posterior = fullbatch_e_step(hmm, emissions)
-        hmm = fullbatch_m_step(posterior, emissions)
-        avg_ll = posterior.marginal_loglik / len(emissions)
-        return hmm, avg_ll
 
     emissions_dim = train_dataset.dim
 
     # Load all emissions, shape (num_days * uniform_num_frames_per_day, dim)
-    
     train_dl = FishPCDataloader(train_dataset, batch_size=len(train_dataset))
     train_emissions = next(iter(train_dl)).reshape(-1, emissions_dim)
-    print(f'Loaded training data...shape {train_emissions.shape}')
 
     test_dl = FishPCDataloader(test_dataset, batch_size=len(test_dataset))
     test_emissions = next(iter(test_dl)).reshape(-1, emissions_dim)
-    print(f'Loaded testing data...shape {test_emissions.shape}')
 
-    train_lls = - np.ones(num_iters) * np.inf
-    test_lls  = - np.ones(num_iters) * np.inf
+    def em_step(hmm, x):
+        train_posterior = fullbatch_e_step(hmm, train_emissions)
+        new_hmm = fullbatch_m_step(train_posterior, train_emissions)
 
-    test_lls.block_until_ready()
-    print('Beginning fit...')
-    for itr in tqdm(range(num_iters)):
-        # pdb.set_trace()
-        hmm, avg_train_ll = _em_step(hmm, train_emissions)
-        
-        _, avg_test_ll = _em_step(hmm, test_emissions)
+        avg_train_ll = train_posterior.marginal_loglik / len(train_emissions)
 
-        train_lls = train_lls.at[itr].set(avg_train_ll)
-        test_lls = test_lls.at[itr].set(avg_test_ll)
+        # --------------------------------------------------------
+        test_posterior = fullbatch_e_step(new_hmm, test_emissions)
+        avg_test_ll = test_posterior.marginal_loglik / len(test_emissions)
 
-        jax.profiler.save_device_memory_profile(f"memory{itr}_{len(train_emissions)}.prof")
-    return train_lls, test_lls
+        return new_hmm, np.array([avg_train_ll, avg_test_ll])
+
+    fitted_hmm, train_and_test_lls = lax.scan(em_step, init_hmm, np.arange(num_iters))
+
+    train_and_test_lls.block_until_ready()
+    jax.profiler.save_device_memory_profile(f"memory_nomap.prof")
+    return train_and_test_lls[:,0], train_and_test_lls[:,1]
 
 def fit_hmm_pmap(em_step, train_dataset, test_dataset, initial_hmm, seed, num_iters):
     """Fit HMM to FishPCDataset using expectation maximization.
