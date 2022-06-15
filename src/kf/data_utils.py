@@ -143,9 +143,8 @@ class FishPCDataset():
         num_train = num_train if num_train else int(frac_train * len(self))
         num_test = num_test if num_test else int(frac_test * len(self))
 
-        i_full = np.arange(len(self))
-        if seed is not None:
-            i_full = jr.permutation(seed, i_full)
+        i_full = jr.permutation(seed, np.arange(len(self))) \
+                 if seed is not None else np.arange(len(self))
 
         # Split dataset by filenames
         f_train = [self.filenames[i] for i in i_full[0:num_train]]
@@ -170,9 +169,11 @@ class FishPCDataloader():
         batch_size: int, default 1
             Number of batches to return.
         num_days_per_batch: int, default 1
-            Number of consecutive days per batch.
+            Number of consecutive days per batch. TODO: Remove
+        num_frames_per_day: int, default -1
+            If -1, use all frames.
         uniform_batch_size: bool, default True
-            If True, all batches will have the same number of frames.
+            If True, all batches will have the same number of frames. TODO: Remove
         drop_last: bool. default False
             If True, drop the last incomplete batch. If False, keep the last
             batch, which be smaller if dataset is indivisible by batch size,
@@ -188,6 +189,7 @@ class FishPCDataloader():
                  dataset,
                  batch_size:int=1,
                  num_days_per_batch:int=1,
+                 num_frames_per_day: int=-1,
                  uniform_batch_size:bool=True,
                  drop_last: bool=True,
                  shuffle:bool=False,
@@ -200,10 +202,16 @@ class FishPCDataloader():
         warnings.warn('Forcing `uniform_batch_size=True`.')
         uniform_batch_size = True
         # See how this variable is used in `collate` function
-        self.num_frames_per_day = np.min(dataset.num_frames) \
-                                  if uniform_batch_size else -1
 
+        # By default, self.num_frames_per_day is set to the minimum common number
+        # of frames. If user passes in option, ensure it is less than this number.
+        self.num_frames_per_day = np.min(dataset.num_frames)
+        if num_frames_per_day > 0:
+            self.num_frames_per_day = np.minimum(num_frames_per_day, self.num_frames_per_day)
+        
         self.drop_last = True if uniform_batch_size else drop_last
+
+        self._data_batch_shape = (self.batch_size, self.num_frames_per_day, self.dataset.dim)
 
         # Parameters for randomized iterator
         self.shuffle = shuffle
@@ -212,6 +220,11 @@ class FishPCDataloader():
         self.shuffle_key = shuffle_key
         self.shuffle_count = 0                                                  # "Global counter"
         return
+
+    @property
+    def data_batch_shape(self) -> chex.Shape:
+        """Return shape of each batch of data"""
+        return self._data_batch_shape
 
     def __len__(self) -> int:
         effective_batch_size = self.num_days_per_batch * self.batch_size
