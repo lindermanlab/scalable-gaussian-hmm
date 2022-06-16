@@ -6,7 +6,7 @@ jax.config.update('jax_platform_name', 'cpu')
 from absl.testing import absltest
 import chex
 
-from kf.data_utils import FishPCDataset
+from kf.data_utils import FishPCDataset, FishPCDataloader
 
 import jax.numpy as np
 import jax.random as jr
@@ -24,7 +24,7 @@ filenames = sorted([
 ])
 
 class TestPCDataset(chex.TestCase):
-    def testDataset(self):
+    def testBasic(self):
         ds = FishPCDataset(fish_name, DATADIR, min_num_frames=0)
 
         # Length of num_frames list should equal "length" of dataset
@@ -56,7 +56,7 @@ class TestPCDataset(chex.TestCase):
 
         self.assertTrue(np.allclose(arr42[frames,:], true_arr, atol=1e-6))
 
-    def testDataSubsetIndex(self):
+    def testSubsetByIndex(self):
         """Specify index range of files to use."""
 
         i_range = (10, 15)
@@ -74,7 +74,7 @@ class TestPCDataset(chex.TestCase):
                         'Files and/or file ordering in dataset do not exactly match expected values. ' \
                         + f'Got {ds.filenames}')
 
-    def testDataSubsetFilename(self):
+    def testSubsetByFilename(self):
         """Specify filenames in non-sequential order and some that do not exist."""
         
         fnames_input = ['p3_fish0_137_20210413.h5', 
@@ -152,11 +152,11 @@ class TestPCDataset(chex.TestCase):
         train_ds, test_ds = \
             ds.train_test_split(num_train=num_train, num_test=num_test, seed=seed)
 
-        self.assertTrue(len(train_ds) == num_train)
-        self.assertTrue(len(test_ds) == num_test)
+        self.assertEqual(len(train_ds), num_train)
+        self.assertEqual(len(test_ds), num_test)
 
-        self.assertTrue(train_ds.filenames != train_ref)
-        self.assertTrue(test_ds.filenames != test_ref)
+        self.assertNotEqual(train_ds.filenames, train_ref)
+        self.assertNotEqual(test_ds.filenames, test_ref)
 
         # -----------------------------------
         # Specify via mix of frac and integer. Value of frac_train specified 
@@ -164,8 +164,80 @@ class TestPCDataset(chex.TestCase):
         frac_train = 0.025 
         train_ds, test_ds = ds.train_test_split(
             frac_train=frac_train, num_test=num_test, seed=seed)
-        self.assertTrue(train_ds.filenames != train_ref)
-        self.assertTrue(test_ds.filenames != test_ref)
+        self.assertNotEqual(train_ds.filenames, train_ref)
+        self.assertNotEqual(test_ds.filenames, test_ref)
+
+class TestPCDataloader(chex.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.ds = FishPCDataset(fish_name, DATADIR, data_subset='all', min_num_frames=0)
+        self.seed = jr.PRNGKey(519)
+
+    def testBatchOne(self,):
+        """Batch size of 1"""
+
+        num_frames_per_day = 500
+        dl = FishPCDataloader(self.ds, batch_size=1, num_frames_per_day=num_frames_per_day).__iter__()
+
+        dl_shuffled = FishPCDataloader(self.ds, batch_size=1, num_frames_per_day=num_frames_per_day,
+                                       shuffle=True, seed=self.seed).__iter__()
+
+        ref_batch_shape = (1, num_frames_per_day, self.ds.dim)
+
+        
+        self.assertEqual(dl.batch_shape, ref_batch_shape,
+                         f'Expected batch shape {ref_batch_shape}, received {dl.batch_shape}.')
+        self.assertEqual(dl_shuffled.batch_shape, ref_batch_shape,
+                         f'Expected batch shape {ref_batch_shape}, received {dl_shuffled.batch_shape}.')
+
+        self.assertTrue((dl.idx_into_ds!=dl_shuffled.idx_into_ds).mean()>0.5,
+                        'Expected unshuffled and shuffled dataloaders to have different data indices.')
+
+    def testBatchAll(self,):
+        """Load entire dataset"""
+
+        num_frames_per_day = 10
+        dl = FishPCDataloader(self.ds, batch_size=-1, num_frames_per_day=num_frames_per_day)
+
+        ref_batch_shape = (len(self.ds), num_frames_per_day, self.ds.dim)
+
+        self.assertEqual(dl.batch_shape, ref_batch_shape)
+    
+    def testDropLast(self,):
+        """Ensure drop_last behavior automatically enforced."""
+
+        num_frames_per_day = 10
+        batch_size = 5
+        dl = FishPCDataloader(self.ds, batch_size=batch_size, num_frames_per_day=num_frames_per_day,
+                              shuffle=True, seed=self.seed).__iter__()
+
+        ref_num_batches = len(self.ds) // batch_size
+        ref_batch_shape = (batch_size, num_frames_per_day, self.ds.dim)
+
+        self.assertEqual(len(dl), ref_num_batches,
+                         f'Expected Dataloader to be length {ref_num_batches} (i.e. num_batches), received {len(dl)}')
+        
+        self.assertEqual(dl.batch_shape, ref_batch_shape)
+
+    def testSpeckle(self,):
+        """Randomly select frames within a day of data."""
+        num_frames_per_day = 10
+        batch_size = 5
+
+        dl = FishPCDataloader(self.ds,
+                              batch_size=batch_size,
+                              num_frames_per_day=num_frames_per_day).__iter__()
+        dl_speckled = FishPCDataloader(self.ds,
+                                       batch_size=batch_size,
+                                       num_frames_per_day=num_frames_per_day,
+                                       speckle=True, seed=self.seed).__iter__()
+
+        data = next(dl)    
+        data_speckled = next(dl_speckled)
+        import pdb
+        pdb.set_trace()
+        self.assertFalse(np.allclose(data, data_speckled))
+        pass
 
 if __name__ == '__main__':
     absltest.main()
