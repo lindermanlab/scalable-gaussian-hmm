@@ -252,34 +252,40 @@ class FishPCDataloader():
         assert len(self) == len(self.indices_into_dataset)
 
         self.iter_count = 0                                                     # Reset this instance's counter
+
+        # Create data buffer to reduce memory footprint
+        self._buffer = np.empty(self.data_batch_shape)
         return self
     
     def __next__(self,):
         if self.iter_count >= len(self):
             raise StopIteration
 
-        # TODO: Note that if shuffle and if drop_last=False, the small batch
-        # will be located somewhere in the iterator and not necessarily at the 
-        # end. This may be undesirable behavior. Solutions: a) force parameter
-        # drop_last=True if shuffle=True; b) find another way to construct
-        # self.indices_into_dataset so that last days are not necessarily ignored
-        i_ds_start = self.indices_into_dataset[self.iter_count]
-        i_ds_stop = i_ds_start + self.num_days_per_batch
+        # # TODO: Note that if shuffle and if drop_last=False, the small batch
+        # # will be located somewhere in the iterator and not necessarily at the 
+        # # end. This may be undesirable behavior. Solutions: a) force parameter
+        # # drop_last=True if shuffle=True; b) find another way to construct
+        # # self.indices_into_dataset so that last days are not necessarily ignored
+        # i_ds_start = self.indices_into_dataset[self.iter_count]
+        # i_ds_stop = i_ds_start + self.num_days_per_batch
 
-        # If drop_last == False, ensure last batch doesn't raise out of range error
-        i_ds_stop = np.where(
-            i_ds_stop > len(self.dataset),
-            i_ds_stop - (self.num_days_per_batch - len(self.dataset) % self.num_days_per_batch),
-            i_ds_stop
-            )
+        # # If drop_last == False, ensure last batch doesn't raise out of range error
+        # i_ds_stop = np.where(
+        #     i_ds_stop > len(self.dataset),
+        #     i_ds_stop - (self.num_days_per_batch - len(self.dataset) % self.num_days_per_batch),
+        #     i_ds_stop
+        #     )
 
+        # Recall that self.indices_into_dataset has shape (num_batches, batch_size,)
+        # So i_ds_batch has shape (batch_size,)
+        i_ds_batch = self.indices_into_dataset[self.iter_count]
+        for i, i_ds in enumerate(i_ds_batch):
+            self._buffer = self._buffer.at[i].set(self.dataset[i_ds][:self.num_frames_per_day])
+        
         # Update counter
         self.iter_count += 1
 
-        return np.stack([
-            self.collate(np.arange(_start, _stop))
-            for _start, _stop in zip(i_ds_start, i_ds_stop)
-        ], axis=0)
+        return self._buffer
 
     def collate(self, indices):
         """Batches data along frames axis.
