@@ -55,7 +55,7 @@ parser.add_argument(
     '--seed', type=int, default=45212276,
     help='PRNG seed to split data and intialize HMM.')
 parser.add_argument(
-    '--batch_size', type=int, default=None,
+    '--batch_size', type=int, default=1,
     help='Number of days per batch.')
 parser.add_argument(
     '--num_train', type=int, default=1,
@@ -69,7 +69,6 @@ parser.add_argument(
 parser.add_argument(
     '--num_hmm_states', type=int, default=20,
     help='Number of HMM states to fit')
-
 
 # -------------------------------------
 
@@ -100,8 +99,8 @@ def fit_hmm_vmap(train_dataset, test_dataset, init_hmm,
 
     print('Anticipated train, test emissions array nbytes [MB]')
     get_nbytes_32 = lambda shp: reduce(mul, shp) * 4
-    print(get_nbytes_32(train_dl.data_batch_shape)/(1024**2),
-          get_nbytes_32(test_dl.data_batch_shape)/(1024**2),)
+    print(get_nbytes_32(train_dl.batch_shape)/(1024**2),
+          get_nbytes_32(test_dl.batch_shape)/(1024**2),)
 
     # Computed average marginal loglikelihood, weighted by number of obs
     # NB: If weird numbers appear, consider int32/float32 overflow issues...
@@ -109,6 +108,7 @@ def fit_hmm_vmap(train_dataset, test_dataset, init_hmm,
         (ngss.num_emissions/ngss.num_emissions.sum() * ngss.marginal_loglik).sum()/ngss.num_emissions.sum()
 
     train_and_test_lls = -np.ones((num_iters, 2)) * np.inf
+
     for itr in range(num_iters):
         def e_step(hmm, dl):
             _ngss = [vmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
@@ -174,8 +174,9 @@ def fit_hmm_nomap(train_dataset, test_dataset, init_hmm,
 
     return train_and_test_lls[:,0], train_and_test_lls[:,1]
 
-def fit_hmm_pmap(em_step, train_dataset, test_dataset, initial_hmm, seed, num_iters):
-    """Fit HMM to FishPCDataset using expectation maximization.
+def fit_hmm_pmap(train_dataset, test_dataset, init_hmm,
+                 num_iters, batch_size, num_frames_per_day):
+    """Fit HMM to FishPCDataset by pmapping over batches using EM.
 
     Parameters
         em_step: Callable[[GaussianHMM, np.ndarray] -> [GaussianHMM, NGSS]]
@@ -185,10 +186,10 @@ def fit_hmm_pmap(em_step, train_dataset, test_dataset, initial_hmm, seed, num_it
         num_iters: int
             Number of EM steps to run.
     """
+    raise NotImplementedError
+    
 
-    for itr in range(num_iters):
-        # Run full-batch E-step
-        pass
+FIT_HMM = dict(nomap=fit_hmm_nomap, vmap=fit_hmm_vmap, pmap=fit_hmm_pmap)
 
 def main():
     args = parser.parse_args()
@@ -203,7 +204,26 @@ def main():
     num_em_iters = args.num_em_iters
     num_hmm_states = args.num_hmm_states
     num_frames_per_day = 100000 # 100K seems loadable interval
+
+    # ==========================================================================
+    # Setup XLA flags
+    xla_flags = []
+    if args.profile == 'time':
+        xla_flags.append('--xla_cpu_enable_xprof_traceme')
+
+    if method =='pmap':
+        xla_flags.append(f'--xla_force_host_platform_device_count={args.batch_size}') 
+
+    # Set XLA_FLAGS env_var by joining all indicated flags, separated by space
+    if len(xla_flags):
+        os.environ['XLA_FLAGS'] = ' '.join(xla_flags)
+        print(f"Setting XLA_FLAGS: {os.getenv['XLA_FLAGS']}")
+        
+        if method =='pmap':
+            assert jax.local_device_count() == args.batch_size, \
+                   "Unable to set multiple devices, check that you're requested a node with multiple processors."
     
+    # ==========================================================================
     seed_split_data, seed_init_hmm = jr.split(seed, 2)
 
     # Initialize training and testing datasets
@@ -217,34 +237,30 @@ def main():
 
     # Initialize hidden Markov model
     print(f'Initializing HMM with {num_hmm_states} states...')
-    emission_dim = train_ds.dim
-    init_hmm = GaussianHMM.random_initialization(seed_init_hmm,
-                                                 num_hmm_states,
-                                                 emission_dim)
-
-    # Fit
-    if method == 'vmap':
-        fit_fn = fit_hmm_vmap
-    elif method =='pmap':
-        raise NotImplementedError
-    elif method == 'nomap':
-        fit_fn = fit_hmm_nomap
+    init_hmm = GaussianHMM.random_initialization(seed_init_hmm, num_hmm_states, train_ds.dim)
     
+    # --------------------------------------------------------------------------
+    # Start trace
     if profile == 'time':
-        raise NotImplementedError
+        jax.profiler.start_trace(logdir)
+    
+    # --------------------------------------------------------------------------
+    # Fit function
+    train_lls, test_lls = \
+                FIT_HMM[method](train_ds, test_ds, init_hmm,
+                                num_em_iters, batch_size, num_frames_per_day)
+    train_lls.block_until_ready()
+
+    # --------------------------------------------------------------------------
+    # Stop trace
+    if profile == 'time':
+        jax.profiler.stop_trace()
     elif profile == 'mem':
-        train_lls, test_lls = \
-                fit_fn(train_ds, test_ds, init_hmm,
-                       num_em_iters, batch_size, num_frames_per_day)
-        train_lls.block_until_ready()
+        timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+        jax.profiler.save_device_memory_profile(
+                    os.path.join(logdir, f"{timestamp}-memory_{method}.prof"))
 
-        log_fname = datetime.now().strftime("%y%m%d_%H%M%S") \
-                    + f"-memory_{method}.prof"
-        jax.profiler.save_device_memory_profile(os.path.join(TEMPDIR, log_fname))
-    else:
-        train_lls, test_lls = fit_fn(train_ds, test_ds, init_hmm,
-                                     num_em_iters, batch_size, num_frames_per_day)
-
+    # ----
     print('train log likelihoods')
     print(train_lls)
     print('\n---------\n')
