@@ -77,8 +77,8 @@ parser.add_argument(
 
 # -------------------------------------
 
-def fit_hmm_vmap(train_dataset, test_dataset, init_hmm,
-                 num_iters, batch_size, num_frames_per_day):
+def fit_hmm_jmap(train_dataset, test_dataset, init_hmm,
+                 num_iters, batch_size, num_frames_per_day, method='vmap'):
     """Fit HMM to FishPCDataset by vmapping over batches using EM.
 
     Parameters
@@ -87,8 +87,12 @@ def fit_hmm_vmap(train_dataset, test_dataset, init_hmm,
         init_hmm: GaussianHMM
         num_iters: int. Number of EM steps to run.
         batch_size: int. Number of days per batch
+        num_frames_per_day: int
+        method: str. The jax parallelization method, either 'vmap' or 'pmap'.
     """
 
+    jmap = vmap if method == 'vmap' else pmap
+    
     emissions_dim = train_dataset.dim
 
     # Load all emissions, shape (num_days, num_frames_per_day, dim)
@@ -113,12 +117,10 @@ def fit_hmm_vmap(train_dataset, test_dataset, init_hmm,
 
     train_and_test_lls = -np.ones((num_iters, 2)) * np.inf
 
-    outer_pbar = trange(num_iters)
-    outer_pbar.set_description("Epoch")
-
-    for itr in trange(num_iters):
+    pbar = trange(num_iters)
+    for itr in pbar:
         def e_step(hmm, dl):
-            _ngss = [vmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
+            _ngss = [jmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
             ngss = reduce(NGSS.concat, _ngss)
             ll = compute_avg_marginal_loglik(ngss)
             return ngss, ll
@@ -133,8 +135,8 @@ def fit_hmm_vmap(train_dataset, test_dataset, init_hmm,
 
         train_and_test_lls = train_and_test_lls.at[itr].set(np.array([train_ll, test_ll]))
     
-        outer_pbar.set_description(f"Train: {train_ll:.2f}, test: {test_ll:.3f}")
-        outer_pbar.update()
+        pbar.set_description(f"Train: {train_ll:.2f}, test: {test_ll:.2f}")
+        pbar.update()
 
     return train_and_test_lls[:,0], train_and_test_lls[:,1]
     
@@ -184,69 +186,11 @@ def fit_hmm_nomap(train_dataset, test_dataset, init_hmm,
 
     return train_and_test_lls[:,0], train_and_test_lls[:,1]
 
-def fit_hmm_pmap(train_dataset, test_dataset, init_hmm,
-                 num_iters, batch_size, num_frames_per_day):
-    """Fit HMM to FishPCDataset by pmapping over batches using EM.
-
-    Parameters
-        em_step: Callable[[GaussianHMM, np.ndarray] -> [GaussianHMM, NGSS]]
-        train_dataset: FishPCDataset
-        test_dataset: FishPCDataset
-        initial_hmm: GaussianHMM
-        num_iters: int
-            Number of EM steps to run.
-    """
-    emissions_dim = train_dataset.dim
-
-    # Load all emissions, shape (num_days, num_frames_per_day, dim)
-    train_dl = FishPCDataloader(train_dataset,
-                                batch_size=batch_size,
-                                num_frames_per_day=num_frames_per_day)
-
-    test_dl  = FishPCDataloader(test_dataset,
-                                batch_size=1,
-                                num_frames_per_day=num_frames_per_day)
-
-    hmm = init_hmm
-
-    print('Anticipated train, test emissions array nbytes [MB]')
-    print(get_nbytes_32(train_dl.batch_shape)/(1024**2),
-          get_nbytes_32(test_dl.batch_shape)/(1024**2),)
-
-    outer_pbar = trange(num_iters)
-    outer_pbar.set_description("Epoch")
-
-    # Computed average marginal loglikelihood, weighted by number of obs
-    # NB: If weird numbers appear, consider int32/float32 overflow issues...
-    compute_avg_marginal_loglik = lambda ngss: \
-        (ngss.num_emissions/ngss.num_emissions.sum() * ngss.marginal_loglik).sum()/ngss.num_emissions.sum()
-
-    train_and_test_lls = -np.ones((num_iters, 2)) * np.inf
-
-    for itr in trange(num_iters):
-        def e_step(hmm, dl):
-            _ngss = [pmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
-            ngss = reduce(NGSS.concat, _ngss)
-            ll = compute_avg_marginal_loglik(ngss)
-            return ngss, ll
-        
-        train_ngss, train_ll = e_step(hmm, train_dl)
-        
-        hmm = collective_m_step(train_ngss)
-        
-        # --------------------------------------------------------
-
-        _, test_ll = e_step(hmm, test_dl)
-
-        train_and_test_lls = train_and_test_lls.at[itr].set(np.array([train_ll, test_ll]))
-
-        outer_pbar.set_description(f"Train: {train_ll:.2f}, test: {test_ll:.3f}")
-        outer_pbar.update()
-
-    return train_and_test_lls[:,0], train_and_test_lls[:,1]
-    
-
-FIT_HMM = dict(nomap=fit_hmm_nomap, vmap=fit_hmm_vmap, pmap=fit_hmm_pmap)
+# FIT_HMM = dict(nomap=fit_hmm_nomap, vmap=fit_hmm_vmap, pmap=fit_hmm_pmap)
+FIT_HMM = dict(nomap=fit_hmm_nomap,
+               vmap=partial(fit_hmm_jmap, method='vmap'),
+               pmap=partial(fit_hmm_jmap, method='pmap'),
+               )
 
 def main():
     args = parser.parse_args()
@@ -274,8 +218,9 @@ def main():
         print('Adding CPU trace flag to XLA_FLAGS')
         raise NotImplementedError
 
-    if method =='pmap':
+    # if method =='pmap':
         # TODO FINE IF SET MANUALLY, UNSUCCESSFUL IF SET FROM HERE
+        # export XLA_FLAGS=--xla_force_host_platform_device_count={args.batch_size}
         # xla_flags.append(f'--xla_force_host_platform_device_count={args.batch_size}') 
 
     # Set XLA_FLAGS env_var by joining all indicated flags, separated by space
@@ -284,8 +229,8 @@ def main():
     #     print(f"Setting XLA_FLAGS: {os.getenv('XLA_FLAGS')}")
         
     if method =='pmap':
-        assert jax.local_device_count() == args.batch_size, \
-               "Unable to set multiple devices, check that you're requested a node with multiple processors."
+        assert jax.local_device_count() >= args.batch_size, \
+               f"Found {jax.local_device_count()} devices, expected {args.batch_size} devices."
     
     # ==========================================================================
     seed_split_data, seed_init_hmm = jr.split(seed, 2)
