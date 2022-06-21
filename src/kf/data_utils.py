@@ -242,6 +242,8 @@ class FishPCDataloader():
     
     def __next__(self):
         if self._iter_count >= len(self):
+            del self._buffer
+            # Call gc.collect()?
             raise StopIteration
 
         i_ds_batch = self.idx_into_ds[self._iter_count]                         # shape (batch_size)

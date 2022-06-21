@@ -5,7 +5,7 @@
 #   2. Manually set XLA_FLAGS in shell...doesn't seem to register when setting from script
 #       - $ export XLA_FLAGS=--xla_force_host_platform_device_count=NUM_CPUS
 #   3. Now, we can finally run the script. From killifish directory,
-#       - python examples/profile_jmap.py --method pmap --profile mem --batch_size NUM_CPUS --num_train 6 --num_test 1 --num_em_iters 10
+#       - python scripts/profile_jmap.py --method pmap --profile mem --batch_size NUM_CPUS --num_train 6 --num_test 1 --num_em_iters 10
 
 import os
 import argparse
@@ -29,7 +29,6 @@ from kf.data_utils import FishPCDataset, FishPCDataloader
 
 from tqdm import trange
 import pdb
-import time
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['TEMPDIR']
@@ -123,12 +122,14 @@ def fit_hmm_jmap(train_dataset, test_dataset, init_hmm,
     train_and_test_lls = -np.ones((num_iters, 2)) * np.inf
 
     pbar = trange(num_iters)
+    pbar.set_description(f"Train: -inf, test: -inf")
     for itr in pbar:
         def e_step(hmm, dl):
             _ngss = [jmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
             ngss = reduce(NGSS.concat, _ngss)
             ll = compute_avg_marginal_loglik(ngss)
-            return ngss, ll
+            # return ngss, ll
+            return ngss, ngss.batch_marginal_loglik()
         
         train_ngss, train_ll = e_step(hmm, train_dl)
         

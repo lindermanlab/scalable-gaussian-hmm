@@ -79,6 +79,16 @@ class NormalizedGaussianHMMSuffStats:
         _ss_seq = tree_map(lambda arr: np.expand_dims(arr, axis=axis), ss_seq)
         return reduce(cls.concat, _ss_seq)
 
+    def batch_marginal_loglik(self,):
+        """Compute average marginal log likelihood from batch of normalized 
+        marginal loglikelihoods. Assumes that this is a batched NGSS instance,
+        i.e. data fields have dimensions (M,...).
+
+        Should be numerically safe - If number is extremely off, check for overflow.
+        """
+        ns = self.num_emissions
+        return (ns/ns.sum() * self.marginal_loglik).sum()/ns.sum()
+
 def sharded_e_step(hmm: GaussianHMM, emissions: chex.Array) -> NormalizedGaussianHMMSuffStats:
     """Computes posterior expected sufficient stats given partial batch of emissions.
 
