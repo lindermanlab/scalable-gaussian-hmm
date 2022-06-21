@@ -1,0 +1,279 @@
+# Running pmap job on single fish
+# TODO
+# 
+# NB: If using PMAP, must
+#   1. Request node with multiple CPUs, e.g.
+#       - $ sdev -p dev -m 8G -c NUM_CPUS
+#   2. Manually set XLA_FLAGS in shell...doesn't seem to register when setting from script
+#       - $ export XLA_FLAGS=--xla_force_host_platform_device_count=NUM_CPUS
+#   3. Now, we can finally run the script. From killifish directory,
+#       - python examples/profile_jmap.py --method pmap --profile mem --batch_size NUM_CPUS --num_train 6 --num_test 1 --num_em_iters 10
+
+import os
+import argparse
+from datetime import datetime                           # For saving files
+
+from jax import jit, vmap, pmap, lax
+import jax.numpy as np
+import jax.random as jr
+
+import jax.profiler
+
+from functools import partial, reduce
+from operator import mul
+
+from ssm_jax.hmm.models import GaussianHMM
+from kf.inference import (sharded_e_step, collective_m_step,
+                          NormalizedGaussianHMMSuffStats as NGSS)
+
+from kf.data_utils import FishPCDataset, FishPCDataloader
+
+from tqdm import trange
+import pdb
+
+DATADIR = os.environ['DATADIR']
+TEMPDIR = os.environ['TEMPDIR']
+
+# Calculate byte size of arrays, assuming float32 precision
+get_nbytes_32 = lambda shp: reduce(mul, shp) * 4
+
+# -------------------------------------
+# Suppress JAX/TFD warning: ...`check_dtypes` is deprecated... message
+import logging
+class CheckTypesFilter(logging.Filter):
+    def filter(self, record):
+        return "check_types" not in record.getMessage()
+
+logger = logging.getLogger()
+logger.addFilter(CheckTypesFilter())
+
+# -------------------------------------
+
+parser = argparse.ArgumentParser(description='HMM fit to single fish')
+parser.add_argument(
+    '--method', type=str, default='vmap',
+    choices=['pmap','vmap','nomap'],
+    help='Parallelization approach. NB: If using pmap, must run on node with multiple cores.')
+parser.add_argument(
+    '--profile', type=str, default='none',
+    choices=['time', 'mem', 'none'],
+    help='What aspect of code to profile')
+parser.add_argument(
+    '--logdir', type=str, default=TEMPDIR,
+    help='Directory to log profiles.')
+parser.add_argument(
+    '--seed', type=int, default=45212276,
+    help='PRNG seed to split data and intialize HMM.')
+parser.add_argument(
+    '--batch_size', type=int, default=1,
+    help='Number of days per batch.')
+parser.add_argument(
+    '--num_train', type=int, default=1,
+    help='Number of days to train over')
+parser.add_argument(
+    '--num_test', type=int, default=1,
+    help='Number of days to test over')
+parser.add_argument(
+    '--num_em_iters', type=int, default=10,
+    help='Number of EM iterations to run')
+parser.add_argument(
+    '--num_hmm_states', type=int, default=20,
+    help='Number of HMM states to fit')
+
+# -------------------------------------
+
+def fit_hmm_jmap(train_dataset, test_dataset, hmm,
+                 num_iters, batch_size, num_frames_per_day, method='vmap'):
+    """Fit HMM to FishPCDataset by [v/p]mapping over full-batches using EM.
+
+    Parameters
+        train_dataset: FishPCDataset
+        test_dataset: FishPCDataset
+        hmm: GaussianHMM. Initial hmm for this fit
+        num_iters: int. Number of EM steps to run.
+        batch_size: int. Number of days per batch
+        num_frames_per_day: int
+        method: str. The jax parallelization method, either 'vmap' or 'pmap'.
+    """
+
+    jmap = vmap if method == 'vmap' else pmap
+    
+    emissions_dim = train_dataset.dim
+
+    # Load all emissions, shape (num_days, num_frames_per_day, dim)
+    # TODO Any way we can reuse buffer from one dataloader to a next?
+    # Not as written...and maybe not a problem on bigmem partition
+    train_dl = FishPCDataloader(train_dataset,
+                                batch_size=batch_size,
+                                num_frames_per_day=num_frames_per_day)
+
+    test_dl  = FishPCDataloader(test_dataset,
+                                batch_size=batch_size,
+                                num_frames_per_day=num_frames_per_day)
+
+    print('Anticipated train, test emissions array nbytes [MB]')
+    print(get_nbytes_32(train_dl.batch_shape)/(1024**2),
+          get_nbytes_32(test_dl.batch_shape)/(1024**2),)
+
+    train_lls = -np.ones(num_iters) * np.inf
+    test_lls  = -np.ones(num_iters) * np.inf
+
+    pbar = trange(num_iters)
+    pbar.set_description(f"Train: -inf, test: -inf")
+    for itr in pbar:
+        def e_step(hmm, dl):
+            _ngss = [jmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
+            ngss = reduce(NGSS.concat, _ngss)
+            return ngss, ngss.batch_marginal_loglik()
+        
+        # Fit and update on train data
+        train_ngss, train_ll = e_step(hmm, train_dl)
+        hmm = collective_m_step(train_ngss)
+        
+        # Evaluate on test data
+        _, test_ll = e_step(hmm, test_dl)
+
+        train_lls = train_lls.at[itr].set(train_ll)
+        test_lls  = test_lls.at[itr].set(test_ll)
+    
+        pbar.set_description(f"Train: {train_ll:.2f}, test: {test_ll:.2f}")
+        pbar.update()
+
+    return hmm, train_lls, test_lls
+    
+
+def fit_hmm_nomap(train_dataset, test_dataset, init_hmm,
+                  num_iters, batch_size=None, num_frames_per_day=-1):
+    """Fit HMM to FishPCDataset using full batch expectation maximization.
+
+    Parameters
+        train_dataset: FishPCDataset
+        test_dataset: FishPCDataset
+        init_hmm: GaussianHMM.
+        num_iters: int. Number of EM steps to run.
+        batch_size: int. Ignored in this function.
+    """
+
+    emissions_dim = train_dataset.dim
+
+    # Load all emissions, shape (num_days*uniform_num_frames_per_day, dim)
+    train_dl = FishPCDataloader(train_dataset,
+                                batch_size=len(train_dataset),
+                                num_frames_per_day=num_frames_per_day)
+    train_emissions = next(iter(train_dl)).reshape(-1, emissions_dim)
+
+    test_dl = FishPCDataloader(test_dataset,
+                               batch_size=len(test_dataset),
+                               num_frames_per_day=num_frames_per_day)
+    test_emissions = next(iter(test_dl)).reshape(-1, emissions_dim)
+
+    print('train, test emissions array nbytes [MB]')
+    print(train_emissions.nbytes/(1024**2), test_emissions.nbytes/(1024**2))
+
+    @jit
+    def em_step(hmm, itr):
+        train_posterior = fullbatch_e_step(hmm, train_emissions)
+        new_hmm = fullbatch_m_step(train_posterior, train_emissions)
+
+        avg_train_ll = train_posterior.marginal_loglik / len(train_emissions)
+
+        # --------------------------------------------------------
+        test_posterior = fullbatch_e_step(new_hmm, test_emissions)
+        avg_test_ll = test_posterior.marginal_loglik / len(test_emissions)
+
+        return new_hmm, np.array([avg_train_ll, avg_test_ll])
+
+    fitted_hmm, train_and_test_lls = lax.scan(em_step, init_hmm, np.arange(num_iters))
+
+    return train_and_test_lls[:,0], train_and_test_lls[:,1]
+
+FIT_HMM = dict(nomap=fit_hmm_nomap,
+               vmap=partial(fit_hmm_jmap, method='vmap'),
+               pmap=partial(fit_hmm_jmap, method='pmap'),
+               )
+
+def main():
+    args = parser.parse_args()
+    method = args.method
+    profile = args.profile
+    logdir = args.logdir
+
+    seed = jr.PRNGKey(args.seed)
+    batch_size = args.batch_size
+    num_train = args.num_train
+    num_test = args.num_test
+    num_em_iters = args.num_em_iters
+    num_hmm_states = args.num_hmm_states
+    num_frames_per_day = 100000 # 100K seems loadable interval
+
+    # ==========================================================================
+    # Setup XLA flags
+    # TODO: Add XLA flags to environment variable (see below)
+    # Curent prioblem: XLA Device count flag doesn't get registered if set within
+    # the program...it's fine when I do it interactively in ipython, or set it
+    # manually in the terminal. CURRENT SOLUTION: SET WITHIN TERMINAL/BATCH SCRIPT
+    xla_flags = []
+    if args.profile == 'time':
+        xla_flags.append('--xla_cpu_enable_xprof_traceme')
+        print('Adding CPU trace flag to XLA_FLAGS')
+        raise NotImplementedError
+
+    # if method =='pmap':
+        # xla_flags.append(f'--xla_force_host_platform_device_count={args.batch_size}') 
+
+    # Set XLA_FLAGS env_var by joining all indicated flags, separated by space
+    # if len(xla_flags):
+    #     # os.environ['XLA_FLAGS'] = ' '.join(xla_flags)
+    #     print(f"Setting XLA_FLAGS: {os.getenv('XLA_FLAGS')}")
+        
+    if method =='pmap':
+        assert jax.local_device_count() >= args.batch_size, \
+               f"Found {jax.local_device_count()} devices, expected {args.batch_size} devices."
+    
+    # ==========================================================================
+    seed_split_data, seed_init_hmm = jr.split(seed, 2)
+
+    # Initialize training and testing datasets
+    print(f"Initializing training ({num_train} days) " 
+          + f"and testing ({num_test} days) datasets, "
+          + f"with {num_frames_per_day} frames per day...")
+    train_ds, test_ds = \
+        FishPCDataset('fish0_137', DATADIR).train_test_split(num_train=num_train,
+                                                             num_test=num_test,
+                                                             seed=seed_split_data)
+
+    # Initialize hidden Markov model
+    print(f'Initializing HMM with {num_hmm_states} states...')
+    init_hmm = GaussianHMM.random_initialization(seed_init_hmm, num_hmm_states, train_ds.dim)
+    
+    # --------------------------------------------------------------------------
+    # Start trace
+    if profile == 'time':
+        jax.profiler.start_trace(logdir)
+    
+    # --------------------------------------------------------------------------
+    # Fit function
+    train_lls, test_lls = \
+                FIT_HMM[method](train_ds, test_ds, init_hmm,
+                                num_em_iters, batch_size, num_frames_per_day)
+    train_lls.block_until_ready()
+
+    # --------------------------------------------------------------------------
+    # Stop trace
+    if profile == 'time':
+        jax.profiler.stop_trace()
+    elif profile == 'mem':
+        timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+        jax.profiler.save_device_memory_profile(
+                    os.path.join(logdir, f"{timestamp}-memory_{method}.prof"))
+
+    # ----
+    print('train log likelihoods')
+    print(train_lls)
+    print('\n---------\n')
+    print('test log likelihoods')
+    print(test_lls)
+    return
+
+if __name__ == '__main__':
+    main()
