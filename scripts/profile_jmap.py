@@ -1,6 +1,11 @@
-# Time EM on real data
-# From killifish directory
-#   python examples/script_em_real_data.py --method vmap --profile mem --batch_size 3 --num_train 6 --num_test 1 --num_em_iters 10
+# Memory and time profiling of EM on real data
+# NB: If using PMAP, must
+#   1. Request node with multiple CPUs, e.g.
+#       - $ sdev -p dev -m 8G -c NUM_CPUS
+#   2. Manually set XLA_FLAGS in shell...doesn't seem to register when setting from script
+#       - $ export XLA_FLAGS=--xla_force_host_platform_device_count=NUM_CPUS
+#   3. Now, we can finally run the script. From killifish directory,
+#       - python examples/profile_jmap.py --method pmap --profile mem --batch_size NUM_CPUS --num_train 6 --num_test 1 --num_em_iters 10
 
 import os
 import argparse
@@ -186,7 +191,6 @@ def fit_hmm_nomap(train_dataset, test_dataset, init_hmm,
 
     return train_and_test_lls[:,0], train_and_test_lls[:,1]
 
-# FIT_HMM = dict(nomap=fit_hmm_nomap, vmap=fit_hmm_vmap, pmap=fit_hmm_pmap)
 FIT_HMM = dict(nomap=fit_hmm_nomap,
                vmap=partial(fit_hmm_jmap, method='vmap'),
                pmap=partial(fit_hmm_jmap, method='pmap'),
@@ -219,8 +223,6 @@ def main():
         raise NotImplementedError
 
     # if method =='pmap':
-        # TODO FINE IF SET MANUALLY, UNSUCCESSFUL IF SET FROM HERE
-        # export XLA_FLAGS=--xla_force_host_platform_device_count={args.batch_size}
         # xla_flags.append(f'--xla_force_host_platform_device_count={args.batch_size}') 
 
     # Set XLA_FLAGS env_var by joining all indicated flags, separated by space
