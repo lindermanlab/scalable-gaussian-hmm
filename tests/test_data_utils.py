@@ -236,7 +236,7 @@ class TestPCDataloader(chex.TestCase):
         self.assertFalse(np.allclose(data, data_speckled))
 
 class TestPCDataloaderDay(chex.TestCase):
-    def testSplitDayIntoBatches(self,):
+    def testBasic(self,):
         # Load first 3 files, modify Dataset to think files only have ~100 frames
         ds = FishPCDataset(fish_name, DATADIR, data_subset=(0,3), min_num_frames=0)
         ds._num_frames = np.array([98, 123, 100])
@@ -245,6 +245,7 @@ class TestPCDataloaderDay(chex.TestCase):
         # Which results in 3 batches out of this iteration, where
         num_frames_per_batch = 20
         batch_size = 5
+        batch_shape = (batch_size, num_frames_per_batch, ds.dim)
 
         dl = FishPCDataloaderDay(ds,
                                 batch_size=batch_size,
@@ -252,22 +253,89 @@ class TestPCDataloaderDay(chex.TestCase):
         self.assertEqual(len(dl), 3)
 
         dl = dl.__iter__()
+        ref = np.empty(batch_shape)
 
         # batch 0 should consist of ds[0][0:80] + ds[1][0:20]
-        b0 = dl.__next__()
-        r0 = np.concatenate([ds[0][0:80], ds[1][0:20]]).reshape(batch_size, num_frames_per_batch, ds.dim)
-        self.assertTrue(np.all(b0==r0))
+        b = dl.__next__()
+        ref = np.concatenate([ds[0][0:80], ds[1][0:20]]).reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
 
         # batch 1 should consist of ds[1][20:120]
-        b1 = dl.__next__()
-        r1 = np.concatenate(ds[1][20:120]).reshape(batch_size, num_frames_per_batch, ds.dim)
-        self.assertTrue(np.all(b1==r1))
+        b = dl.__next__()
+        ref = ds[1][20:120].reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
 
         # batch 2 should consist of ds[2][0:100]
-        b2 = dl.__next__()
-        r2 = np.concatenate(ds[2][0:100]).reshape(batch_size, num_frames_per_batch, ds.dim)
+        b = dl.__next__()
+        ref = ds[2][0:100].reshape(*batch_shape)
         
-        self.assertTrue(np.all(b2==r2))
+        self.assertTrue(np.all(b==ref))
+    
+    def testShuffle(self,):
+        # Load first 3 files, modify Dataset to think files only have ~100 frames
+        ds = FishPCDataset(fish_name, DATADIR, data_subset=(0,4), min_num_frames=0)
+        ds._num_frames = np.array([98, 123, 100, 131])
+        
+        # So, we have set sizes of sum([4,6,5,6]) = 21
+        # Which results in 4 batches out of this iteration, where
+        num_frames_per_batch = 20
+        batch_size = 5
+        batch_shape = (batch_size, num_frames_per_batch, ds.dim)
+
+        dl = FishPCDataloaderDay(ds,
+                                batch_size=batch_size,
+                                num_frames_per_batch=num_frames_per_batch,
+                                shuffle=True,
+                                seed=jr.PRNGKey(34002))
+        self.assertEqual(len(dl), 4)
+
+        # ---------------------------------------------------
+        # First iter: datafiles will be permuted into [1,2,3,0]
+        dl = dl.__iter__()
+
+        ref = np.empty(batch_shape)
+        # batch 0 should consist of ds[1][0:100]
+        b0 = dl.__next__()
+        ref = ds[1][0:100].reshape(*batch_shape)
+        self.assertTrue(np.all(b0==ref))
+
+        # batch 1 should consist of ds[1][100:120] + ds[2][0:80]
+        b = dl.__next__()
+        ref = np.concatenate([ds[1][100:120], ds[2][0:80]]).reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
+
+        # batch 2 should consist of ds[2][80:100] + ds[3][0:80]
+        b = dl.__next__()
+        ref = np.concatenate([ds[2][80:100], ds[3][0:80]]).reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
+
+        # batch 3 should consist of ds[3][80:120] + ds[0][0:60]
+        b = dl.__next__()
+        ref = np.concatenate([ds[3][80:120], ds[0][0:60]]).reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
+
+        # ---------------------------------------------------
+        # Second iter: datafiles will be permuted into [1,0,2,3]
+        dl = dl.__iter__()
+        self.assertEqual(dl._shuffle_count, 2)
+
+        bb0 = dl.__next__()
+        self.assertTrue(np.all(b0==bb0))
+
+        # batch 1 should consist of ds[1][100:120] + ds[0][0:80]
+        b = dl.__next__()
+        ref = np.concatenate([ds[1][100:120], ds[0][0:80]]).reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
+
+        # batch 2 should consist of ds[2][0:100]
+        b = dl.__next__()
+        ref = ds[2][0:100].reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
+
+        # batch 3 should consist of ds[3][0:100]
+        b = dl.__next__()
+        ref = ds[3][0:100].reshape(*batch_shape)
+        self.assertTrue(np.all(b==ref))
         
 class TestMiscFns(chex.TestCase):
     def testUniformSplit(self,):
@@ -279,11 +347,11 @@ class TestMiscFns(chex.TestCase):
         # Get args to split, then split original set
         original_set_sizes = list(map(len, original_sets))
         num_batches = sum(original_set_sizes) // batch_size
-        args = arg_uniform_split(original_set_sizes, batch_size)
+        args = arg_uniform_split(batch_size, original_set_sizes)
         uniform_sets = np.empty((num_batches, batch_size))
         for i_batch, b_args in enumerate(args):
             uniform_sets = \
-                uniform_sets.at[i_batch]\
+                uniform_sets.at[i_batch] \
                             .set(np.concatenate([original_sets[i_set][s_set[0]:s_set[1]] \
                                                  for (i_set, s_set) in b_args]))
 
@@ -300,7 +368,7 @@ class TestMiscFns(chex.TestCase):
         # Get args to split, then split original set
         original_set_sizes = list(map(len, original_sets))
         num_batches = sum(original_set_sizes) // batch_size
-        args = arg_uniform_split(original_set_sizes, batch_size)
+        args = arg_uniform_split(batch_size, original_set_sizes)
         uniform_sets = np.empty((num_batches, batch_size))
         for i_batch, b_args in enumerate(args):
             uniform_sets = \

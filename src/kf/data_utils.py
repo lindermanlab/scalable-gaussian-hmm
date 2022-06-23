@@ -11,7 +11,8 @@ import jax.numpy as np
 import jax.random as jr
 from jax import lax
 
-def arg_uniform_split(original_set_sizes, target_set_size):
+# TODO SWITCH ORDER
+def arg_uniform_split(target_set_size, set_sizes, set_ids=None):
     """Returns a function that splits the original set of different sizes into
     sets of uniforms sizes, in order. drop_last behavior automatically enforced.
 
@@ -34,13 +35,17 @@ def arg_uniform_split(original_set_sizes, target_set_size):
             b_args, i_file, i_in_file = split_fn([], i_file, i_in_file)
 
     parameters:
-        original_set_sizes: sequence of ints indicate original set sizes
         target_set_size: int
+        set_sizes: sequence of ints indicate original set sizes
+        set_ids: sequence of ints. Used when shuffling original set sizes
+    
+    returns:
+        list, length (target_num_sets,) of lists with elements (set_id, (frame_start, frame_end))
     """
     def _format(i_set, i_within_start, i_within_end):
         """Defines how resulting args are presented formatted."""
         # return (i_set, np.s_[int(i_within_start):int(i_within_end)])
-        return (i_set, (int(i_within_start), int(i_within_end)))
+        return (int(i_set), (int(i_within_start), int(i_within_end)))
 
     def _fn(n, i_set, i_within_set, out):
         """Recursively returns the args of the sets and elements within sets
@@ -57,11 +62,12 @@ def arg_uniform_split(original_set_sizes, target_set_size):
             i_within_set: Updated index of unallocated element within set
             out: Updated list of arguments
         """
-        n_set = original_set_sizes[i_set]                   # Size of this set
-        # This set can complete the remainder of the set: Take as many elements
-        # as needed and return to main loop
+        n_set = set_sizes[i_set]                   # Size of this set
+        
+        # This set can complete the remainder of the uniform set: Take as many
+        # elements as needed and return to main loop
         if n <= (n_set - i_within_set):
-            out.append(_format(i_set, i_within_set, i_within_set+n))
+            out.append(_format(set_ids[i_set], i_within_set, i_within_set+n))
             
             # Increase within-set index. If we reached end of set, reset 
             # within-set index to 0 (%) and increase set index
@@ -69,23 +75,21 @@ def arg_uniform_split(original_set_sizes, target_set_size):
             i_set = i_set + 1 if i_within_set == 0 else i_set
             return i_set, i_within_set, out
 
-        # This set cannot complete the remainder of the set: Take all elements
-        # from this set and update number of elements still needed and indices.
-        # Then, call function to perform on next set
+        # This set cannot complete the remainder of the uniform set: Take all
+        # remaining elements from this set and update number of elements still
+        # needed. Then, call function to perform on next set
         else:
-            out.append(_format(i_set, i_within_set, n_set))
+            out.append(_format(set_ids[i_set], i_within_set, n_set))
             n -= (n_set - i_within_set)
             return _fn(n, i_set+1, 0, out)
-    
-    # The number of evenly-sized sets that will result
-    target_num_sets = sum(original_set_sizes) // target_set_size
 
+    target_num_sets = sum(set_sizes) // target_set_size                # The number of evenly-sized sets that will result
+    set_ids = np.arange(len(set_sizes)) if set_ids is None else set_ids    
     i_set = i_within_set = 0
     all_args = []
     for _ in range(target_num_sets):
         i_set, i_within_set, set_args = _fn(target_set_size, i_set, i_within_set, [],)
         all_args.append(set_args)
-
     return all_args
 
 
@@ -407,14 +411,18 @@ class FishPCDataloaderDay():
 
         # Number of batches in each file in dataset, shape (length(self.dataset), )
         num_batches_by_day = self.dataset.num_frames // self.num_frames_per_batch
-        # Create (maybe random) index into dataset, length (num_batches, )
-        self.idx_into_ds = arg_uniform_split(num_batches_by_day, self.batch_size)
 
         if self.shuffle:
-            raise NotImplementedError
             key = jr.fold_in(self._shuffle_key, self._shuffle_count)
-            self.idx_into_ds = jr.permutation(key, len(self.dataset))
+            idx_into_ds = jr.permutation(key, len(self.dataset))
+            num_batches_by_day = num_batches_by_day[idx_into_ds]
             self._shuffle_count += 1
+        else:
+            idx_into_ds = np.arange(len(self.dataset))
+        
+        self.lst_split_args = arg_uniform_split(self.batch_size,
+                                                num_batches_by_day,
+                                                idx_into_ds)
        
         return self
     
@@ -424,15 +432,19 @@ class FishPCDataloaderDay():
             # Call gc.collect()?
             raise StopIteration
 
-        file_and_slices = self.idx_into_ds[self._iter_count]                         # shape (batch_size)
+        file_and_slices = self.lst_split_args[self._iter_count]
         i_buff = 0
         for i_ds, s_ds in file_and_slices:
             if self.speckle:
-                raise NotImplementedError                                                    # This is probably very slow code...
-                key = jr.fold_in(self._speckle_key, self._shuffle_count*self._iter_count + i)
-                idx_into_day = jr.permutation(key, self.dataset.num_frames[i_ds])
-                idx_into_day = np.sort(idx_into_day[:self.num_frames_per_day])
-                self._buffer = self._buffer.at[i].set(self.dataset[i_ds][idx_into_day])
+                raise NotImplementedError
+                # If we really need to implement this: When we instantiate the iterator,
+                # figure out how many batches we want out of the file. Then, expand
+                # batch_edges > num_frames_per_batch so that we can speckle within
+                # that within-day batch...Hopefully this comment makes sense in several weeks lol
+                # key = jr.fold_in(self._speckle_key, self._shuffle_count*self._iter_count + i)
+                # idx_into_day = jr.permutation(key, self.dataset.num_frames[i_ds])
+                # idx_into_day = np.sort(idx_into_day[:self.num_frames_per_day])
+                # self._buffer = self._buffer.at[i].set(self.dataset[i_ds][idx_into_day])
             else:
                 n_buff = s_ds[1] - s_ds[0]
                 s_ = np.s_[s_ds[0]*self.num_frames_per_batch : s_ds[1]*self.num_frames_per_batch]
