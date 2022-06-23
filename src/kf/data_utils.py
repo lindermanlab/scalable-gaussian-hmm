@@ -11,6 +11,77 @@ import jax.numpy as np
 import jax.random as jr
 from jax import lax
 
+def arg_uniform_split(original_set_sizes, target_set_size):
+    """Returns a function that splits the original set of different sizes into
+    sets of uniforms sizes, in order. drop_last behavior automatically enforced.
+
+    Suppose we'd like to create even batches of 3 elements from the following
+    unevenly-sized sets:
+        {a,b,c,d}, {e}, {f,g,h}, {i,j}, {k,l,m,n}
+    Each letter is a distinct elemnt within the set. When for-looping through
+    this function returns
+        [(i=0,s_[0:3]],
+        [(i=0,s_[3:4], (i=1,s_[0:1], (i=2,s_[0:1]],
+        [(i=2,s_[1:3], (i=3,s_[0:1]],
+        [(i=3,s_[1:2], (i=4,s_[0:2]]
+    which would result in the sets:
+        {a,b,c}, {d,e,f}, {g,h,i}, {j,k,l}
+
+    Example usage:
+        num_batches, split_fn = arg_uniform_split(batches_per_file, batch_size)
+        i_file = i_in_file = 0      # File index, batch within file index to current file
+        for i in range(num_batches):
+            b_args, i_file, i_in_file = split_fn([], i_file, i_in_file)
+
+    parameters:
+        original_set_sizes: sequence of ints indicate original set sizes
+        target_set_size: int
+    """
+    def _format(i_set, i_within_start, i_within_end):
+        """Defines how resulting args are presented formatted."""
+        return (i_set, np.s_[int(i_within_start):int(i_within_end)])
+
+    def _fn(n, i_set, i_within_set, out):
+        """Recursively returns the args of the sets and elements within sets
+        needed to make an even function set.
+
+        Parameters:
+            n: int. Number of elements needed to complete an event set.
+            i_set: int. Index of current set
+            i_within_set: int. Index of current element within set
+            out: Current list of arguments
+
+        Returns: 
+            i_set: Updated index of current set
+            i_within_set: Updated index of unallocated element within set
+            out: Updated list of arguments
+        """
+        # This set can complete the remainder of the set: Take as many elements
+        # as needed and return to main loop
+        if n <= (original_set_sizes[i_set] - i_within_set):
+            out.append(_format(i_set, i_within_set, i_within_set+n))
+            return i_set, i_within_set+n, out
+
+        # This set cannot complete the remainder of the set: Take all elements
+        # from this set and update number of elements still needed and indices.
+        # Then, call function to perform on next set
+        else:
+            out.append(_format(i_set, i_within_set, original_set_sizes[i_set]))
+            n -= (original_set_sizes[i_set] - i_within_set)
+            return _fn(n, i_set+1, 0, out)
+    
+    # The number of evenly-sized sets that will result
+    target_num_sets = sum(original_set_sizes) // target_set_size
+
+    i_set = i_within_set = 0
+    all_args = []
+    for i_even_set in range(target_num_sets):
+        i_set, i_within_set, set_args = _fn(target_set_size, i_set, i_within_set, [],)
+        all_args.append(set_args)
+
+    return all_args
+
+
 class FishPCDataset():
     """Dataset of top 15 PCs of a single fish.
     

@@ -6,7 +6,9 @@ jax.config.update('jax_platform_name', 'cpu')
 from absl.testing import absltest
 import chex
 
-from kf.data_utils import FishPCDataset, FishPCDataloader
+from kf.data_utils import (FishPCDataset, FishPCDataloader,
+                           FishPCDataloaderDay,
+                           arg_uniform_split)
 
 import jax.numpy as np
 import jax.random as jr
@@ -234,10 +236,28 @@ class TestPCDataloader(chex.TestCase):
 
         data = next(dl)    
         data_speckled = next(dl_speckled)
-        import pdb
-        pdb.set_trace()
         self.assertFalse(np.allclose(data, data_speckled))
-        pass
+
+class TestMiscFns(chex.TestCase):
+    def testUniformSplit(self,):
+        # Original sets = [0,1,2,3], [4], [5,6,7], [8,9], [10,11,12,13]
+        original_sets = np.split(np.arange(14), (4,5,8,10))
+        batch_size = 3
+
+        # Get args to split, then split original set
+        original_set_sizes = list(map(len, original_sets))
+        num_batches = sum(original_set_sizes) // batch_size
+        args = arg_uniform_split(original_set_sizes, batch_size)
+        uniform_sets = np.empty((num_batches, batch_size))
+        for i_batch, b_args in enumerate(args):
+            uniform_sets = \
+                uniform_sets.at[i_batch]\
+                            .set(np.concatenate([original_sets[i_set][s_set] \
+                                                 for (i_set, s_set) in b_args]))
+
+        expected_sets = np.arange(12).reshape(4, 3)
+        self.assertTrue(np.all(uniform_sets==expected_sets))
+
 
 if __name__ == '__main__':
     absltest.main()
