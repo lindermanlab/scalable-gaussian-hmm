@@ -39,7 +39,8 @@ def arg_uniform_split(original_set_sizes, target_set_size):
     """
     def _format(i_set, i_within_start, i_within_end):
         """Defines how resulting args are presented formatted."""
-        return (i_set, np.s_[int(i_within_start):int(i_within_end)])
+        # return (i_set, np.s_[int(i_within_start):int(i_within_end)])
+        return (i_set, (int(i_within_start), int(i_within_end)))
 
     def _fn(n, i_set, i_within_set, out):
         """Recursively returns the args of the sets and elements within sets
@@ -56,18 +57,24 @@ def arg_uniform_split(original_set_sizes, target_set_size):
             i_within_set: Updated index of unallocated element within set
             out: Updated list of arguments
         """
+        n_set = original_set_sizes[i_set]                   # Size of this set
         # This set can complete the remainder of the set: Take as many elements
         # as needed and return to main loop
-        if n <= (original_set_sizes[i_set] - i_within_set):
+        if n <= (n_set - i_within_set):
             out.append(_format(i_set, i_within_set, i_within_set+n))
-            return i_set, i_within_set+n, out
+            
+            # Increase within-set index. If we reached end of set, reset 
+            # within-set index to 0 (%) and increase set index
+            i_within_set = (i_within_set + n) % n_set
+            i_set = i_set + 1 if i_within_set == 0 else i_set
+            return i_set, i_within_set, out
 
         # This set cannot complete the remainder of the set: Take all elements
         # from this set and update number of elements still needed and indices.
         # Then, call function to perform on next set
         else:
-            out.append(_format(i_set, i_within_set, original_set_sizes[i_set]))
-            n -= (original_set_sizes[i_set] - i_within_set)
+            out.append(_format(i_set, i_within_set, n_set))
+            n -= (n_set - i_within_set)
             return _fn(n, i_set+1, 0, out)
     
     # The number of evenly-sized sets that will result
@@ -75,7 +82,7 @@ def arg_uniform_split(original_set_sizes, target_set_size):
 
     i_set = i_within_set = 0
     all_args = []
-    for i_even_set in range(target_num_sets):
+    for _ in range(target_num_sets):
         i_set, i_within_set, set_args = _fn(target_set_size, i_set, i_within_set, [],)
         all_args.append(set_args)
 
@@ -274,8 +281,6 @@ class FishPCDataloader():
             self.num_frames_per_day = \
                     int(np.minimum(num_frames_per_day, self.num_frames_per_day))
 
-        self._batch_shape = (self.batch_size, self.num_frames_per_day, self.dataset.dim)
-
         # Parameters for randomized iterator
         self.shuffle = shuffle
         self.speckle = speckle
@@ -287,7 +292,7 @@ class FishPCDataloader():
     @property
     def batch_shape(self) -> chex.Shape:
         """Return shape of each batch of data"""
-        return self._batch_shape
+        return (self.batch_size, self.num_frames_per_day, self.dataset.dim)
 
     def __len__(self) -> int:
         return len(self.dataset) // self.batch_size
@@ -326,6 +331,116 @@ class FishPCDataloader():
                 self._buffer = self._buffer.at[i].set(self.dataset[i_ds][idx_into_day])
             else:
                 self._buffer = self._buffer.at[i].set(self.dataset[i_ds][:self.num_frames_per_day])
+        
+        self._iter_count += 1
+
+        return self._buffer
+
+class FishPCDataloaderDay():
+    """Provides an iterable over the given dataset. Allows splitting a day into
+    batches. Iterator returns an array of shape (batch_size, num_frames, dim).
+    Automatically enforces
+    drop_last=True behavior.
+    
+    Parameters
+        dataset: FishPCDataset
+        batch_size: int, default 1
+            Number of batches to return. If batch_size=-1, load entire dataset.
+        num_frames_per_batch: int, default -1
+            If -1, use MIN_NUM_FRAMES, which is defined by the recording day in
+            the dataset with the fewest number of frames. Users may also specify
+            a value <= MIN_NUM_FRAMES. This guarantees uniform batch shape. 
+        shuffle: bool, default: False
+            If True, reshuffle data at every epoch. This is kept track of in
+            by the internal `_shuffle_count` attribute.
+        speckle: bool, default: False
+            If True, uses a sorted, randomly selected set of frames within each
+            day of data. If False (default), selects the first num_frames_per_batch
+            frames to use. Recall that not all frames in a day are used, for
+            uniform batch shape purposes. 
+        seed: PRNGKey, default: None
+            If `shuffle` or `speckle` is True, a global key must be provided.
+    """
+
+    def __init__(self,
+                 dataset,
+                 batch_size:int=1,
+                 num_frames_per_batch: int=-1,
+                 shuffle: bool=False,
+                 speckle: bool=False,
+                 seed:jr.PRNGKey=None,
+                 ):
+        self.dataset = dataset
+        self.batch_size = batch_size if batch_size > 0 else len(dataset)
+
+        # By default, self.num_frames_per_batch is set to the minimum common number
+        # of frames (MIN_NUM_FRAMES). If user passes in specification, ensure
+        # that num_frames_per_batch <= MIN_NUM_FRAMES to ensure uniform batch size.
+        # See how this variable is used in `collate` function...
+        self.num_frames_per_batch = num_frames_per_batch \
+                                    if num_frames_per_batch > 0 \
+                                    else int(np.min(dataset.num_frames))
+        
+        # Parameters for randomized iterator
+        self.shuffle = shuffle
+        self.speckle = speckle
+        if shuffle or speckle:
+            self._shuffle_key, self._speckle_key = jr.split(seed)
+        self._shuffle_count = 0                                                 # "Global counter" to ensure successive calls to this instance results in different randomizations
+        return
+
+    @property
+    def batch_shape(self) -> chex.Shape:
+        """Return shape of each batch of data"""
+        return (self.batch_size, self.num_frames_per_batch, self.dataset.dim)
+
+    def __len__(self) -> int:
+        return (self.dataset.num_frames // self.num_frames_per_batch).sum() // self.batch_size
+        # return len(self.dataset) // self.batch_size
+
+    def __iter__(self):
+        # Reset this iterator instance's counter
+        self._iter_count = 0
+
+        # Create data buffer to reduce memory footprint
+        self._buffer = np.empty(self.batch_shape)
+
+        # Number of batches in each file in dataset, shape (length(self.dataset), )
+        num_batches_by_day = self.dataset.num_frames // self.num_frames_per_batch
+        # Create (maybe random) index into dataset, length (num_batches, )
+        self.idx_into_ds = arg_uniform_split(num_batches_by_day, self.batch_size)
+
+        if self.shuffle:
+            raise NotImplementedError
+            key = jr.fold_in(self._shuffle_key, self._shuffle_count)
+            self.idx_into_ds = jr.permutation(key, len(self.dataset))
+            self._shuffle_count += 1
+       
+        return self
+    
+    def __next__(self):
+        if self._iter_count >= len(self):
+            del self._buffer
+            # Call gc.collect()?
+            raise StopIteration
+
+        file_and_slices = self.idx_into_ds[self._iter_count]                         # shape (batch_size)
+        i_buff = 0
+        for i_ds, s_ds in file_and_slices:
+            if self.speckle:
+                raise NotImplementedError                                                    # This is probably very slow code...
+                key = jr.fold_in(self._speckle_key, self._shuffle_count*self._iter_count + i)
+                idx_into_day = jr.permutation(key, self.dataset.num_frames[i_ds])
+                idx_into_day = np.sort(idx_into_day[:self.num_frames_per_day])
+                self._buffer = self._buffer.at[i].set(self.dataset[i_ds][idx_into_day])
+            else:
+                n_buff = s_ds[1] - s_ds[0]
+                s_ = np.s_[s_ds[0]*self.num_frames_per_batch : s_ds[1]*self.num_frames_per_batch]
+                self._buffer = self._buffer \
+                    .at[i_buff : i_buff+n_buff] \
+                    .set(self.dataset[i_ds][s_].reshape(n_buff, self.num_frames_per_batch, -1))
+
+                i_buff += n_buff
         
         self._iter_count += 1
 

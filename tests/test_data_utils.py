@@ -237,9 +237,43 @@ class TestPCDataloader(chex.TestCase):
         data = next(dl)    
         data_speckled = next(dl_speckled)
         self.assertFalse(np.allclose(data, data_speckled))
+    
+    def testSplitDayIntoBatches(self,):
+        # Load first 3 files, modify Dataset to think files only have ~100 frames
+        ds = FishPCDataset(fish_name, DATADIR, data_subset=(0,3), min_num_frames=0)
+        ds._num_frames = np.array([98, 123, 100])
+        
+        # So, we have set sizes of sum([4,6,5]) = 15
+        # Which results in 3 batches out of this iteration, where
+        num_frames_per_batch = 20
+        batch_size = 5
 
+        dl = FishPCDataloaderDay(ds,
+                                batch_size=batch_size,
+                                num_frames_per_batch=num_frames_per_batch)
+        self.assertEqual(len(dl), 3)
+
+        dl = dl.__iter__()
+
+        # batch 0 should consist of ds[0][0:80] + ds[1][0:20]
+        b0 = dl.__next__()
+        r0 = np.concatenate([ds[0][0:80], ds[1][0:20]]).reshape(batch_size, num_frames_per_batch, ds.dim)
+        self.assertTrue(np.all(b0==r0))
+
+        # batch 1 should consist of ds[1][20:120]
+        b1 = dl.__next__()
+        r1 = np.concatenate(ds[1][20:120]).reshape(batch_size, num_frames_per_batch, ds.dim)
+        self.assertTrue(np.all(b1==r1))
+
+        # batch 2 should consist of ds[2][0:100]
+        b2 = dl.__next__()
+        r2 = np.concatenate(ds[2][0:100]).reshape(batch_size, num_frames_per_batch, ds.dim)
+        
+        self.assertTrue(np.all(b2==r2))
+        
 class TestMiscFns(chex.TestCase):
     def testUniformSplit(self,):
+        """Use elements from multiple sets."""
         # Original sets = [0,1,2,3], [4], [5,6,7], [8,9], [10,11,12,13]
         original_sets = np.split(np.arange(14), (4,5,8,10))
         batch_size = 3
@@ -252,12 +286,34 @@ class TestMiscFns(chex.TestCase):
         for i_batch, b_args in enumerate(args):
             uniform_sets = \
                 uniform_sets.at[i_batch]\
-                            .set(np.concatenate([original_sets[i_set][s_set] \
+                            .set(np.concatenate([original_sets[i_set][s_set[0]:s_set[1]] \
                                                  for (i_set, s_set) in b_args]))
 
         expected_sets = np.arange(12).reshape(4, 3)
         self.assertTrue(np.all(uniform_sets==expected_sets))
+    
+    def testUniformSplit2(self,):
+        """Middle sets have clean finishes."""
+        # Original sets: [0,1,2,3], [4,5,6,7,8,9], ...
+        #                [10,11,12,13,14], [15,16,17,18,19,20,21]
+        original_sets = np.split(np.arange(22), (4,10,15))
+        batch_size = 5
 
+        # Get args to split, then split original set
+        original_set_sizes = list(map(len, original_sets))
+        num_batches = sum(original_set_sizes) // batch_size
+        args = arg_uniform_split(original_set_sizes, batch_size)
+        uniform_sets = np.empty((num_batches, batch_size))
+        for i_batch, b_args in enumerate(args):
+            uniform_sets = \
+                uniform_sets.at[i_batch]\
+                            .set(np.concatenate([original_sets[i_set][s_set[0]:s_set[1]] \
+                                                 for (i_set, s_set) in b_args]))
 
+        expected_sets = np.arange(20).reshape(4,5)
+
+        self.assertTrue(np.all(uniform_sets==expected_sets))
+
+    
 if __name__ == '__main__':
     absltest.main()
