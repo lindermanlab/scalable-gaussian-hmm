@@ -1,29 +1,26 @@
-"""Test Dataset and Dataloader classes"""
+"""Test Dataset and Dataloader classes
 
-import jax.config
-jax.config.update('jax_platform_name', 'cpu')
+To run all tests:
+    python test_data_utils.py
+To run single class:
+    python test_data_utils.py TestClassName
+To run single test:
+    python test_data_utils.py TestClassName.testMethodName
+"""
 
 from absl.testing import absltest
+
+import os
 import chex
+import jax.numpy as np
+import jax.random as jr
 
 from kf.data_utils import (FishPCDataset, FishPCDataloader,
                            FishPCDataloaderDay,
                            arg_uniform_split)
 
-import jax.numpy as np
-import jax.random as jr
-
-import os
-from os import listdir
-from os.path import join, isfile
-
 DATADIR = os.environ['DATADIR']
 fish_name = 'fish0_137'
-
-fish_dir = join(DATADIR, fish_name)
-filenames = sorted([
-    f for f in listdir(fish_dir) if isfile(join(fish_dir, f))
-])
 
 class TestPCDataset(chex.TestCase):
     def testBasic(self):
@@ -237,7 +234,8 @@ class TestPCDataloader(chex.TestCase):
         data = next(dl)    
         data_speckled = next(dl_speckled)
         self.assertFalse(np.allclose(data, data_speckled))
-    
+
+class TestPCDataloaderDay(chex.TestCase):
     def testSplitDayIntoBatches(self,):
         # Load first 3 files, modify Dataset to think files only have ~100 frames
         ds = FishPCDataset(fish_name, DATADIR, data_subset=(0,3), min_num_frames=0)
