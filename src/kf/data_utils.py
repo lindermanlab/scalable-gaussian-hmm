@@ -320,31 +320,15 @@ class FishPCDataloader():
        
         return self
     
-    def __next__(self):
-        if self._iter_count >= len(self):
-            del self._buffer
-            # Call gc.collect()?
-            raise StopIteration
+    
 
-        i_ds_batch = self.idx_into_ds[self._iter_count]                         # shape (batch_size)
-        for i, i_ds in enumerate(i_ds_batch):
-            if self.speckle:                                                    # This is probably very slow code...
-                key = jr.fold_in(self._speckle_key, self._shuffle_count*self._iter_count + i)
-                idx_into_day = jr.permutation(key, self.dataset.num_frames[i_ds])
-                idx_into_day = np.sort(idx_into_day[:self.num_frames_per_day])
-                self._buffer = self._buffer.at[i].set(self.dataset[i_ds][idx_into_day])
-            else:
-                self._buffer = self._buffer.at[i].set(self.dataset[i_ds][:self.num_frames_per_day])
-        
-        self._iter_count += 1
-
-        return self._buffer
-
-class FishPCDataloaderDay():
+class FishPCDataloader():
     """Provides an iterable over the given dataset. Allows splitting a day into
     batches. Iterator returns an array of shape (batch_size, num_frames, dim).
-    Automatically enforces
-    drop_last=True behavior.
+    Automatically enforces drop_last=True behavior.
+
+    To batch "by day", instantiate this with parameter
+    num_frames_per_batch = int(np.min(dataset.num_frames))
     
     Parameters
         dataset: FishPCDataset
@@ -352,8 +336,8 @@ class FishPCDataloaderDay():
             Number of batches to return. If batch_size=-1, load entire dataset.
         num_frames_per_batch: int, default -1
             If -1, use MIN_NUM_FRAMES, which is defined by the recording day in
-            the dataset with the fewest number of frames. Users may also specify
-            a value <= MIN_NUM_FRAMES. This guarantees uniform batch shape. 
+            the dataset with the fewest number of frames. This defaults to loading
+            1 day of data as 1 batch. Users may also specify a value <= MIN_NUM_FRAMES.
         shuffle: bool, default: False
             If True, reshuffle data at every epoch. This is kept track of in
             by the internal `_shuffle_count` attribute.
@@ -368,23 +352,28 @@ class FishPCDataloaderDay():
 
     def __init__(self,
                  dataset,
-                 batch_size:int=1,
+                 batch_size:int=-1,
                  num_frames_per_batch: int=-1,
                  shuffle: bool=False,
                  speckle: bool=False,
                  seed:jr.PRNGKey=None,
                  ):
         self.dataset = dataset
-        self.batch_size = batch_size if batch_size > 0 else len(dataset)
 
-        # By default, self.num_frames_per_batch is set to the minimum common number
-        # of frames (MIN_NUM_FRAMES). If user passes in specification, ensure
-        # that num_frames_per_batch <= MIN_NUM_FRAMES to ensure uniform batch size.
-        # See how this variable is used in `collate` function...
+        # Default: (or if <=0): set num_frames_per_batch to minimum common number
+        # of frames (MIN_NUM_FRAMES) such that one batch = one full-day of data
+        # NB: This break in some cases, e.g. when MIN_NUM_FRAMES << 1.7M and/or
+        # when there's a file with >> 1.7M frames
         self.num_frames_per_batch = num_frames_per_batch \
                                     if num_frames_per_batch > 0 \
                                     else int(np.min(dataset.num_frames))
         
+        # Default (or if <=0): Set batch_size to number of batches in Dataset
+        # such that num_batches = len(dl) = 1
+        self.batch_size = batch_size \
+                          if batch_size > 0 \
+                          else int((self.dataset.num_frames // self.num_frames_per_batch).sum())
+
         # Parameters for randomized iterator
         self.shuffle = shuffle
         self.speckle = speckle
@@ -399,8 +388,8 @@ class FishPCDataloaderDay():
         return (self.batch_size, self.num_frames_per_batch, self.dataset.dim)
 
     def __len__(self) -> int:
+        """Equivalent to number of batches."""
         return (self.dataset.num_frames // self.num_frames_per_batch).sum() // self.batch_size
-        # return len(self.dataset) // self.batch_size
 
     def __iter__(self):
         # Reset this iterator instance's counter
@@ -437,10 +426,11 @@ class FishPCDataloaderDay():
         for i_ds, s_ds in file_and_slices:
             if self.speckle:
                 raise NotImplementedError
-                # If we really need to implement this: When we instantiate the iterator,
-                # figure out how many batches we want out of the file. Then, expand
-                # batch_edges > num_frames_per_batch so that we can speckle within
-                # that within-day batch...Hopefully this comment makes sense in several weeks lol
+                # # If we really need to implement this: When we instantiate the iterator,
+                # # figure out how many batches we want out of the file. Then, expand
+                # # batch_edges > num_frames_per_batch so that we can speckle within
+                # # that within-day batch...Hopefully this comment makes sense in several weeks lol
+                # # See below for example from previous Dataloader
                 # key = jr.fold_in(self._speckle_key, self._shuffle_count*self._iter_count + i)
                 # idx_into_day = jr.permutation(key, self.dataset.num_frames[i_ds])
                 # idx_into_day = np.sort(idx_into_day[:self.num_frames_per_day])
@@ -457,3 +447,24 @@ class FishPCDataloaderDay():
         self._iter_count += 1
 
         return self._buffer
+
+    # How I did speckle dataloading in previous Dataloader (where batches were forced to be 1 whole day)
+    # def __next__(self):
+    #     if self._iter_count >= len(self):
+    #         del self._buffer
+    #         # Call gc.collect()?
+    #         raise StopIteration
+
+    #     i_ds_batch = self.idx_into_ds[self._iter_count]                         # shape (batch_size)
+    #     for i, i_ds in enumerate(i_ds_batch):
+    #         if self.speckle:                                                    # This is probably very slow code...
+    #             key = jr.fold_in(self._speckle_key, self._shuffle_count*self._iter_count + i)
+    #             idx_into_day = jr.permutation(key, self.dataset.num_frames[i_ds])
+    #             idx_into_day = np.sort(idx_into_day[:self.num_frames_per_day])
+    #             self._buffer = self._buffer.at[i].set(self.dataset[i_ds][idx_into_day])
+    #         else:
+    #             self._buffer = self._buffer.at[i].set(self.dataset[i_ds][:self.num_frames_per_day])
+        
+    #     self._iter_count += 1
+
+    #     return self._buffer

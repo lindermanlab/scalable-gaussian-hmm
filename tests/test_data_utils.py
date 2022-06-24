@@ -16,8 +16,8 @@ import jax.numpy as np
 import jax.random as jr
 
 from kf.data_utils import (FishPCDataset, FishPCDataloader,
-                           FishPCDataloaderDay,
                            arg_uniform_split)
+                           
 
 DATADIR = os.environ['DATADIR']
 fish_name = 'fish0_137'
@@ -167,76 +167,33 @@ class TestPCDataset(chex.TestCase):
         self.assertNotEqual(test_ds.filenames, test_ref)
 
 class TestPCDataloader(chex.TestCase):
-    def setUp(self):
-        super().setUp()
-        self.ds = FishPCDataset(fish_name, DATADIR, data_subset='all', min_num_frames=0)
-        self.seed = jr.PRNGKey(519)
+    def testShapeFullDays(self,):
+        """Test length and batch shapes when loading full days of data."""
 
-    def testBatchOne(self,):
-        """Batch size of 1"""
+        ds = FishPCDataset(fish_name, DATADIR, data_subset='all', min_num_frames=1700000)
 
-        num_frames_per_day = 500
-        dl = FishPCDataloader(self.ds, batch_size=1, num_frames_per_day=num_frames_per_day).__iter__()
-
-        dl_shuffled = FishPCDataloader(self.ds, batch_size=1, num_frames_per_day=num_frames_per_day,
-                                       shuffle=True, seed=self.seed).__iter__()
-
-        ref_batch_shape = (1, num_frames_per_day, self.ds.dim)
-
+        num_frames_per_batch = int(np.min(ds.num_frames))
+        dl = FishPCDataloader(ds, batch_size=1, num_frames_per_batch=num_frames_per_batch).__iter__()
         
-        self.assertEqual(dl.batch_shape, ref_batch_shape,
-                         f'Expected batch shape {ref_batch_shape}, received {dl.batch_shape}.')
-        self.assertEqual(dl_shuffled.batch_shape, ref_batch_shape,
-                         f'Expected batch shape {ref_batch_shape}, received {dl_shuffled.batch_shape}.')
+        self.assertEqual(len(dl), len(ds))
+        self.assertEqual(dl.batch_shape, (1, num_frames_per_batch, ds.dim),
+                         f'Expected batch shape {(1, num_frames_per_batch, ds.dim)}, received {dl.batch_shape}.')
 
-        self.assertTrue((dl.idx_into_ds!=dl_shuffled.idx_into_ds).mean()>0.5,
-                        'Expected unshuffled and shuffled dataloaders to have different data indices.')
+    def testShapeSplitDays(self,):
+        """Test length and batch shapes when loading days of data in batches."""
 
-    def testBatchAll(self,):
-        """Load entire dataset"""
+        ds = FishPCDataset(fish_name, DATADIR, data_subset=(0,4), min_num_frames=1700000)
 
-        num_frames_per_day = 10
-        dl = FishPCDataloader(self.ds, batch_size=-1, num_frames_per_day=num_frames_per_day)
+        num_frames_per_batch = 400000 # Therefore, expect 4 batches from a day of data
+        dl = FishPCDataloader(ds, batch_size=-1, num_frames_per_batch=num_frames_per_batch)
 
-        ref_batch_shape = (len(self.ds), num_frames_per_day, self.ds.dim)
+        self.assertEqual(len(dl), 1,
+                         f'Loading all data at once. Expected Dataloader length 1, received {len(dl)}')
+        self.assertEqual(dl.batch_shape, (len(ds)*4, num_frames_per_batch, ds.dim),
+                         f'Expecting batch shape {(len(ds)*4, num_frames_per_batch, ds.dim)}, received {dl.batch_shape}')
 
-        self.assertEqual(dl.batch_shape, ref_batch_shape)
-    
-    def testDropLast(self,):
-        """Ensure drop_last behavior automatically enforced."""
-
-        num_frames_per_day = 10
-        batch_size = 5
-        dl = FishPCDataloader(self.ds, batch_size=batch_size, num_frames_per_day=num_frames_per_day,
-                              shuffle=True, seed=self.seed).__iter__()
-
-        ref_num_batches = len(self.ds) // batch_size
-        ref_batch_shape = (batch_size, num_frames_per_day, self.ds.dim)
-
-        self.assertEqual(len(dl), ref_num_batches,
-                         f'Expected Dataloader to be length {ref_num_batches} (i.e. num_batches), received {len(dl)}')
-        
-        self.assertEqual(dl.batch_shape, ref_batch_shape)
-
-    def testSpeckle(self,):
-        """Randomly select frames within a day of data."""
-        num_frames_per_day = 10
-        batch_size = 5
-
-        dl = FishPCDataloader(self.ds,
-                              batch_size=batch_size,
-                              num_frames_per_day=num_frames_per_day).__iter__()
-        dl_speckled = FishPCDataloader(self.ds,
-                                       batch_size=batch_size,
-                                       num_frames_per_day=num_frames_per_day,
-                                       speckle=True, seed=self.seed).__iter__()
-
-        data = next(dl)    
-        data_speckled = next(dl_speckled)
-        self.assertFalse(np.allclose(data, data_speckled))
-
-class TestPCDataloaderDay(chex.TestCase):
-    def testBasic(self,):
+    def testBatchBasic(self,):
+        """Test Dataloader loading correct batches of data."""
         # Load first 3 files, modify Dataset to think files only have ~100 frames
         ds = FishPCDataset(fish_name, DATADIR, data_subset=(0,3), min_num_frames=0)
         ds._num_frames = np.array([98, 123, 100])
@@ -247,7 +204,7 @@ class TestPCDataloaderDay(chex.TestCase):
         batch_size = 5
         batch_shape = (batch_size, num_frames_per_batch, ds.dim)
 
-        dl = FishPCDataloaderDay(ds,
+        dl = FishPCDataloader(ds,
                                 batch_size=batch_size,
                                 num_frames_per_batch=num_frames_per_batch)
         self.assertEqual(len(dl), 3)
@@ -271,7 +228,8 @@ class TestPCDataloaderDay(chex.TestCase):
         
         self.assertTrue(np.all(b==ref))
     
-    def testShuffle(self,):
+    def testBatchShuffle(self,):
+        """Test Dataloader loading correct batches of data when shuffled."""
         # Load first 3 files, modify Dataset to think files only have ~100 frames
         ds = FishPCDataset(fish_name, DATADIR, data_subset=(0,4), min_num_frames=0)
         ds._num_frames = np.array([98, 123, 100, 131])
@@ -282,7 +240,7 @@ class TestPCDataloaderDay(chex.TestCase):
         batch_size = 5
         batch_shape = (batch_size, num_frames_per_batch, ds.dim)
 
-        dl = FishPCDataloaderDay(ds,
+        dl = FishPCDataloader(ds,
                                 batch_size=batch_size,
                                 num_frames_per_batch=num_frames_per_batch,
                                 shuffle=True,
@@ -336,6 +294,25 @@ class TestPCDataloaderDay(chex.TestCase):
         b = dl.__next__()
         ref = ds[3][0:100].reshape(*batch_shape)
         self.assertTrue(np.all(b==ref))
+
+    # TODO
+    # def testSpeckle(self,):
+    #     """Randomly select frames within a day of data."""
+    #     # Create a dataset....  
+    #     num_frames_per_day = 10
+    #     batch_size = 5
+
+    #     dl = FishPCDataloader(ds,
+    #                           batch_size=batch_size,
+    #                           num_frames_per_day=num_frames_per_day).__iter__()
+    #     dl_speckled = FishPCDataloader(ds,
+    #                                    batch_size=batch_size,
+    #                                    num_frames_per_day=num_frames_per_day,
+    #                                    speckle=True, seed=self.seed).__iter__()
+
+    #     data = next(dl)    
+    #     data_speckled = next(dl_speckled)
+    #     self.assertFalse(np.allclose(data, data_speckled))
         
 class TestMiscFns(chex.TestCase):
     def testUniformSplit(self,):
