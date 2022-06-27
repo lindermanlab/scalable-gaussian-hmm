@@ -380,3 +380,27 @@ class FishPCDataloader():
     #     self._iter_count += 1
 
     #     return self._buffer
+
+def save_hmm(fpath: str, hmm):
+    """Save GaussianHMM in .npz format."""
+    import numpy as np  # jax.numpy has not yet implemented this method
+    np.savez_compressed(fpath, 
+        initial_probabilities = hmm.initial_probabilities,
+        transition_matrix = hmm.transition_matrix,
+        emission_means = hmm.emission_means,
+        emission_covariance_matrices = hmm.emission_covariance_matrices)
+    return 
+
+def load_hmm(fpath: str):
+    """Loads a GaussianHMM from .npz format."""
+    from ssm_jax.hmm.models import GaussianHMM
+
+    keys = ['initial_probabilities',
+            'transition_matrix',
+            'emission_means',
+            'emission_covariance_matrices']
+
+    with np.load(fpath) as f:
+        hmm = GaussianHMM(**{k: f[k] for k in keys})
+
+    return hmm
