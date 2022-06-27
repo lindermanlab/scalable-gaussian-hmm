@@ -11,7 +11,6 @@ import jax.numpy as np
 import jax.random as jr
 from jax import lax
 
-# TODO SWITCH ORDER
 def arg_uniform_split(target_set_size, set_sizes, set_ids=None):
     """Returns a function that splits the original set of different sizes into
     sets of uniforms sizes, in order. drop_last behavior automatically enforced.
@@ -120,10 +119,13 @@ class FishPCDataset():
             NB: file removal is performed AFTER subsetting into directory, so
             if, for example, data_subset=(i_start, i_end), len(self) may be
             less than (i_end - i_start - 1).
+        max_num_frames: int, default None
+            If specified (e.g. 1.8M), limits the dataset to only recognize the
+            first MAX_NUM_FRAMES frames in the dataset. Useful for debugging.
     """
 
-    def __init__(self, name: str, data_dir: str,
-                 data_subset='all', min_num_frames: int=1700000
+    def __init__(self, name: str, data_dir: str, data_subset='all',
+                 min_num_frames: int=1700000, max_num_frames: int=None,
                  ):
         self.name = name
 
@@ -155,6 +157,8 @@ class FishPCDataset():
            len(h5py.File(join(self._dir, f), 'r')['stage/axis1'])
            for f in self.filenames
         ])
+        if max_num_frames is not None:
+            self._num_frames = np.minimum(self._num_frames, max_num_frames)
         
         # Remove recording days with not enough frames
         self.min_num_frames = min_num_frames
