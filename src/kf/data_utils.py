@@ -194,33 +194,28 @@ class FishPCDataset():
     def __add__(self, other):
         raise NotImplementedError
 
-    def train_test_split(self,
-                         num_train: int=None,
-                         num_test: int=None,
-                         frac_train: float=None,
-                         frac_test: float=None,
+    def train_test_split(self, num_train: [int,float], num_test: [int, float],
                          seed: jr.PRNGKey=None):
         """Split current dataset into a training set and a testing set.
 
-        One of num_* or frac_* must be specified, for both train and test sizes.
-        If both are specified, num_* is retained (and frac_* is ignored).
-
-        If seed is not None, dataset is permuted randomly. Otherwise (default),
-        the first N_train + N_test days are used, in sequential order.
+        Parameters:
+            num_train: scalar.
+                If num_train >= 1, it is interpreted as the number of files
+                in the dataset to allocate to trainig. If num_train < 1, it is
+                interpreted as the fraction of files in the dataset to allocate.
+            num_test: scalar. Similiar to num_train, but for testing.
+            seed: jr.PRNGKey, default: None
+                If not None, dataset is permuted randomly. Otherwise (default),
+                the first N_train + N_test files are used.
 
         Returns
             train_dataset: FishPCDataset
             test_dataset: FishPCDataset
         """
 
-        assert (num_train is not None) or (frac_train is not None), \
-            "One of `num_train[int]` or `frac_train[float]` must be specified."
-
-        assert (num_test is not None) or (frac_test is not None), \
-            "One of `num_test[int]` or `frac_test[float]` must be specified."
-
-        num_train = num_train if num_train else int(frac_train * len(self))
-        num_test = num_test if num_test else int(frac_test * len(self))
+        _cond = lambda num: int(num) if num >= 1 else int(num * len(self))
+        num_train = _cond(num_train)
+        num_test = _cond(num_test)
 
         i_full = jr.permutation(seed, np.arange(len(self))) \
                  if seed is not None else np.arange(len(self))

@@ -17,7 +17,6 @@ import jax.random as jr
 
 from kf.data_utils import (FishPCDataset, FishPCDataloader,
                            arg_uniform_split)
-                           
 
 DATADIR = os.environ['DATADIR']
 fish_name = 'fish0_137'
@@ -125,7 +124,7 @@ class TestPCDataset(chex.TestCase):
         # Specify via mix of frac and integer. Value of frac_train specified 
         # such that int(207 * 0.025) ==5, so we can reuse above references
         frac_train = 0.025 
-        train_ds, test_ds = ds.train_test_split(frac_train=frac_train, num_test=num_test)
+        train_ds, test_ds = ds.train_test_split(num_train=frac_train, num_test=num_test)
         self.assertTrue(train_ds.filenames == train_ref)
         self.assertTrue(test_ds.filenames == test_ref)
 
@@ -162,7 +161,7 @@ class TestPCDataset(chex.TestCase):
         # such that int(207 * 0.025) ==5, so we can reuse above references
         frac_train = 0.025 
         train_ds, test_ds = ds.train_test_split(
-            frac_train=frac_train, num_test=num_test, seed=seed)
+            num_train=frac_train, num_test=num_test, seed=seed)
         self.assertNotEqual(train_ds.filenames, train_ref)
         self.assertNotEqual(test_ds.filenames, test_ref)
 
