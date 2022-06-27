@@ -239,96 +239,13 @@ class FishPCDataset():
                                       min_num_frames=self.min_num_frames)
         return train_dataset, test_dataset
 
-
-class FishPCDataloader():
-    """Provides an iterable over the given dataset. Iterator returns an array of
-    shape (batch_size, num_frames_per_day, dim). Automatically enforces
-    drop_last=True behavior.
-    
-    Parameters
-        dataset: FishPCDataset
-        batch_size: int, default 1
-            Number of batches to return. If batch_size=-1, load entire dataset.
-        num_frames_per_day: int, default -1
-            If -1, use MIN_NUM_FRAMES, which is defined by the recording day in
-            the dataset with the fewest number of frames. Users may also specify
-            a value <= MIN_NUM_FRAMES. This guarantees uniform batch shape. 
-        shuffle: bool, default: False
-            If True, reshuffle data at every epoch. This is kept track of in
-            by the internal `_shuffle_count` attribute.
-        speckle: bool, default: False
-            If True, uses a sorted, randomly selected set of frames within each
-            day of data. If False (default), selects the first num_frames_per_day
-            frames to use. Recall that not all frames in a day are used, for
-            uniform batch shape purposes. 
-        seed: PRNGKey, default: None
-            If `shuffle` or `speckle` is True, a global key must be provided.
-    """
-
-    def __init__(self,
-                 dataset,
-                 batch_size:int=1,
-                 num_frames_per_day: int=-1,
-                 shuffle: bool=False,
-                 speckle: bool=False,
-                 seed:jr.PRNGKey=None,
-                 ):
-        self.dataset = dataset
-        self.batch_size = batch_size if batch_size > 0 else len(dataset)
-
-        # By default, self.num_frames_per_day is set to the minimum common number
-        # of frames (MIN_NUM_FRAMES). If user passes in specification, ensure
-        # that num_frames_per_day <= MIN_NUM_FRAMES to ensure uniform batch size.
-        # See how this variable is used in `collate` function...
-        self.num_frames_per_day = int(np.min(dataset.num_frames))
-        if num_frames_per_day > 0:
-            self.num_frames_per_day = \
-                    int(np.minimum(num_frames_per_day, self.num_frames_per_day))
-
-        # Parameters for randomized iterator
-        self.shuffle = shuffle
-        self.speckle = speckle
-        if shuffle or speckle:
-            self._shuffle_key, self._speckle_key = jr.split(seed)
-        self._shuffle_count = 0                                                 # "Global counter" to ensure successive calls to this instance results in different randomizations
-        return
-
-    @property
-    def batch_shape(self) -> chex.Shape:
-        """Return shape of each batch of data"""
-        return (self.batch_size, self.num_frames_per_day, self.dataset.dim)
-
-    def __len__(self) -> int:
-        return len(self.dataset) // self.batch_size
-
-    def __iter__(self):
-        # Reset this iterator instance's counter
-        self._iter_count = 0
-
-        # Create data buffer to reduce memory footprint
-        self._buffer = np.empty(self.batch_shape)
-
-        # Create (maybe random) index into dataset, shape (num_batches, batch_size)
-        self.idx_into_ds = np.arange(0, len(self.dataset))
-        if self.shuffle:
-            key = jr.fold_in(self._shuffle_key, self._shuffle_count)
-            self.idx_into_ds = jr.permutation(key, len(self.dataset))
-            self._shuffle_count += 1
-        
-        self.idx_into_ds = self.idx_into_ds[:len(self)*self.batch_size]
-        self.idx_into_ds = self.idx_into_ds.reshape(-1, self.batch_size)
-       
-        return self
-    
-    
-
 class FishPCDataloader():
     """Provides an iterable over the given dataset. Allows splitting a day into
     batches. Iterator returns an array of shape (batch_size, num_frames, dim).
     Automatically enforces drop_last=True behavior.
 
     To batch "by day", instantiate this with parameter
-    num_frames_per_batch = int(np.min(dataset.num_frames))
+        num_frames_per_batch = int(np.min(dataset.num_frames))
     
     Parameters
         dataset: FishPCDataset
