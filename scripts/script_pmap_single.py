@@ -11,7 +11,6 @@
 
 import os
 import argparse
-import time
 from datetime import datetime
 from tqdm import tqdm
 from sys import stdout
@@ -105,9 +104,8 @@ def fit_hmm_jmap(train_data, test_data, hmm,
                 initial=0,
                 postfix=f'train={-np.inf}, test={-np.inf}',
     )
+    
     for itr in pbar:
-        tic = time.perf_counter()
-        # --------------------------------------------------------
         def e_step(hmm, dl):
             _ngss = [jmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
             ngss = reduce(NGSS.concat, _ngss)
@@ -123,12 +121,8 @@ def fit_hmm_jmap(train_data, test_data, hmm,
         train_lls = train_lls.at[itr].set(train_ll)
         test_lls  = test_lls.at[itr].set(test_ll)
     
-        pbar.set_postfix(f'train={train_ll:0.3f}, test={test_ll:0.3f}')
-
-        toc = time.perf_counter()
-        tqdm.write(f"i{itr}: {toc-start_time:0.2f} s", file=stdout)
+        pbar.set_postfix_str(f'train={train_ll:0.3f}, test={test_ll:0.3f}')
         
-
     return hmm, train_lls, test_lls
     
 FIT_HMM = dict(vmap=partial(fit_hmm_jmap, method='vmap'),
