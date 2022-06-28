@@ -1,18 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=single_fish_pmap
 #SBATCH --partition=hns
-#SBATCH --cpus-per-task=4
 #SBATCH --mincpus=4
 #SBATCH --time=01:00:00
 #SBATCH --mem=8G
-#SBATCH --chdir ~/killifish/scripts/
 #SBATCH --output=/scratch/users/%u/kf_tmp/job.%j.out
 #SBATCH --error=/scratch/users/%u/kf_tmp/job.%j.err
 
-# NB: Important to specify `mincpus`` to be <= `cpus-per-task``.
-# This is the minimum number of CPUs required on node, and a "hard-requirement"
-# for SLURM to fulfill, where as `cpus-per-task` is more a "soft-requirement". 
-# If unspecified, Slurm happily allocates a node with 1 CPU.
+# NB: Apparently --chdir does not accept pattersn such as %u. So use `cd` below
+# NB: Important to specify `--mincpus`  instead of `--cpus-per-task` since
+#     Slurm seems to consider the former a "constraint"/"hard requirement"
+#     whereas it considers the latter as more of a "soft requirement". 
 
 # ================================================
 # Slurm job script for testing EM on a single fish
@@ -28,7 +26,7 @@ module load python/3.9.0
 venv activate kf-cpu
 
 # Set XLA_FLAGS to match number of CPUs allocated for this job
-echo 'CPUS for this job ' $SLURM_JOB_CPUS_PER_NODE, 'CPUS available on this node ' $SLURM_CPUS_ON_NODE
+echo 'CPUS for this job: ' $SLURM_JOB_CPUS_PER_NODE, 'CPUS available on this node: ' $SLURM_CPUS_ON_NODE
 export XLA_FLAGS=--xla_force_host_platform_device_count=$SLURM_JOB_CPUS_PER_NODE
 
 # ---------------------------------------------------------------------------
@@ -54,5 +52,5 @@ num_em_iters=20
 
 seed=20220627
 
-# python -u flag: Force  stdin,  stdout and stderr to be totally unbuffered.
-python -u script_pmap_single.py --method pmap --seed $seed --batch_size $batch_size --num_frames_per_batch $num_frames_per_batch --num_train $frac_train --num_test $frac_test --num_hmm_states $num_hmm_states --num_em_iters $num_em_iters
+cd ~/killifish/
+python ./scripts/script_pmap_single.py --method pmap --seed $seed --batch_size $batch_size --num_frames_per_batch $num_frames_per_batch --num_train $frac_train --num_test $frac_test --num_hmm_states $num_hmm_states --num_em_iters $num_em_iters

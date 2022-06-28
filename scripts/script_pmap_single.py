@@ -13,26 +13,24 @@ import os
 import argparse
 import time
 from datetime import datetime
+from tqdm import tqdm
+from sys import stdout
+
+from functools import partial, reduce
+from operator import mul
 
 from jax import jit, vmap, pmap, lax, local_device_count
 import jax.numpy as np
 import jax.random as jr
 
-from functools import partial, reduce
-from operator import mul
-
 from ssm_jax.hmm.models import GaussianHMM
 from kf.inference import (sharded_e_step, collective_m_step,
                           NormalizedGaussianHMMSuffStats as NGSS)
 from kf.data_utils import FishPCDataset, FishPCDataloader, save_hmm
-from tqdm import trange
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['TEMPDIR']
 fish_id = 'fish0_137'
-
-# Calculate byte size of arrays, assuming float32 precision
-get_nbytes_32 = lambda shp: reduce(mul, shp) * 4
 
 # -------------------------------------
 # Suppress JAX/TFD warning: ...`check_dtypes` is deprecated... message
@@ -80,15 +78,15 @@ parser.add_argument(
     '--num_hmm_states', type=int, default=20,
     help='Number of HMM states to fit')
 
-# -------------------------------------
+# =============================================================================
 
-def fit_hmm_jmap(train_dataset, test_dataset, hmm,
+def fit_hmm_jmap(train_data, test_data, hmm,
                  num_iters, batch_size, num_frames_per_batch, method='vmap'):
     """Fit HMM to FishPCDataset by vmapping over batches using EM.
 
     Parameters
-        train_dataset: FishPCDataset
-        test_dataset: FishPCDataset
+        train_data: FishPCDataloader
+        test_data: FishPCDataloader
         hmm: GaussianHMM
         num_iters: int. Number of EM steps to run.
         batch_size: int. Number of days per batch
@@ -97,48 +95,39 @@ def fit_hmm_jmap(train_dataset, test_dataset, hmm,
     """
 
     jmap = vmap if method == 'vmap' else pmap
-    
-    emissions_dim = train_dataset.dim
-
-    # Load all emissions, shape (num_days, num_frames_per_batch, dim)
-    train_dl = FishPCDataloader(train_dataset,
-                                batch_size=batch_size,
-                                num_frames_per_batch=num_frames_per_batch)
-
-    test_dl  = FishPCDataloader(test_dataset,
-                                batch_size=1,
-                                num_frames_per_batch=num_frames_per_batch)
-
-    print('Anticipated train, test emissions array nbytes [MB]')
-    print(get_nbytes_32(train_dl.batch_shape)/(1024**2),
-          get_nbytes_32(test_dl.batch_shape)/(1024**2),)
 
     train_lls = -np.ones(num_iters) * np.inf
     test_lls  = -np.ones(num_iters) * np.inf
 
-    pbar = trange(num_iters)
-    pbar.set_description(f"Train: -inf, test: -inf")
+    pbar = tqdm(iterable=range(num_iters),
+                desc=f"Epochs",
+                file=stdout,
+                initial=0,
+                postfix=f'train={-np.inf}, test={-np.inf}',
+    )
     for itr in pbar:
-        start_time = time.perf_counter()
+        tic = time.perf_counter()
         # --------------------------------------------------------
         def e_step(hmm, dl):
             _ngss = [jmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
             ngss = reduce(NGSS.concat, _ngss)
             return ngss, ngss.batch_marginal_loglik()
         
-        train_ngss, train_ll = e_step(hmm, train_dl)
+        train_ngss, train_ll = e_step(hmm, train_data)
         hmm = collective_m_step(train_ngss)
         
         # --------------------------------------------------------
         # Evaluate on test set and save log-likelihoods
-        _, test_ll = e_step(hmm, test_dl)
+        _, test_ll = e_step(hmm, test_data)
 
         train_lls = train_lls.at[itr].set(train_ll)
         test_lls  = test_lls.at[itr].set(test_ll)
     
-        print(f"i{itr}: {time.perf_counter()-start_time:0.4f} s")
-        pbar.set_description(f"Train: {train_ll:.2f}, test: {test_ll:.2f}")
-        pbar.update()
+        pbar.set_postfix(f'train={train_ll:0.3f}, test={test_ll:0.3f}')
+
+        toc = time.perf_counter()
+        tqdm.write(f"i{itr}: {toc-start_time:0.2f} s", file=stdout)
+        
 
     return hmm, train_lls, test_lls
     
@@ -147,6 +136,9 @@ FIT_HMM = dict(vmap=partial(fit_hmm_jmap, method='vmap'),
                )
 
 def main():
+    # TODO Allow warm-starting of hmm fit code from saved file.
+    # - Add argument to to start with random initialization or from file
+    # - If warm-starting, extract last iteration and log likelihoods, same seed for splitting dataset
     args = parser.parse_args()
     method = args.method
     profile = args.profile
@@ -167,7 +159,7 @@ def main():
     if method =='pmap':
         assert local_device_count() >= args.batch_size, \
                f"Found {local_device_count()} devices, expected {args.batch_size} devices."
-        print(f'USING PMAP: found {local_device_count()} devices on node')
+
     # ==========================================================================
     seed_split_data, seed_init_hmm = jr.split(seed, 2)
 
@@ -182,10 +174,27 @@ def main():
                                                  num_test=num_test,
                                                  seed=seed_split_data)
     
-    print(f"Initializing training ({len(train_ds)} days) " 
-          + f"and testing ({len(test_ds)} days) datasets, "
-          + f"with {num_frames_per_batch} frames per batch...")
-
+    print(f"Initialized datasets: training ({len(train_ds)} days) ")
+    print(f"\ttrain: {len(train_ds):3d} days with {num_frames_per_batch} frames per batch")
+    print(f"\ttest : {len(test_ds):3d} days with {num_frames_per_batch} frames per batch")
+    
+    # TODO Move train_test_split function to FishPCDataloader class
+    # so that we can shuffle over batches (and not just over days)
+    # Load all emissions, shape (num_days, num_frames_per_batch, dim)
+    train_dl = FishPCDataloader(train_ds,
+                                batch_size=batch_size,
+                                num_frames_per_batch=num_frames_per_batch)
+          
+    test_dl  = FishPCDataloader(test_ds,
+                                batch_size=1,
+                                num_frames_per_batch=num_frames_per_batch)
+    
+    print("Initialized dataloaders")
+    print(f"\ttrain: {len(train_dl):3d} batches of "
+          + f"shape {train_dl.batch_shape} [{reduce(mul, train_dl.batch_shape)*4/(1024**2):.1f} MB]")
+    print(f"\ttest : {len(test_dl):3d} batches of "
+          + f"shape {test_dl.batch_shape} [{reduce(mul, test_dl.batch_shape)*4/(1024**2):.1f} MB]")
+    
     # --------------------------------------------------------------------------
     # Start trace
     if profile == 'time':
@@ -201,7 +210,7 @@ def main():
     # Fit function
     print(f'Running...')
     hmm, train_lls, test_lls = \
-                FIT_HMM[method](train_ds, test_ds, init_hmm, num_em_iters,
+                FIT_HMM[method](train_dl, test_dl, init_hmm, num_em_iters,
                                 batch_size, num_frames_per_batch)
     train_lls.block_until_ready()
 
