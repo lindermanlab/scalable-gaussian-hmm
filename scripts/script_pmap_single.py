@@ -9,6 +9,8 @@
 #   3. Now, we can finally run the script. From killifish directory,
 #       - python scripts/script_pmap_single.py --method pmap --profile mem --batch_size NUM_CPUS --num_train 6 --num_test 1 --num_em_iters 10
 
+# python script_pmap_single.py --batch_size 4 --num_frames_per_batch 72000 --num_train 0.05 --num_test 0.005 --num_hmm_states 20 --num_em_iters 20
+
 import os
 import argparse
 from datetime import datetime
@@ -26,6 +28,8 @@ from ssm_jax.hmm.models import GaussianHMM
 from kf.inference import (sharded_e_step, collective_m_step,
                           NormalizedGaussianHMMSuffStats as NGSS)
 from kf.data_utils import FishPCDataset, FishPCDataloader, save_hmm
+
+import pdb
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['TEMPDIR']
@@ -104,7 +108,7 @@ def fit_hmm_jmap(train_data, test_data, hmm,
                 initial=0,
                 postfix=f'train={-np.inf}, test={-np.inf}',
     )
-    
+
     for itr in pbar:
         def e_step(hmm, dl):
             _ngss = [jmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
@@ -122,12 +126,14 @@ def fit_hmm_jmap(train_data, test_data, hmm,
         test_lls  = test_lls.at[itr].set(test_ll)
     
         pbar.set_postfix_str(f'train={train_ll:0.3f}, test={test_ll:0.3f}')
+
+        if np.isnan(test_ll):
+            pdb.set_trace()
         
     return hmm, train_lls, test_lls
     
 FIT_HMM = dict(vmap=partial(fit_hmm_jmap, method='vmap'),
-               pmap=partial(fit_hmm_jmap, method='pmap'),
-               )
+               pmap=partial(fit_hmm_jmap, method='pmap'),)
 
 def main():
     # TODO Allow warm-starting of hmm fit code from saved file.
@@ -168,10 +174,7 @@ def main():
                                                  num_test=num_test,
                                                  seed=seed_split_data)
     
-    print(f"Initialized datasets: training ({len(train_ds)} days) ")
-    print(f"\ttrain: {len(train_ds):3d} days with {num_frames_per_batch} frames per batch")
-    print(f"\ttest : {len(test_ds):3d} days with {num_frames_per_batch} frames per batch")
-    
+    del full_ds
     # TODO Move train_test_split function to FishPCDataloader class
     # so that we can shuffle over batches (and not just over days)
     # Load all emissions, shape (num_days, num_frames_per_batch, dim)
@@ -180,20 +183,13 @@ def main():
                                 num_frames_per_batch=num_frames_per_batch)
           
     test_dl  = FishPCDataloader(test_ds,
-                                batch_size=1,
+                                batch_size=batch_size,
                                 num_frames_per_batch=num_frames_per_batch)
     
-    print("Initialized dataloaders")
-    print(f"\ttrain: {len(train_dl):3d} batches of "
-          + f"shape {train_dl.batch_shape} [{reduce(mul, train_dl.batch_shape)*4/(1024**2):.1f} MB]")
-    print(f"\ttest : {len(test_dl):3d} batches of "
-          + f"shape {test_dl.batch_shape} [{reduce(mul, test_dl.batch_shape)*4/(1024**2):.1f} MB]")
-    
-    # --------------------------------------------------------------------------
-    # Start trace
-    if profile == 'time':
-        jax.profiler.start_trace(logdir)
-    
+    print(f"Initialized datasets ({len(train_ds)} days training, {len(test_ds)} days testing)")
+    print(f"\ttrain: {len(train_dl):3d} batches of shape {train_dl.batch_shape}")
+    print(f"\ttest : {len(test_dl):3d} batches of shape {test_dl.batch_shape}")
+        
     # --------------------------------------------------------------------------
     # Initialize hidden Markov model
     print(f'Initializing HMM with {num_hmm_states} states...')
@@ -209,18 +205,8 @@ def main():
     train_lls.block_until_ready()
 
     # --------------------------------------------------------------------------
-    # Stop trace
-    
-    timestamp = datetime.now().strftime("%y%m%d_%H%M")
-    print(f'Finished, saving results to file with prefix {timestamp}')
-    if profile == 'time':
-        jax.profiler.stop_trace()
-    elif profile == 'mem':
-        jax.profiler.save_device_memory_profile(
-                    os.path.join(logdir, f"{timestamp}-memory_{method}.prof"))    
-
-    # ----
     # Save likelihoods and hmm
+    timestamp = datetime.now().strftime("%y%m%d_%H%M")
     fpath = os.path.join(TEMPDIR, f"{timestamp}-{num_hmm_states}_states-{num_em_iters}_iters.npz")
     save_hmm(fpath, hmm, train_lls=train_lls, test_lls=test_lls)
     return

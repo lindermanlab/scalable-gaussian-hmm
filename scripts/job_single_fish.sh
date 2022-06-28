@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=single_fish_pmap
+#SBATCH --job-name=pmap_single_fish
 #SBATCH --partition=hns
 #SBATCH --mincpus=4
 #SBATCH --time=01:00:00
@@ -52,5 +52,5 @@ num_em_iters=20
 
 seed=20220627
 
-cd ~/killifish/
-python ./scripts/script_pmap_single.py --method pmap --seed $seed --batch_size $batch_size --num_frames_per_batch $num_frames_per_batch --num_train $frac_train --num_test $frac_test --num_hmm_states $num_hmm_states --num_em_iters $num_em_iters
+cd ~/killifish/scripts
+python ./script_pmap_single.py --method pmap --seed $seed --batch_size $batch_size --num_frames_per_batch $num_frames_per_batch --num_train $frac_train --num_test $frac_test --num_hmm_states $num_hmm_states --num_em_iters $num_em_iters
