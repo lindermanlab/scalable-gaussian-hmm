@@ -286,9 +286,9 @@ class FishPCDataloader():
         
         # Default (or if <=0): Set batch_size to number of batches in Dataset
         # such that num_batches = len(dl) = 1
-        self.batch_size = batch_size \
-                          if batch_size > 0 \
-                          else int((self.dataset.num_frames // self.num_frames_per_batch).sum())
+        self._batch_size = int(batch_size) \
+                           if batch_size > 0 \
+                           else int((self.dataset.num_frames // self.num_frames_per_batch).sum())
 
         # Parameters for randomized iterator
         self.shuffle = shuffle
@@ -298,14 +298,24 @@ class FishPCDataloader():
         self._shuffle_count = 0                                                 # "Global counter" to ensure successive calls to this instance results in different randomizations
         return
 
+    def __len__(self) -> int:
+        """Equivalent to number of batches."""
+        return (self.dataset.num_frames // self.num_frames_per_batch).sum() // self.batch_size
+
+    @property
+    def batch_size(self) -> int:
+        """Number of minibatches in each batch of data."""
+        return self._batch_size
+
     @property
     def batch_shape(self) -> chex.Shape:
         """Return shape of each batch of data"""
         return (self.batch_size, self.num_frames_per_batch, self.dataset.dim)
 
-    def __len__(self) -> int:
-        """Equivalent to number of batches."""
-        return (self.dataset.num_frames // self.num_frames_per_batch).sum() // self.batch_size
+    @property
+    def num_minibatches(self) -> int:
+        """Total number of minibatches that the dataloader will produce."""
+        return self.batch_size * len(self)
 
     def __iter__(self):
         # Reset this iterator instance's counter
@@ -334,7 +344,6 @@ class FishPCDataloader():
     def __next__(self):
         if self._iter_count >= len(self):
             del self._buffer
-            # Call gc.collect()?
             raise StopIteration
 
         file_and_slices = self.lst_split_args[self._iter_count]
