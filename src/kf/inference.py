@@ -64,20 +64,56 @@ class NormalizedGaussianHMMSuffStats:
     normd_ExxT: chex.Array                          # shape ([M],K,D,D)
     marginal_loglik: float=-np.inf                  # shape ([M],)
     num_emissions: int=0                            # shape ([M],)
-
+    
     @classmethod
-    def concat(cls, a, b, axis=0):
-        """Concatenates instances a and b into a new instance of the class."""
-        return cls(
-            **{k: np.concatenate([a[k], b[k]], axis=axis)
-               for k in cls.__dataclass_fields__.keys()}
-        )
+    def empty(cls, shape: tuple):
+        """Create an empty NGSS object.
 
-    @classmethod
-    def stack(cls, ss_seq, axis=0):
-        """Stack a sequence of class objects along new axis."""
-        _ss_seq = tree_map(lambda arr: np.expand_dims(arr, axis=axis), ss_seq)
-        return reduce(cls.concat, _ss_seq)
+        Useful for efficient memory usage by pre-allocating an NGSS object of a
+        fixed size. Use in conjunction with the instance function `set`.
+        
+        Parameters
+            shape: tuple
+                If length 2, `shape` interpreted as (K,D).
+                Else if length 3, `shape` interpreted as (M,K,D)
+        Returns
+            ngss: NGSS instance with empty fields of appropriate shapes
+        """
+
+        if len(shape) == 2:
+            K, D = shape
+            return cls(
+                init_state_probs=np.empty((K,)),
+                transition_probs=np.empty((K,K,)),
+                w_normalizer=np.empty((K,)),
+                normd_Ex=np.empty((K,D,)),
+                normd_ExxT=np.empty((K,D,D,)),
+            )
+        elif len(shape) == 3:
+            M, K, D = shape
+            return cls(
+                init_state_probs=np.empty((M,K)),
+                transition_probs=np.empty((M,K,K)),
+                w_normalizer=np.empty((M,K)),
+                normd_Ex=np.empty((M,K,D)),
+                normd_ExxT=np.empty((M,K,D,D)),
+                marginal_loglik=np.empty((M,)),
+                num_emissions=np.empty((M,)),
+            )
+        else:
+            raise ValueError(f"Expected tuple of length 2 or 3, received {len(shape)}")
+
+    def batch_set(self, slice, other):
+        """Set field values at indicated indices to field vlaues of `other`.
+        
+        Parameters:
+            slice: int or 1D index slice
+                "Length" of slice must equal M (or 1 if `other` isn't batched)
+            other: NGSS, with shape ([M],...)
+        """
+        for k in self.__dataclass_fields__.keys():
+            setattr(self, k, self[k].at[slice].set(other[k]))
+        return 
 
     def batch_marginal_loglik(self,):
         """Compute average marginal log likelihood from batch of normalized 
@@ -88,6 +124,25 @@ class NormalizedGaussianHMMSuffStats:
         """
         ns = self.num_emissions
         return (ns/ns.sum() * self.marginal_loglik).sum()/ns.sum()
+    
+    @classmethod
+    def concat(cls, a, b, axis=0):
+        """Concatenates instances a and b into a new instance of the class.
+        
+        NB: Both `a` and `b` must have leading batch dimension.
+        NB: Convenient, but can be memory inefficient if calling many times. See
+        instead `cls.empty(shape)` and `self.batch_set` functions
+        """
+        return cls(
+            **{k: np.concatenate([a[k], b[k]], axis=axis)
+               for k in cls.__dataclass_fields__.keys()}
+        )
+
+    @classmethod
+    def stack(cls, ss_seq, axis=0):
+        """Stack a sequence of class objects along new axis."""
+        _ss_seq = tree_map(lambda arr: np.expand_dims(arr, axis=axis), ss_seq)
+        return reduce(cls.concat, _ss_seq)
 
 def sharded_e_step(hmm: GaussianHMM, emissions: chex.Array) -> NormalizedGaussianHMMSuffStats:
     """Computes posterior expected sufficient stats given partial batch of emissions.

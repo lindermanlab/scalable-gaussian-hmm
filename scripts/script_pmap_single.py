@@ -17,6 +17,8 @@ from datetime import datetime
 from tqdm import tqdm
 from sys import stdout
 
+from memory_profiler import profile
+
 from functools import partial, reduce
 from operator import mul
 
@@ -83,6 +85,7 @@ parser.add_argument(
 
 # =============================================================================
 
+@profile(precision=2)
 def fit_hmm_jmap(train_data, test_data, hmm,
                  num_iters, batch_size, num_frames_per_batch, method='vmap'):
     """Fit HMM to FishPCDataset by vmapping over batches using EM.
@@ -106,29 +109,33 @@ def fit_hmm_jmap(train_data, test_data, hmm,
                 desc=f"Epochs",
                 file=stdout,
                 initial=0,
-                postfix=f'train={-np.inf}, test={-np.inf}',
-    )
+                postfix=f'train={-np.inf}, test={-np.inf}',)
 
+    train_ngss = NGSS.empty((train_data.num_minibatches, hmm.num_states, hmm.num_obs))
+    test_ngss  = NGSS.empty((test_data.num_minibatches,  hmm.num_states, hmm.num_obs))
     for itr in pbar:
-        def e_step(hmm, dl):
-            _ngss = [jmap(partial(sharded_e_step, hmm))(ems) for ems in dl]    
-            ngss = reduce(NGSS.concat, _ngss)
-            return ngss, ngss.batch_marginal_loglik()
-        
-        train_ngss, train_ll = e_step(hmm, train_data)
+        def e_step_inplace(hmm, dl, ngss):
+            _e_step = jmap(partial(sharded_e_step, hmm))
+            for i_batch, emissions in enumerate(dl):
+                bslice = np.s_[i_batch*dl.batch_size:(i_batch+1)*dl.batch_size]
+                ngss.batch_set(bslice, _e_step(emissions))
+            return
+
+        e_step_inplace(hmm, train_data, train_ngss)
+        train_ll = train_ngss.batch_marginal_loglik()
         hmm = collective_m_step(train_ngss)
         
         # --------------------------------------------------------
         # Evaluate on test set and save log-likelihoods
-        _, test_ll = e_step(hmm, test_data)
+        e_step_inplace(hmm, test_data, test_ngss)
 
-        train_lls = train_lls.at[itr].set(train_ll)
-        test_lls  = test_lls.at[itr].set(test_ll)
+        train_lls = train_lls.at[itr].set(train_ngss.batch_marginal_loglik())
+        test_lls  = test_lls.at[itr].set(test_ngss.batch_marginal_loglik())
     
         pbar.set_postfix_str(f'train={train_ll:0.3f}, test={test_ll:0.3f}')
 
-        if np.isnan(test_ll):
-            pdb.set_trace()
+        # if np.isnan(train_ll) or np.isnan(test_ll):
+        #     pdb.set_trace()
         
     return hmm, train_lls, test_lls
     
