@@ -160,12 +160,18 @@ def sharded_e_step(hmm: GaussianHMM, emissions: chex.Array) -> NormalizedGaussia
             hmm_smoother(hmm.initial_probabilities, hmm.transition_matrix, lps)
 
     # Compute expected sufficient statistics
+    # Sometimes, w_normalizer = 0, resulting in NaNs in normd_Ex and normed_ExxT
     w_normalizer = posterior.smoothed_probs.sum(axis=0)                         # shape (K,). sum_i w_i, shape (K,)
-    normd_weights = posterior.smoothed_probs / w_normalizer                                  # shape (T,K)
+    normd_weights = posterior.smoothed_probs / w_normalizer                     # shape (T,K)
 
-    normd_Ex = np.einsum('tk, ti->ki', normd_weights, emissions)
-    normd_ExxT = np.einsum('tk, ti, tj->kij',
-                              normd_weights, emissions, emissions)
+    emission_dim = emissions.shape[-1]
+    normd_Ex = np.where(w_normalizer[:,None] < 1e-6,
+                        np.zeros(emission_dim),
+                        np.einsum('tk, ti->ki', normd_weights, emissions))
+
+    normd_ExxT = np.where(w_normalizer[...,None,None] < 1e-6,
+                          1e6 * np.eye(emission_dim),
+                          np.einsum('tk, ti, tj->kij', normd_weights, emissions, emissions))
 
     init_state_probs = posterior.smoothed_probs[0]
     transition_probs = posterior.smoothed_transition_probs_sum
@@ -199,7 +205,8 @@ def collective_m_step(nss: NormalizedGaussianHMMSuffStats) -> GaussianHMM:
 
     # Gaussian emission distribution
     emission_dim = nss.normd_Ex.shape[-1]
-    weights = nss.w_normalizer / nss.w_normalizer.sum(axis=0)                                               # shape (M,K,)
+    weights = nss.w_normalizer / nss.w_normalizer.sum(axis=0)                   # shape (M,K,)
+
     emission_means = (nss.normd_Ex * weights[:,:,None]).sum(axis=0)
     emission_covs  = (nss.normd_ExxT * weights[:,:,None,None]).sum(axis=0) \
                      - np.einsum('ki,kj->kij', emission_means, emission_means) \

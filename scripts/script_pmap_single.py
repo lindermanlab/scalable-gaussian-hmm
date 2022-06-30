@@ -132,10 +132,7 @@ def fit_hmm_jmap(train_data, test_data, hmm,
         train_lls = train_lls.at[itr].set(train_ngss.batch_marginal_loglik())
         test_lls  = test_lls.at[itr].set(test_ngss.batch_marginal_loglik())
     
-        pbar.set_postfix_str(f'train={train_ll:0.3f}, test={test_ll:0.3f}')
-
-        # if np.isnan(train_ll) or np.isnan(test_ll):
-        #     pdb.set_trace()
+        pbar.set_postfix_str(f'train={train_lls[itr]:0.3f}, test={test_lls[itr]:0.3f}')
         
     return hmm, train_lls, test_lls
     
