@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --partition=hns
-#SBATCH --mincpus=4
+#SBATCH --mincpus=8
 #SBATCH --time=02:00:00
-#SBATCH --mem=8G
+#SBATCH --mem=12G
 #SBATCH --output=/scratch/users/%u/kf_tmp/prof.%j.out
 #SBATCH --error=/scratch/users/%u/kf_tmp/prof.%j.err
 #SBATCH --job-name=profile_fish
@@ -52,5 +52,11 @@ seed=20220627
 
 cd ~/killifish/scripts
 
-mprof run -C --output $TEMPDIR/prof.$SLURM_JOB_ID\.mprofile ./script_pmap_single.py --seed $seed --batch_size $batch_size --num_frames_per_batch $num_frames_per_batch --num_train $frac_train --num_test $frac_test --num_hmm_states $num_hmm_states --num_em_iters $num_em_iters
-mprof plot $TEMPDIR/prof.$SLURM_JOB_ID\.mprofile --output $TEMPDIR/prof.$SLURM_JOB_ID\.mprofile.png
+# Capture memory usage of main process and child processes (-C)
+mprof run -C -o $TEMPDIR/prof.$SLURM_JOB_ID\.mprof ./script_pmap_single.py --seed $seed --batch_size $batch_size --num_frames_per_batch $num_frames_per_batch --num_train $frac_train --num_test $frac_test --num_hmm_states $num_hmm_states --num_em_iters $num_em_iters
+
+# Print peak memory usage
+mprof peak $TEMPDIR\prof.$SLURM_JOB_ID\.mprof
+
+# Make mem usage plot with slope (-s)
+mprof plot -s $TEMPDIR\prof.$SLURM_JOB_ID\.mprof -o $TEMPDIR\prof.$SLURM_JOB_ID\.mprof.png
