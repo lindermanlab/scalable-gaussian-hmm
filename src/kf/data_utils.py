@@ -113,19 +113,19 @@ class FishPCDataset():
             - Load all data: 'all'
             - Load range of data: (i_start, i_end)
             - Load specified files: [fname_0, fname_1, ...]
-        min_num_frames: int, default 1.7M.
+        min_frames_per_file: int, default -1 (all)
             If a recording day has fewer than this many frames, omit. Default
             value derived from ~20 Hz x 60 s/min x 60 min/hr x 24 hr/day
             NB: file removal is performed AFTER subsetting into directory, so
             if, for example, data_subset=(i_start, i_end), len(self) may be
             less than (i_end - i_start - 1).
-        max_num_frames: int, default None
+        max_frames_per_file: int, default -1 (all)
             If specified (e.g. 1.8M), limits the dataset to only recognize the
             first MAX_NUM_FRAMES frames in the dataset. Useful for debugging.
     """
 
     def __init__(self, name: str, data_dir: str, data_subset='all',
-                 min_num_frames: int=1700000, max_num_frames: int=None,
+                 min_frames_per_file: int=-1, max_frames_per_file: int=-1,
                  ):
         self.name = name
 
@@ -157,13 +157,14 @@ class FishPCDataset():
            len(h5py.File(join(self._dir, f), 'r')['stage/axis1'])
            for f in self.filenames
         ])
-        if max_num_frames is not None:
-            self._num_frames = np.minimum(self._num_frames, max_num_frames)
+        
+        if (max_frames_per_file is not None) and (max_frames_per_file > 0):
+            self._num_frames = np.minimum(self._num_frames, max_frames_per_file)
+        self._max_frames_per_file = max_frames_per_file
         
         # Remove recording days with not enough frames
-        self.min_num_frames = min_num_frames
-        if min_num_frames:
-            i_keep = (self._num_frames >= min_num_frames)
+        if min_frames_per_file:
+            i_keep = (self._num_frames >= min_frames_per_file)
             self.filenames = [
                 self.filenames[i] for i, b in enumerate(i_keep) if b
             ]
@@ -232,10 +233,10 @@ class FishPCDataset():
         _data_dir = split(self._dir)[0]
         train_dataset = FishPCDataset(self.name, _data_dir,
                                       data_subset=f_train,
-                                      min_num_frames=self.min_num_frames)
+                                      max_frames_per_file=self._max_frames_per_file)
         test_dataset  = FishPCDataset(self.name, _data_dir,
                                       data_subset=f_test,
-                                      min_num_frames=self.min_num_frames)
+                                      max_frames_per_file=self._max_frames_per_file)
         return train_dataset, test_dataset
 
 class FishPCDataloader():
@@ -393,6 +394,8 @@ class FishPCDataloader():
     #     self._iter_count += 1
 
     #     return self._buffer
+
+# ==============================================================================
 
 def save_hmm(fpath: str, hmm, **kwargs):
     """Save GaussianHMM in .npz format.
