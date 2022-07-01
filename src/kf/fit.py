@@ -34,7 +34,8 @@ def fit_jmap(train, test, hmm,
             local devices <= batch size outputted by dataloaders.
     """
 
-    jmap = vmap if method == 'vmap' else pmap
+    # pmap automatically jit-compiles functions, but vmap does not
+    jmap = pmap if method=='pmap' else lambda fn: vmap(jit(fn))
     m_step = jit(collective_m_step)
 
     train_lls = -np.ones(num_iters) * np.inf

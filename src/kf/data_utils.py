@@ -228,7 +228,7 @@ class FishPCDataset():
         # Split dataset by filenames
         f_train = [self.filenames[i] for i in i_full[0:num_train]]
         f_test  = [self.filenames[i] for i in i_full[num_train:num_train+num_test]]
-
+        
         # Create two new datasets
         _data_dir = split(self._dir)[0]
         train_dataset = FishPCDataset(self.name, _data_dir,

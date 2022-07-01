@@ -10,7 +10,7 @@ import jax.numpy as np
 import jax.random as jr
 from ssm_jax.hmm.models import GaussianHMM
 from kf.data_utils import FishPCDataset, FishPCDataloader, save_hmm
-from kf.fit import fit_pmap
+from kf.fit import fit_pmap, fit_vmap
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['TEMPDIR']
@@ -92,6 +92,8 @@ def main():
     num_hmm_states = args.num_hmm_states
     num_em_iters = args.num_em_iters
 
+    fit = fit_pmap if method=='pmap' else fit_vmap
+
     if log_prefix is None:
         timestamp = datetime.now().strftime("%y%m%d_%H%M")
         log_prefix=f"{timestamp}-{num_hmm_states}st-{num_em_iters}it"
@@ -114,7 +116,7 @@ def main():
     train_dl = FishPCDataloader(train_ds,
                                 batch_size=batch_size,
                                 num_frames_per_batch=frames_per_batch)
-          
+    
     test_dl  = FishPCDataloader(test_ds,
                                 batch_size=batch_size,
                                 num_frames_per_batch=frames_per_batch)
@@ -134,21 +136,22 @@ def main():
 
     if profile == 'mem':
         from memory_profiler import memory_usage
-        with open(log_prefix+'.mprof', 'a') as fstream:
-            mem_usage, (hmm, train_lls, test_lls) = \
-                        memory_usage((fit_pmap, fn_args, fn_kwargs),
-                                      retval=True,
-                                      include_children=False,
-                                      multiprocess=True,
-                                      stream=fstream)
+        memlog_path = os.path.join(log_dir, log_prefix+'.mprof')
+        with open(memlog_path+'.mprof', 'a') as fstream:
+            memory_usage((fit, fn_args, fn_kwargs),
+                            retval=True,
+                            include_children=False,
+                            multiprocess=True,
+                            stream=fstream)
 
     else:
-        hmm, train_lls, test_lls = fit_pmap(*fn_args, **fn_kwargs)
+        hmm, train_lls, test_lls = fit(*fn_args, **fn_kwargs)
         train_lls.block_until_ready()
 
     # --------------------------------------------------------------------------
     # Save likelihoods and hmm
-    # save_hmm(log_prefix, hmm, train_lls=train_lls, test_lls=test_lls)
+    fpath = os.path.join(log_dir, log_prefix+'.npz')
+    save_hmm(fpath, hmm, train_lls=train_lls, test_lls=test_lls)
     return
 
 if __name__ == '__main__':
