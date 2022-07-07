@@ -1,4 +1,5 @@
 # Slurm output files
+scripts/.jobs*
 *.out
 *.err
 
