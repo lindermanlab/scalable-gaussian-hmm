@@ -67,7 +67,7 @@ for arg_dict in [SBATCH_ARGS, SCRIPT_ARGS]:
     for flag, kwargs in arg_dict.items():
         parser.add_argument(f'--{flag}', **kwargs)
     
-# Additional
+# Additional arguments
 parser.add_argument(
     '--mprof', action='store_true',
     help='If specified, profile memory usage with memory_profiler.')
@@ -117,7 +117,8 @@ def parse_and_split_args(args):
     # If there are arrayed elements, handle them here!
     # -------------------------------------------------
     def make_arr(key):
-        sb_args['array'] = args[key]
+        # Remove all whitespaces from sbatch directive (i.e. [10,20] instead of [10, 20])
+        sb_args['array'] = str(args[key]).replace(" ", "")
         py_args[key] = '$SLURM_ARRAY_TASK_ID'
         return
 
@@ -163,7 +164,6 @@ def parse_and_split_args(args):
 
     return sb_args, py_args, iterable
 
-
 def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False):
     """Generate job script for fitting HMM.
 
@@ -203,7 +203,7 @@ def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False):
         # Execute code
         if mprof:
             f.writelines('mpfile={}\n'.format(os.path.join(logdir, prefix+'$SLURM_JOB_ID\.mprof')))
-            f.writelines('mprof run -M -o $mpfile \\\n')
+            f.writelines('mprof run -M -o $mpfile --backend psutil_pss \\\n')
             f.writelines('\t{} \\\n'.format(py_script_name))
         else:
             f.writelines('python {}\n'.format(py_script_name))
@@ -233,22 +233,13 @@ def main():
             job_path = generate_script(prefix, sb_args, py_args, mprof=args['mprof'])
 
             if not args['norun']:
-                os.system(f"sbatch {job_path}")
+                os.system(f"sbatch {jobpath}")
     else:
         prefix = f"{timestamp}-{py_args['method']}"
         jobpath = generate_script(prefix, sb_args, py_args, mprof=args['mprof'])
         
         if not args['norun']:
-            os.system(f"sbatch {job_path}")
-
-    
-    # Generate scripts and submit jobs
-    # timestamp = datetime.now().strftime("%y%m%d-%H%M")
-    # prefix = f"{timestamp}-{method}-s{py_args['states']}-i{py_args['iters']}-"
-    # if len(array_args) == 0:
-    #     job_path = os.path.join(TEMPDIR, f"{timestamp}-{}.job")# TODO
-    #     generate_script(fpath, args)
-    #     os.system(f"sbatch {job_path}")
+            os.system(f"sbatch {jobpath}")
 
 if __name__ == '__main__':
     main()
