@@ -4,8 +4,6 @@ import os
 import argparse
 from datetime import datetime
 
-from memory_profiler import profile
-
 import jax.numpy as np
 import jax.random as jr
 from ssm_jax.hmm.models import GaussianHMM
@@ -33,10 +31,6 @@ parser.add_argument(
     '--method', type=str, default='pmap',
     choices=['pmap','vmap'],
     help='Parallelization approach. NB: If using pmap, must run on node with multiple cores.')
-parser.add_argument(
-    '--profile', type=str, default='none',
-    choices=['time', 'mem', 'none'],
-    help='What aspect of code to profile')
 parser.add_argument(
     '--log_dir', type=str, default=TEMPDIR,
     help='Directory to log profiles.')
@@ -70,14 +64,12 @@ parser.add_argument(
 
 # =============================================================================
 
-# @profile(precision=2)
 def main():
     # TODO Allow warm-starting of hmm fit code from saved file.
     # - Add argument to to start with random initialization or from file
     # - If warm-starting, extract last iteration and log likelihoods, same seed for splitting dataset
     args = parser.parse_args()
     method = args.method
-    profile = args.profile
     log_dir = args.log_dir
     log_prefix = args.log_prefix        
 
@@ -134,19 +126,8 @@ def main():
     fn_args = (train_dl, test_dl, init_hmm,)
     fn_kwargs = {'num_iters': num_em_iters, 'll_fmt':'.4f'}
 
-    if profile == 'mem':
-        from memory_profiler import memory_usage
-        memlog_path = os.path.join(log_dir, log_prefix+'.mprof')
-        with open(memlog_path+'.mprof', 'a') as fstream:
-            memory_usage((fit, fn_args, fn_kwargs),
-                            retval=True,
-                            include_children=False,
-                            multiprocess=True,
-                            stream=fstream)
-
-    else:
-        hmm, train_lls, test_lls = fit(*fn_args, **fn_kwargs)
-        train_lls.block_until_ready()
+    hmm, train_lls, test_lls = fit(*fn_args, **fn_kwargs)
+    train_lls.block_until_ready()
 
     # --------------------------------------------------------------------------
     # Save likelihoods and hmm
