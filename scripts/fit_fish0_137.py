@@ -8,7 +8,7 @@ import jax.numpy as np
 import jax.random as jr
 from ssm_jax.hmm.models import GaussianHMM
 from kf.data_utils import FishPCDataset, FishPCDataloader, save_hmm
-from kf.fit import fit_pmap, fit_vmap
+from kf.fit import fit_pmap
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['TEMPDIR']
@@ -50,16 +50,16 @@ parser.add_argument(
     '--max_frames_per_day', type=int, default=-1,
     help='Maximum number of frames available in each file/day. Useful for debugging.')
 parser.add_argument(
-    '--num_train', type=float, default=1,
+    '--train', type=float, default=1,
     help='If >1, number of files in dataset to train over. If [0, 1), fraction of dataset to train over.')
 parser.add_argument(
-    '--num_test', type=float, default=1,
+    '--test', type=float, default=1,
     help='If >1, number of files in dataset to test over. If [0, 1), fraction of dataset to test over.')
 parser.add_argument(
-    '--num_em_iters', type=int, default=10,
+    '--iters', type=int, default=10,
     help='Number of EM iterations to run')
 parser.add_argument(
-    '--num_hmm_states', type=int, default=20,
+    '--states', type=int, default=20,
     help='Number of HMM states to fit')
 
 # =============================================================================
@@ -78,11 +78,11 @@ def main():
     frames_per_batch = args.frames_per_batch
     max_frames_per_day = args.max_frames_per_day
 
-    num_train = args.num_train
-    num_test = args.num_test
+    num_train = args.train
+    num_test = args.test
     
-    num_hmm_states = args.num_hmm_states
-    num_em_iters = args.num_em_iters
+    num_hmm_states = args.states
+    num_em_iters = args.iters
 
     fit = fit_pmap if method=='pmap' else fit_vmap
 
