@@ -3,11 +3,8 @@ import jax.numpy as np
 import jax
 
 from ssm_jax.hmm.models import GaussianHMM                                      # probml/ssm-jax : https://github.com/probml/ssm-jax
-from ssm_jax.hmm.inference import (hmm_smoother as _hmm_smoother,
-                                   HMMPosterior as _HMMPosterior,
+from ssm_jax.hmm.inference import (hmm_smoother,
                                    _compute_sum_transition_probs,)
-
-from functools import reduce
 
 from tensorflow_probability.substrates.jax.distributions import Dirichlet
 
@@ -190,7 +187,8 @@ def streaming_parallel_e_step(hmm, emissions_dl):
     num_devices = jax.local_device_count()
     parallel_e_step = jax.pmap(hmm.e_step)
 
-    suff_stats = SplitBatchOnlineSuffStats.empty((hmm.num_states, hmm.num_obs))
+    # Add leading dimension for m-step to sum over
+    suff_stats = SplitBatchOnlineSuffStats.empty((1, hmm.num_states, hmm.num_obs))
     
     p_emiss_shape = (num_devices, emissions_dl.batch_shape[0]//num_devices, *emissions_dl.batch_shape[1:])
     for batch_emissions in emissions_dl:
@@ -198,41 +196,3 @@ def streaming_parallel_e_step(hmm, emissions_dl):
         batch_suff_stats = SplitBatchOnlineSuffStats.convert_flat(batch_suff_stats)
         suff_stats.add(batch_suff_stats)
     return suff_stats
-    
-
-# ==============================================================================
-# "Standard" full-batch EM steps
-#
-#   def em_step(hmm, emissions):
-#       posterior = fullbatch_e_step(hmm, emissions)
-#       hmm = fullbatch_m_step(posterior, emissions)
-#       return hmm, posterior
-# ------------------------------------------------------------------------------
-def fullbatch_e_step(hmm, emissions):
-    return hmm_smoother(hmm.initial_probabilities,
-                        hmm.transition_matrix,
-                        hmm._conditional_logliks(emissions))
-
-def fullbatch_m_step(posterior, emissions):
-    # Initial distribution
-    initial_probs = Dirichlet(1.0001 + posterior.smoothed_probs[0]).mode()
-
-    # Transition distribution
-    transition_matrix = Dirichlet(
-        1.0001 + posterior.smoothed_transition_probs_sum).mode()
-
-    # Gaussian emission distribution
-    w_sum = np.einsum('tk->k', posterior.smoothed_probs)
-    x_sum = np.einsum('tk, ti->ki', posterior.smoothed_probs, emissions)
-    xxT_sum = np.einsum('tk, ti, tj->kij', posterior.smoothed_probs, emissions, emissions)
-
-    emission_means = x_sum / w_sum[:, None]
-    emission_covs = xxT_sum / w_sum[:, None, None] \
-        - np.einsum('ki,kj->kij', emission_means, emission_means) \
-        + 1e-4 * np.eye(emissions.shape[-1])
-    
-    # Pack the results into a new GaussianHMM
-    return GaussianHMM(initial_probs,
-                       transition_matrix,
-                       emission_means,
-                       emission_covs)
