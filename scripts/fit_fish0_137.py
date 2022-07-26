@@ -62,8 +62,21 @@ parser.add_argument(
     '--states', type=int, default=20,
     help='Number of HMM states to fit')
 
-# =============================================================================
+def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
+    """Writes memory usage vs. time results returned by `memory_usage` to file.
 
+    Parameters:
+        path: str, path to file
+        mem_usage: list of tuples (timestamp, mem_usage [MiB])
+        mode: str, file write mode
+    """
+
+    with open(path, mode) as f:
+        for res in mem_usage:
+            f.writelines('MEM {} {}\n'.format(res[0], res[1]))
+    return
+    
+# =============================================================================
 def main():
     # TODO Allow warm-starting of hmm fit code from saved file.
     # - Add argument to to start with random initialization or from file
@@ -84,11 +97,16 @@ def main():
     num_hmm_states = args.states
     num_em_iters = args.iters
 
-    fit = fit_pmap if method=='pmap' else fit_vmap
+    # TODO Add these options into arg parser
+    mprof = True
+    save_results = False
 
     if log_prefix is None:
-        timestamp = datetime.now().strftime("%y%m%d_%H%M")
+        timestamp = datetime.now().strftime("%y%m%d%H%M")
         log_prefix=f"{timestamp}-{num_hmm_states}st-{num_em_iters}it"
+    
+    print("")
+    print(f"Output files will be logged to: {log_dir}")
     # ==========================================================================
     seed_split_data, seed_init_hmm = jr.split(seed, 2)
 
@@ -119,20 +137,43 @@ def main():
         
     # --------------------------------------------------------------------------
     # Initialize hidden Markov model
-    print(f'Initializing HMM with {num_hmm_states} states...')
+    print(f'\nInitializing HMM with {num_hmm_states} states...\n')
     init_hmm = GaussianHMM.random_initialization(seed_init_hmm, num_hmm_states, train_ds.dim)
 
     # Run function
     fn_args = (train_dl, test_dl, init_hmm,)
     fn_kwargs = {'num_iters': num_em_iters, 'll_fmt':'.4f'}
 
-    hmm, train_lls, test_lls = fit(*fn_args, **fn_kwargs)
-    train_lls.block_until_ready()
+    if mprof:
+        from memory_profiler import memory_usage
+        
+        # In order to record memory usage when calling `memory_usage` on a
+        # python function, MUST specify stream=False (otherwise, returns None)
+        # and then manually write results to file
+        # NB: `memory_usage` only automatically writes to file if called by an
+        #   external process, i.e. with the mprof command in the command line.
+        #   When `mprof` called via a job, psutil has trouble finding the
+        #   correct process id and throws a NoProcessFound error. It still seems
+        #   to be able record it when submitted as non-interactive job, but
+        #   program fails when submitted interactively
+        mem_usage, (hmm, train_lls, test_lls) = memory_usage(
+                proc=(fit_pmap, fn_args, fn_kwargs), retval=True,
+                backend='psutil_pss',
+                stream=False, timestamps=True, max_usage=False,
+                include_children=True, multiprocess=True,
+        )
+
+        f_mprof = os.path.join(log_dir, log_prefix+'.mprof')
+        write_mprof(f_mprof, mem_usage)
+    else:
+        hmm, train_lls, test_lls = fit_pmap(*fn_args, **fn_kwargs)
+        train_lls.block_until_ready()
 
     # --------------------------------------------------------------------------
     # Save likelihoods and hmm
-    fpath = os.path.join(log_dir, log_prefix+'.npz')
-    save_hmm(fpath, hmm, train_lls=train_lls, test_lls=test_lls)
+    if save_results:
+        fpath = os.path.join(log_dir, log_prefix+'.npz')
+        save_hmm(fpath, hmm, train_lls=train_lls, test_lls=test_lls)
     return
 
 if __name__ == '__main__':

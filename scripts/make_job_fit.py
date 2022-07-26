@@ -54,8 +54,11 @@ SCRIPT_ARGS = {
         type=int, default=2207011837,
         help='PRNG seed to split data and intialize HMM.'),
     'max_frames_per_day': dict(
-        type=int, default=-1,
-        help='For debugging. Max # frames available in each file/day.'),
+        type=int, default=0,
+        help='For debugging. Truncate # frames available in each file/day to this value.'),
+        # Must make default value 0 (instead of -1). Otherwise, if argument '-1'
+        # used, the argparse for fit_fish0_137 script interprets the negative
+        # number as an argument and throws "expected one argument" error
 }
 
 parser = argparse.ArgumentParser(
@@ -63,7 +66,7 @@ parser = argparse.ArgumentParser(
 
 for arg_dict in [SBATCH_ARGS, SCRIPT_ARGS]:
     for flag, kwargs in arg_dict.items():
-        parser.add_argument(f'--{flag}', **kwargs)
+        parser.add_argument('--{}'.format(flag), **kwargs)
     
 # Additional arguments
 parser.add_argument(
@@ -171,7 +174,7 @@ def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False):
         sbatch_args: dict of SBATCH directive arguments and values.
         array: tuple, (arrayed_arg, array_values)
     """
-    fpath = os.path.join(SCRIPTDIR, '.jobs', f"{prefix}.job")
+    fpath = os.path.join(SCRIPTDIR, '.jobs', "{}.job".format(prefix))
     with open(fpath, 'w') as f:
         f.writelines("#!/bin/bash\n")
 
@@ -187,6 +190,7 @@ def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False):
         # Set up environment
         f.writelines('source ~/.bashrc\n')
         f.writelines('module purge > /dev/null\n')
+        f.writelines('ml python/3.9\n')
         f.writelines('venv activate kf-cpu\n')
 
         f.writelines('cd {}\n'.format(SCRIPTDIR))
@@ -200,18 +204,21 @@ def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False):
 
         # Execute code
         if mprof:
-            f.writelines('mpfile={}\n'.format(os.path.join(logdir, prefix+'$SLURM_JOB_ID\.mprof')))
+            f.writelines('mpfile={}\n'.format(os.path.join(logdir, prefix+'.$SLURM_JOB_ID')))
             f.writelines('mprof run -M -o $mpfile --backend psutil_pss \\\n')
             f.writelines('\t{} \\\n'.format(py_script_name))
         else:
-            f.writelines('python {}\n'.format(py_script_name))
+            f.writelines('python {}.py \\\n'.format(py_script_name))
+
         for k, v in py_args.items():
             f.writelines('\t--{} {} \\\n'.format(k,v))
+        f.writelines('\t--log_dir {}\\\n'.format(logdir))
+        f.writelines('\t--log_prefix {}\\\n'.format(prefix))
         
         if mprof:
             f.writelines('\n')
-            f.writelines('mprof peak $mpfile                      # Print peak memory usage\n')
-            f.writelines('mprof plot $mpfile -o $mpfile.png -s    # Make figure (-o), with slope (-s)\n')
+            f.writelines('mprof peak $mpfile.mprof                      # Print peak memory usage\n')
+            f.writelines('mprof plot $mpfile.mprof -o $mpfile.png -s    # Make figure (-o), with slope (-s)\n')
     return fpath
 
 def main():
@@ -221,23 +228,26 @@ def main():
     
     timestamp = datetime.now().strftime("%y%m%d%H%M")
     if iterable:
-        
         for i, (k, v) in enumerate(iterable):
             # NOT YET TESTED for itertools.product!!
             py_args[k] = v
             if k=='batch_size' and py_args['method']=='pmap':
                 sb_args['mincpus'] = v
-            prefix = f"{timestamp}_{i}-{py_args['method']}"
+            prefix = "{}_{}-{}".format(timestamp, i, py_args['method'])
             job_path = generate_script(prefix, sb_args, py_args, mprof=args['mprof'])
 
-            if not args['norun']:
-                os.system(f"sbatch {jobpath}")
+            if args['norun']:
+                print(f"--norun specified. jobscript generated:\n\t{job_path}")
+            else:
+                os.system("sbatch {}".format(jobpath))
     else:
-        prefix = f"{timestamp}-{py_args['method']}"
+        prefix = "{}-{}".format(timestamp, py_args['method'])
         jobpath = generate_script(prefix, sb_args, py_args, mprof=args['mprof'])
         
-        if not args['norun']:
-            os.system(f"sbatch {jobpath}")
+        if args['norun']:
+            print(f"--norun specified. jobscript generated:\n\t{job_path}")
+        else:
+            os.system("sbatch {}".format(jobpath))
 
 if __name__ == '__main__':
     main()
