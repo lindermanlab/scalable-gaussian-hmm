@@ -1,21 +1,23 @@
 """Fitting and running HMM functions"""
 
-import jax
-from jax import jit, vmap, pmap
-import jax.numpy as np
-import jax.random as jr
-from functools import partial
-
-from kf.inference import (streaming_parallel_e_step, SplitBatchOnlineSuffStats)
-from kf.data_utils import FishPCDataset, FishPCDataloader
-
 from sys import stdout
 from tqdm import tqdm
 import chex
 
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+
+from kf.inference import (streaming_parallel_e_step, SplitBatchOnlineSuffStats)
+from kf.data_utils import FishPCDataset, FishPCDataloader
+
+from memory_profiler import profile
+import gc
+
+@profile
 def fit_pmap(train, test, hmm,
              num_iters=10, initial_iter=0,
-             initial_lls=(-np.inf,-np.inf), ll_fmt='',
+             initial_lls=(-jnp.inf,-jnp.inf), ll_fmt='',
             ):
     """Fit HMM to principle component data by [v/p]mapping over batches using EM.
 
@@ -30,9 +32,8 @@ def fit_pmap(train, test, hmm,
             test log-likelihoods. Useful when warm-starting from a saved HMM.
         ll_fmt: pyformat style str (e.g. :.2f)
     """
-
-    train_lls = np.ones(num_iters) * initial_lls[0]
-    test_lls  = np.ones(num_iters) * initial_lls[1]
+    train_lls = jnp.ones(num_iters) * initial_lls[0]
+    test_lls  = jnp.ones(num_iters) * initial_lls[1]
 
     pbar = tqdm(iterable=range(initial_iter, num_iters),
                 desc=f"Epochs",
@@ -45,23 +46,28 @@ def fit_pmap(train, test, hmm,
                                    * (dl.batch_shape[0]//num_devices) \
                                    * dl.num_frames_per_batch
 
+    n_batch_train = get_num_emissions(train)
+    n_batch_test  = get_num_emissions(test)
+
     for itr in pbar:
 
         # Fit on training data
         train_suff_stats = streaming_parallel_e_step(hmm, train)
-        train_suff_stats = jax.tree_map(lambda arr: np.expand_dims(arr, axis=0), train_suff_stats)
-        hmm.m_step(None, train_suff_stats)
+        train_ll = train_suff_stats.marginal_loglik.sum() / n_batch_train
 
-        train_ll = train_suff_stats.marginal_loglik.squeeze() / get_num_emissions(train)
+        train_suff_stats = jax.tree_map(lambda arr: jnp.expand_dims(arr, 0), train_suff_stats)
+        hmm.m_step(None, train_suff_stats)
         
         # Evaluate on test data
         test_suff_stats = streaming_parallel_e_step(hmm, test)
-        test_ll = test_suff_stats.marginal_loglik.squeeze() / get_num_emissions(test)
+        test_ll = test_suff_stats.marginal_loglik.sum() / n_batch_test 
 
         # Update progress
         train_lls = train_lls.at[itr].set(train_ll)
         test_lls  = test_lls.at[itr].set(test_ll)
 
         pbar.set_postfix_str(f'train={train_lls[itr]:{ll_fmt}}, test={test_lls[itr]:{ll_fmt}}')
+
+        del train_suff_stats, test_suff_stats
 
     return hmm, train_lls, test_lls

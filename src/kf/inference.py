@@ -1,29 +1,19 @@
+"""Streaming EM step
+E-step computation is parallelized across multiple processors, then
+normalized sufficient statistics are combined in M-step
+Actual `em_step` which differ based on how emissions are split and thus how
+normalized sufficient stats should be combined so that all elements have
+leading batch shape (n_splits, n_hmm_states, ...). Here, no recombination
+is required.
+"""
 import chex
-import jax.numpy as np
 import jax
+import jax.numpy as jnp
 
 from ssm_jax.hmm.models import GaussianHMM                                      # probml/ssm-jax : https://github.com/probml/ssm-jax
-from ssm_jax.hmm.inference import (hmm_smoother,
-                                   _compute_sum_transition_probs,)
-
 from tensorflow_probability.substrates.jax.distributions import Dirichlet
 
 # ==============================================================================
-# Streaming EM step
-# E-step computation is parallelized across multiple processors, then
-# normalized sufficient statistics are combined in M-step
-# Actual `em_step` which differ based on how emissions are split and thus how
-# normalized sufficient stats should be combined so that all elements have
-# leading batch shape (n_splits, n_hmm_states, ...). Here, no recombination
-# is required.
-#
-#   def em_step(hmm, split_emissions):
-#       # Do this b/c GaussianHMM doesn't register as pytree correctly yet
-#       _e_step = partial(sharded_e_step, hmm)
-#       nss = pmap(_e_step)(split_emissions)
-#       hmm = fullbatch_m_step(nss)
-#       return hmm, nss
-# ------------------------------------------------------------------------------
 
 @chex.dataclass
 class _OnlineSuffStats:
@@ -67,12 +57,12 @@ class _OnlineSuffStats:
         K, D = shape[-2:]
 
         return cls(
-            marginal_loglik=np.zeros(B),
-            initial_probs=np.zeros(B+(K,)),
-            trans_probs=np.zeros(B+(K,K)),
-            sum_w=np.zeros(B+(K,)),
-            normd_x=np.empty(B+(K,D,)),
-            normd_xxT=np.empty(B+(K,D,D)),
+            marginal_loglik=jnp.zeros(B),
+            initial_probs=jnp.zeros(B+(K,)),
+            trans_probs=jnp.zeros(B+(K,K)),
+            sum_w=jnp.zeros(B+(K,)),
+            normd_x=jnp.empty(B+(K,D,)),
+            normd_xxT=jnp.empty(B+(K,D,D)),
         )
 
     @classmethod
@@ -164,10 +154,9 @@ class SplitBatchOnlineSuffStats(_OnlineSuffStats):
         return other_initial_probs.reshape(-1, num_states)[0]
 
     def accumulate_initial_probs(self, other_initial_probs):
-        if np.all(self.initial_probs==0.):  # If first input, then save the `other_initial_probs`
+        if jnp.all(self.initial_probs==0.):  # If first ijnput, then save the `other_initial_probs`
             return other_initial_probs
-        return np.zeros_like(self.initial_probs) # Otherwise, ignore
-
+        return jnp.zeros_like(self.initial_probs) # Otherwise, ignore
 
 def streaming_parallel_e_step(hmm, emissions_dl):
     """Performs parallelized E-step on a 'streaming' (sequentially-loaded set of emissions).
@@ -185,14 +174,21 @@ def streaming_parallel_e_step(hmm, emissions_dl):
         suff_stats: dataclass containing posterior normalized sufficient statistics
     """
     num_devices = jax.local_device_count()
-    parallel_e_step = jax.pmap(hmm.e_step)
+    parallel_e_step = jax.pmap(hmm.e_step)   
 
     # Add leading dimension for m-step to sum over
-    suff_stats = SplitBatchOnlineSuffStats.empty((1, hmm.num_states, hmm.num_obs))
+    suff_stats = SplitBatchOnlineSuffStats.empty((hmm.num_states, hmm.num_obs))
     
     p_emiss_shape = (num_devices, emissions_dl.batch_shape[0]//num_devices, *emissions_dl.batch_shape[1:])
+
     for batch_emissions in emissions_dl:
+        # TODO Shape emissions properly IN the dataloader...
+        # With JAX device arrays, "this function may in some cases return a copy
+        # rather than a view of the input." Normally this is not an issue because
+        # jitting the function optimizes memory usage (but obviously we can't).
+        # NOTE Memory profiling does not show this to be an issue...
         batch_suff_stats = parallel_e_step(batch_emissions.reshape(*p_emiss_shape))
         batch_suff_stats = SplitBatchOnlineSuffStats.convert_flat(batch_suff_stats)
         suff_stats.add(batch_suff_stats)
+
     return suff_stats
