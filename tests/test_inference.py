@@ -40,8 +40,8 @@ def allclose_errmsg(test_arr, ref_arr, rtol=1e-5, atol=1e-8, title=''):
               + f'max error {max_isntclose:.2e} > {tol_at_max:.2e}'
     else:
         argmax_isclose = jnp.argmax(err)
-        max_isclose = err[argmax_isclose]
-        tol_at_max = tol[argmax_isclose]
+        max_isclose = err.ravel()[argmax_isclose]
+        tol_at_max  = tol.ravel()[argmax_isclose]
 
         msg = f'{title} (atol={atol:.0e}, rtol={rtol:.0e}): ' \
               + f'max error {max_isclose:.2e} <= {tol_at_max:.2e}'
@@ -173,7 +173,6 @@ def test_streaming_pmap():
     # -------------------------------------------------------------------------
     assert jnp.all(get_leading_dim(test_nss)==1)
 
-    import pdb; pdb.set_trace()
     assert_allclose_with_errmsg(test_hmm.emission_means,
                                 ref_hmm.emission_means,
                                 rtol=1e-1, atol=1e-1,
@@ -184,8 +183,6 @@ def test_streaming_pmap():
                                 rtol=1e-1, atol=1e-1,
                                 title='emission_covariance_matrices')
 
-    # streaming stats reports AVERAGE marginal loglik,
-    # whereas ref_nss reports sum of marginal loglik
     assert_allclose_with_errmsg(test_nss.marginal_loglik,
-                                ref_nss.marginal_loglik / num_timesteps,
+                                ref_nss.marginal_loglik,
                                 rtol=1e-2, title='marginal_loglik')

@@ -125,59 +125,6 @@ class StreamingSuffStats:
         self.sum_w = new_sum_w
         return
     
-@partial(jax.pmap, axis_name='device', static_broadcasted_argnums=(0,))
-def sharded_e_step(hmm, batched_emissions):
-    """
-        batched_emissions: shape (batches_per_device, num_frames_per_batch, obs_dim )
-    """
-
-    # batched_stats: dataclass with shape (batches_per_device, hmm.num_states, ...)
-    batched_stats = hmm.e_step(batched_emissions)
-
-    # """sharded normalize"""
-    marginal_loglik = jax.lax.psum(batched_stats.marginal_loglik.sum(), axis_name='device')
-    initial_probs = batched_stats.initial_probs[0]
-    trans_probs= jax.lax.psum(batched_stats.trans_probs.sum(axis=0), axis_name='device')
-    
-    new_sum_w = jax.lax.psum(batched_stats.sum_w.sum(axis=0), axis_name='device')
-    normd_w = batched_stats.sum_w / new_sum_w
-    normd_x = batched_stats.normd_x * normd_w[..., None]
-    normd_xxT = batched_stats.normd_xxT * normd_w[...,None,None]
-
-    normd_x = jax.lax.psum(normd_x.sum(axis=0), axis_name='device')
-    normd_xxT = jax.lax.psum(normd_xxT.sum(axis=0), axis_name='device')
-    
-    return StreamingSuffStats(
-        marginal_loglik=marginal_loglik,
-        initial_probs=initial_probs,
-        trans_probs=trans_probs,
-        sum_w=new_sum_w,
-        normd_x=normd_x,
-        normd_xxT=normd_xxT,
-    )
-
-@partial(jax.pmap, axis_name='device', static_broadcasted_argnums=(0,))
-def sharded_e_step2(hmm, batched_emissions):
-    """
-        batched_emissions: shape (batches_per_device, num_frames_per_batch, obs_dim )
-    """
-
-    # batched_stats: dataclass with shape (batches_per_device, hmm.num_states, ...)
-    batched_stats = hmm.e_step(batched_emissions)
-
-    stats = StreamingSuffStats(
-        marginal_loglik=batched_stats.marginal_loglik,
-        initial_probs=batched_stats.initial_probs,
-        trans_probs=batched_stats.trans_probs,
-        sum_w=batched_stats.sum_w,
-        normd_x=batched_stats.normd_x,
-        normd_xxT=batched_stats.normd_xxT,
-    )
-
-    stats.normalize() # normalize across batches_per_device axis
-
-    return stats
-
 def streaming_parallel_e_step(hmm, emissions_dl):
     """Performs parallelized E-step on a 'streaming' (sequentially-loaded set of emissions).
 
@@ -193,8 +140,22 @@ def streaming_parallel_e_step(hmm, emissions_dl):
     Returns:
         suff_stats: dataclass containing posterior normalized sufficient statistics
     """
-    # stats = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
+    stats = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
 
+    for batch_emissions in emissions_dl:
+        batch_stats = jax.pmap(hmm.e_step)(batch_emissions)
+        rescaled_stats = StreamingSuffStats(
+            marginal_loglik=batch_stats.marginal_loglik,
+            initial_probs=batch_stats.initial_probs,
+            trans_probs=batch_stats.trans_probs,
+            sum_w=batch_stats.sum_w,
+            normd_x=batch_stats.normd_x,
+            normd_xxT=batch_stats.normd_xxT,
+        )
+
+        rescaled_stats.normalize()
+
+        stats.add(rescaled_stats)
     # from itertools import islice
     # import pdb
     # for batch_emissions in emissions_dl:
@@ -205,11 +166,13 @@ def streaming_parallel_e_step(hmm, emissions_dl):
     # # all close EXCEPT
     # stats2.sum_w == stats.sum_w / 2
     # stats2.trans_prob == stats.trans_probs / 2
-    stats2 = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
-    for batch_emissions in emissions_dl:
-        batch_stats2 = sharded_e_step2(hmm, batch_emissions)
-        batch_stats2.normalize()
-        stats2.add(batch_stats2)
+    # stats2 = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
+    # for batch_emissions in emissions_dl:
+    #     batch_stats2 = sharded_e_step2(hmm, batch_emissions)
+    #     batch_stats2.normalize()
+    #     stats2.add(batch_stats2)
 
-    import pdb; pdb.set_trace()
-    return stats2
+    # import pdb; pdb.set_trace()
+
+
+    return stats
