@@ -26,8 +26,7 @@ logger.addFilter(CheckTypesFilter())
 
 # -----------------------------------------------------------------------------
 
-def assert_allclose_with_errmsg(test_arr, ref_arr, rtol=1e-5, atol=1e-8, title=''):
-    """Assert 2 arrays are all close, else print useful error message."""
+def allclose_errmsg(test_arr, ref_arr, rtol=1e-5, atol=1e-8, title=''):
     err = jnp.abs(test_arr-ref_arr)
     tol = atol + rtol * jnp.abs(ref_arr)
 
@@ -40,7 +39,18 @@ def assert_allclose_with_errmsg(test_arr, ref_arr, rtol=1e-5, atol=1e-8, title='
         msg = f'{title} (atol={atol:.0e}, rtol={rtol:.0e}): ' \
               + f'max error {max_isntclose:.2e} > {tol_at_max:.2e}'
     else:
-        msg = ''
+        argmax_isclose = jnp.argmax(err)
+        max_isclose = err[argmax_isclose]
+        tol_at_max = tol[argmax_isclose]
+
+        msg = f'{title} (atol={atol:.0e}, rtol={rtol:.0e}): ' \
+              + f'max error {max_isclose:.2e} <= {tol_at_max:.2e}'
+    
+    return msg
+
+def assert_allclose_with_errmsg(test_arr, ref_arr, rtol=1e-5, atol=1e-8, title=''):
+    """Assert 2 arrays are all close, else print useful error message."""
+    msg = allclose_errmsg(test_arr, ref_arr, rtol, atol, title)
 
     assert jnp.allclose(test_arr, ref_arr, rtol, atol), msg
     
@@ -48,19 +58,26 @@ def get_leading_dim(ss) -> jnp.ndarray:
     return jnp.array([len(ss[k]) for k in ss.__dataclass_fields__.keys()])
 
 class SimpleDataloader():
-    def __init__(self, emissions, batch_size, num_timesteps_per_batch):
+    def __init__(self, emissions, num_devices, num_batches_per_device, num_timesteps_per_batch):
         self.emissions_dim = emissions.shape[-1]
         self._emissions = emissions.reshape(-1, self.emissions_dim)
 
-        self.batch_size = batch_size
+        self.num_devices = num_devices
+        self.num_batches_per_device = num_batches_per_device
         self.num_timesteps_per_batch = num_timesteps_per_batch
 
     def __len__(self):
-        return len(self._emissions) // self.num_timesteps_per_batch // self.batch_size
+        return (
+            len(self._emissions)
+            // (self.num_devices * self.num_batches_per_device * self.num_timesteps_per_batch)
+        )
     
     @property
     def batch_shape(self):
-        return (self.batch_size, self.num_timesteps_per_batch, self.emissions_dim)
+        return (self.num_devices,
+                self.num_batches_per_device,
+                self.num_timesteps_per_batch,
+                self.emissions_dim)
 
     def __iter__(self):
         self.emissions = self._emissions.reshape(len(self), *self.batch_shape)
@@ -125,7 +142,6 @@ def test_streaming_pmap():
     # -------------------------------------------------------------------------
     num_iters = 5
 
-    # -----------------------------------------------------------
     # Reference point: Full-batch code. Updates hmm out-of-place
     for _ in range(num_iters):
         ref_hmm, ref_nss = standard_em_step(ref_hmm, emissions)
@@ -133,16 +149,16 @@ def test_streaming_pmap():
     # -----------------------------------------------------------
     # Test code: Streaming batches emissions code. Updates hmm in-place
 
-    # e-step reshapes obs into (num_devices, batch_size//num_devices, ...)
+    # e-step reshapes obs into (num_devices, num_batches_per_device, ...)
     # and pmaps across num_devices axis. Assumes batches are consecutive splits
     # of a long time-series.    
-    batch_size = 2
-    if batch_size % jax.local_device_count():
-        print(f"WARNING: `batch_size` ({batch_size}) is not a multiple of # cpus ({jax.local_device_count()}), so not all emissions will be used.")
     if jax.local_device_count() == 1:
         print(f"WARNING: {jax.local_device_count()} cpu detected.")
     
-    dl = SimpleDataloader(emissions, batch_size, num_timesteps_per_batch=250)
+    dl = SimpleDataloader(emissions,
+                          num_devices=jax.local_device_count(),
+                          num_batches_per_device=1,
+                          num_timesteps_per_batch=1000)
 
     def em_step(hmm, emissions_iterator):
         normd_suff_stats = streaming_parallel_e_step(hmm, emissions_iterator)
@@ -156,17 +172,20 @@ def test_streaming_pmap():
     # Evaluate
     # -------------------------------------------------------------------------
     assert jnp.all(get_leading_dim(test_nss)==1)
-    
-    assert_allclose_with_errmsg(ref_nss.marginal_loglik,
-                                test_nss.marginal_loglik,
-                                rtol=1e-2, title='marginal_loglik')
 
+    import pdb; pdb.set_trace()
     assert_allclose_with_errmsg(test_hmm.emission_means,
                                 ref_hmm.emission_means,
                                 rtol=1e-1, atol=1e-1,
                                 title='emission_means')
     
-    assert_allclose_with_errmsg(ref_hmm.emission_covariance_matrices,
-                                test_hmm.emission_covariance_matrices,
+    assert_allclose_with_errmsg(test_hmm.emission_covariance_matrices,
+                                ref_hmm.emission_covariance_matrices,
                                 rtol=1e-1, atol=1e-1,
                                 title='emission_covariance_matrices')
+
+    # streaming stats reports AVERAGE marginal loglik,
+    # whereas ref_nss reports sum of marginal loglik
+    assert_allclose_with_errmsg(test_nss.marginal_loglik,
+                                ref_nss.marginal_loglik / num_timesteps,
+                                rtol=1e-2, title='marginal_loglik')

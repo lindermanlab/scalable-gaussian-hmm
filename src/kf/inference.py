@@ -1,4 +1,5 @@
-"""Streaming EM step
+"""Parallelized, streaming online E step
+
 E-step computation is parallelized across multiple processors, then
 normalized sufficient statistics are combined in M-step
 Actual `em_step` which differ based on how emissions are split and thus how
@@ -9,6 +10,7 @@ is required.
 import chex
 import jax
 import jax.numpy as jnp
+from functools import partial
 
 from ssm_jax.hmm.models import GaussianHMM                                      # probml/ssm-jax : https://github.com/probml/ssm-jax
 from tensorflow_probability.substrates.jax.distributions import Dirichlet
@@ -16,7 +18,7 @@ from tensorflow_probability.substrates.jax.distributions import Dirichlet
 # ==============================================================================
 
 @chex.dataclass
-class _OnlineSuffStats:
+class StreamingSuffStats:
     """Dataclass for cumulatively storing normalized GaussinHMM sufficient statistics."""
     marginal_loglik: chex.Scalar    # shape ([1],)
     initial_probs: chex.Array       # shape ([1],K,)
@@ -25,14 +27,14 @@ class _OnlineSuffStats:
     normd_x: chex.Array             # shape ([B],K,D,)
     normd_xxT: chex.Array           # shape ([B],K,D,D)
 
-    def __post_init__(self):
-        """Verify that all parameters have consistent shapes"""
-        assert self.trans_probs.shape[-2:] == (self.num_states, self.num_states)
-        assert self.normd_xxT.shape[-2:] == (self.num_obs, self.num_obs)
-        assert self.num_states == self.normd_x.shape[-2] == self.normd_xxT.shape[-3] == self.sum_w.shape[-1]
+    # def __post_init__(self):
+    #     """Verify that all parameters have consistent shapes"""
+    #     assert self.trans_probs.shape[-2:] == (self.num_states, self.num_states)
+    #     assert self.normd_xxT.shape[-2:] == (self.num_obs, self.num_obs)
+    #     assert self.num_states == self.normd_x.shape[-2] == self.normd_xxT.shape[-3] == self.sum_w.shape[-1]
         
-        if self.batch_shape:
-            assert self.batch_shape == self.normd_x.shape[:-2] == self.normd_xxT.shape[:-3]
+    #     # if self.batch_shape:
+        #     assert self.batch_shape == self.normd_x.shape[:-2] == self.normd_xxT.shape[:-3]
         
     @property
     def num_states(self,) -> int:
@@ -43,8 +45,12 @@ class _OnlineSuffStats:
         return int(self.normd_x.shape[-1])
 
     @property
-    def batch_shape(self,):
-        return self.sum_w.shape[:-1] if self.sum_w.ndim > 1 else ()
+    def shape(self,):
+        return jax.tree_map(lambda arr: arr.shape, self)
+
+    # @property
+    # def batch_shape(self,):
+    #     return self.sum_w.shape[:-1] if self.sum_w.ndim > 1 else ()
 
     @classmethod
     def empty(cls, shape: tuple):
@@ -52,7 +58,7 @@ class _OnlineSuffStats:
     
         `shape` is interpreted as ([B_1, B_2, ...], num_states, num_obs)
         """
-        assert len(shape) >= 2, f'Expected tuple of length 2 or more, received {shape}'
+        # assert len(shape) >= 2, f'Expected tuple of length 2 or more, received {shape}'
         B = shape[:-2]
         K, D = shape[-2:]
 
@@ -64,53 +70,49 @@ class _OnlineSuffStats:
             normd_x=jnp.empty(B+(K,D,)),
             normd_xxT=jnp.empty(B+(K,D,D)),
         )
-
-    @classmethod
-    def convert(cls, other):
-        """Convert `other` into a CumulativeSuffStat class instance."""
-        return CumulativeSuffStats(
-                marginal_loglik=other.marginal_loglik,
-                initial_probs=other.initial_probs,
-                trans_probs=other.trans_probs,
-                sum_w=other.sum_w,
-                normd_x=other.normd_x,
-                normd_xxT=other.normd_xxT,)
-
-    @classmethod
-    def convert_flat(cls, other):
-        """Convert `other` into a (flattened) class instance.
-
-        If `other` has batch_dimensions, flattens by summing across batches
-        (for HMM parameters) and renormalizing across batches for GMM parameters
+    
+    def flatten(self,):
+        """Reshapes all fields to have 1D batch
+        
+        Resulting fields have shape (B,K,...).
         """
-        # Else, `other` is a NormalizedGaussianSuffStat. Flatten before return instance
-        if other.sum_w.ndim > 1:
-            num_states = other.initial_probs.shape[-1]
-            num_obs = other.normd_x.shape[-1]
+        self.marginal_loglik = self.marginal_loglik.reshape(-1)
+        self.initial_probs = self.initial_probs.reshape(-1, self.num_states)
+        self.trans_probs = self.trans_probs.reshape(-1, self.num_states, self.num_states)
 
-            total_sum_w = other.sum_w.reshape(-1, num_states).sum(axis=0)
-            new_normd_w = other.sum_w/total_sum_w
-            normd_x = other.normd_x * new_normd_w[...,None]
-            normd_x = normd_x.reshape(-1, num_states, num_obs).sum(axis=0)
+        self.sum_w = self.sum_w.reshape(-1, self.num_states)
+        self.normd_x = self.normd_x.reshape(-1, self.num_states, self.num_obs)
+        self.normd_xxT = self.normd_xxT.reshape(-1, self.num_states, self.num_obs, self.num_obs)
+        return
 
-            normd_xxT = other.normd_xxT * new_normd_w[...,None,None]
-            normd_xxT = normd_xxT.reshape(-1, num_states, num_obs, num_obs).sum(axis=0)
+    def normalize(self, ):
+        """Normalizes fields across the batch.
+        
+        Resulting fields have shape (K,...).
+        
+        NB special treatment of initial_probs: Since we assume that data is
+        streamed sequentially, initial_probs should be entirely determined
+        by the initial_probs of the first batch.
+        """
+        self.flatten()
 
-            return cls(
-                marginal_loglik=other.marginal_loglik.sum(),
-                initial_probs=cls.flatten_initial_probs(other.initial_probs),
-                trans_probs=other.trans_probs.reshape(-1, num_states, num_states).sum(axis=0),
-                sum_w=total_sum_w,
-                normd_x=normd_x,
-                normd_xxT=normd_xxT,
-            )
-        else:
-            return cls.convert(other)
+        self.marginal_loglik = self.marginal_loglik.sum()
+        self.initial_probs = self.initial_probs[0]
+        self.trans_probs = self.trans_probs.sum(axis=0)
+
+        new_sum_w = self.sum_w.sum(axis=0)
+        normd_w = self.sum_w / new_sum_w
+        
+        self.normd_x = (self.normd_x * normd_w[...,None]).sum(axis=0)
+        self.normd_xxT = (self.normd_xxT * normd_w[...,None,None]).sum(axis=0)
+        self.sum_w = new_sum_w
+        return
 
     def add(self, other):
         # Accumulate the sum
+        self.initial_probs += other.initial_probs if jnp.all(self.initial_probs==0.) \
+                              else jnp.zeros_like(other.initial_probs)
         self.marginal_loglik += other.marginal_loglik
-        self.initial_probs += self.accumulate_initial_probs(other.initial_probs)
         self.trans_probs += other.trans_probs
 
         # Compute running weighted average
@@ -123,40 +125,58 @@ class _OnlineSuffStats:
         self.sum_w = new_sum_w
         return
     
-    @classmethod
-    def flatten_initial_probs(cls, other_initial_probs):
-        raise NotImplementedError
+@partial(jax.pmap, axis_name='device', static_broadcasted_argnums=(0,))
+def sharded_e_step(hmm, batched_emissions):
+    """
+        batched_emissions: shape (batches_per_device, num_frames_per_batch, obs_dim )
+    """
 
-    def accumulate_initial_probs(self, other_initial_probs):
-        raise NotImplementedError
+    # batched_stats: dataclass with shape (batches_per_device, hmm.num_states, ...)
+    batched_stats = hmm.e_step(batched_emissions)
 
-@chex.dataclass
-class IndepBatchOnlineSuffStats(_OnlineSuffStats):
-    """Data batches treated as independent batches. So, we sum inferred initial_probs"""
-    @classmethod
-    def flatten_initial_probs(cls, other_initial_probs):
-        num_states = other_initial_probs.shape[-1]
-        return other.reshape(-1, num_states).sum(axis=0)
+    # """sharded normalize"""
+    marginal_loglik = jax.lax.psum(batched_stats.marginal_loglik.sum(), axis_name='device')
+    initial_probs = batched_stats.initial_probs[0]
+    trans_probs= jax.lax.psum(batched_stats.trans_probs.sum(axis=0), axis_name='device')
+    
+    new_sum_w = jax.lax.psum(batched_stats.sum_w.sum(axis=0), axis_name='device')
+    normd_w = batched_stats.sum_w / new_sum_w
+    normd_x = batched_stats.normd_x * normd_w[..., None]
+    normd_xxT = batched_stats.normd_xxT * normd_w[...,None,None]
 
-    def accumulate_initial_probs(self, other_initial_probs):
-        num_states = other_initial_probs.shape[-1]
-        return other_initial_probs.reshape(-1, num_states).sum(axis=0)
+    normd_x = jax.lax.psum(normd_x.sum(axis=0), axis_name='device')
+    normd_xxT = jax.lax.psum(normd_xxT.sum(axis=0), axis_name='device')
+    
+    return StreamingSuffStats(
+        marginal_loglik=marginal_loglik,
+        initial_probs=initial_probs,
+        trans_probs=trans_probs,
+        sum_w=new_sum_w,
+        normd_x=normd_x,
+        normd_xxT=normd_xxT,
+    )
 
-@chex.dataclass
-class SplitBatchOnlineSuffStats(_OnlineSuffStats):
-    """Data batches treated as split sequences. So, we only care about the very
-    initial initial_probs, and ignore later initial_probs because they are
-    actually mid-sequence."""
+@partial(jax.pmap, axis_name='device', static_broadcasted_argnums=(0,))
+def sharded_e_step2(hmm, batched_emissions):
+    """
+        batched_emissions: shape (batches_per_device, num_frames_per_batch, obs_dim )
+    """
 
-    @classmethod
-    def flatten_initial_probs(cls, other_initial_probs):
-        num_states = other_initial_probs.shape[-1]
-        return other_initial_probs.reshape(-1, num_states)[0]
+    # batched_stats: dataclass with shape (batches_per_device, hmm.num_states, ...)
+    batched_stats = hmm.e_step(batched_emissions)
 
-    def accumulate_initial_probs(self, other_initial_probs):
-        if jnp.all(self.initial_probs==0.):  # If first ijnput, then save the `other_initial_probs`
-            return other_initial_probs
-        return jnp.zeros_like(self.initial_probs) # Otherwise, ignore
+    stats = StreamingSuffStats(
+        marginal_loglik=batched_stats.marginal_loglik,
+        initial_probs=batched_stats.initial_probs,
+        trans_probs=batched_stats.trans_probs,
+        sum_w=batched_stats.sum_w,
+        normd_x=batched_stats.normd_x,
+        normd_xxT=batched_stats.normd_xxT,
+    )
+
+    stats.normalize() # normalize across batches_per_device axis
+
+    return stats
 
 def streaming_parallel_e_step(hmm, emissions_dl):
     """Performs parallelized E-step on a 'streaming' (sequentially-loaded set of emissions).
@@ -173,22 +193,23 @@ def streaming_parallel_e_step(hmm, emissions_dl):
     Returns:
         suff_stats: dataclass containing posterior normalized sufficient statistics
     """
-    num_devices = jax.local_device_count()
-    parallel_e_step = jax.pmap(hmm.e_step)   
+    # stats = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
 
-    # Add leading dimension for m-step to sum over
-    suff_stats = SplitBatchOnlineSuffStats.empty((hmm.num_states, hmm.num_obs))
-    
-    p_emiss_shape = (num_devices, emissions_dl.batch_shape[0]//num_devices, *emissions_dl.batch_shape[1:])
+    # from itertools import islice
+    # import pdb
+    # for batch_emissions in emissions_dl:
+    #     batch_stats = sharded_e_step(hmm, batch_emissions)
+    #     batch_stats.normalize()
+    #     stats.add(batch_stats)
 
+    # # all close EXCEPT
+    # stats2.sum_w == stats.sum_w / 2
+    # stats2.trans_prob == stats.trans_probs / 2
+    stats2 = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
     for batch_emissions in emissions_dl:
-        # TODO Shape emissions properly IN the dataloader...
-        # With JAX device arrays, "this function may in some cases return a copy
-        # rather than a view of the input." Normally this is not an issue because
-        # jitting the function optimizes memory usage (but obviously we can't).
-        # NOTE Memory profiling does not show this to be an issue...
-        batch_suff_stats = parallel_e_step(batch_emissions.reshape(*p_emiss_shape))
-        batch_suff_stats = SplitBatchOnlineSuffStats.convert_flat(batch_suff_stats)
-        suff_stats.add(batch_suff_stats)
+        batch_stats2 = sharded_e_step2(hmm, batch_emissions)
+        batch_stats2.normalize()
+        stats2.add(batch_stats2)
 
-    return suff_stats
+    import pdb; pdb.set_trace()
+    return stats2
