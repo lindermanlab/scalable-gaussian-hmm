@@ -8,57 +8,28 @@ leading batch shape (n_splits, n_hmm_states, ...). Here, no recombination
 is required.
 """
 import chex
-import jax
+from jax import tree_map, pmap
 import jax.numpy as jnp
 from functools import partial
 
-from ssm_jax.hmm.models import GaussianHMM                                      # probml/ssm-jax : https://github.com/probml/ssm-jax
-from tensorflow_probability.substrates.jax.distributions import Dirichlet
-
 # ==============================================================================
-
 @chex.dataclass
-class StreamingSuffStats:
-    """Dataclass for cumulatively storing normalized GaussinHMM sufficient statistics."""
-    marginal_loglik: chex.Scalar    # shape ([1],)
-    initial_probs: chex.Array       # shape ([1],K,)
-    trans_probs: chex.Array         # shape ([1],K,K)
-    sum_w: chex.Array               # shape ([B],K,)
-    normd_x: chex.Array             # shape ([B],K,D,)
-    normd_xxT: chex.Array           # shape ([B],K,D,D)
-
-    # def __post_init__(self):
-    #     """Verify that all parameters have consistent shapes"""
-    #     assert self.trans_probs.shape[-2:] == (self.num_states, self.num_states)
-    #     assert self.normd_xxT.shape[-2:] == (self.num_obs, self.num_obs)
-    #     assert self.num_states == self.normd_x.shape[-2] == self.normd_xxT.shape[-3] == self.sum_w.shape[-1]
-        
-    #     # if self.batch_shape:
-        #     assert self.batch_shape == self.normd_x.shape[:-2] == self.normd_xxT.shape[:-3]
-        
-    @property
-    def num_states(self,) -> int:
-        return int(self.initial_probs.shape[-1])
-    
-    @property
-    def num_obs(self,) -> int:
-        return int(self.normd_x.shape[-1])
+class NormalizedGaussianHMMSuffStats:
+    # Normalized sufficient statistics of a GaussianHMM
+    marginal_loglik: chex.Scalar    # shape (...,)
+    initial_probs: chex.Array       # shape (...,K,)
+    trans_probs: chex.Array         # shape (...,K,K)
+    sum_w: chex.Array               # shape (...,K,)
+    normd_x: chex.Array             # shape (...,K,D,)
+    normd_xxT: chex.Array           # shape (...,K,D,D)
 
     @property
     def shape(self,):
-        return jax.tree_map(lambda arr: arr.shape, self)
-
-    # @property
-    # def batch_shape(self,):
-    #     return self.sum_w.shape[:-1] if self.sum_w.ndim > 1 else ()
+        return tree_map(lambda arr: arr.shape, self)
 
     @classmethod
     def empty(cls, shape: tuple):
-        """Allocate empty dataclass with specified shapes. Pre-allocated memory for arrays.
-    
-        `shape` is interpreted as ([B_1, B_2, ...], num_states, num_obs)
-        """
-        # assert len(shape) >= 2, f'Expected tuple of length 2 or more, received {shape}'
+        """Allocate empty dataclass with specified shapes."""
         B = shape[:-2]
         K, D = shape[-2:]
 
@@ -67,52 +38,68 @@ class StreamingSuffStats:
             initial_probs=jnp.zeros(B+(K,)),
             trans_probs=jnp.zeros(B+(K,K)),
             sum_w=jnp.zeros(B+(K,)),
-            normd_x=jnp.empty(B+(K,D,)),
-            normd_xxT=jnp.empty(B+(K,D,D)),
+            normd_x=jnp.zeros(B+(K,D,)),
+            normd_xxT=jnp.zeros(B+(K,D,D)),
         )
-    
-    def flatten(self,):
-        """Reshapes all fields to have 1D batch
+
+    @staticmethod
+    def flatten(ss):
+        """Reshape suff stats dataclass so that fields have shape (-1, K, ...)."""
+        K = ss.initial_probs.shape[-1]      # num_states
+        D = ss.normd_x.shape[-1]            # emission_dims
+
+        ss.marginal_loglik = ss.marginal_loglik.reshape(-1)
+        ss.initial_probs = ss.initial_probs.reshape(-1, K)
+        ss.trans_probs = ss.trans_probs.reshape(-1, K, K)
+
+        ss.sum_w = ss.sum_w.reshape(-1, K)
+        ss.normd_x = ss.normd_x.reshape(-1, K, D)
+        ss.normd_xxT = ss.normd_xxT.reshape(-1, K, D, D)
+        return ss
+
+@chex.dataclass
+class StreamingSuffStats(NormalizedGaussianHMMSuffStats):
+    """Cumulatively store normalized GaussinHMM sufficient statistics."""
+    @staticmethod
+    def rescale(ss: NormalizedGaussianHMMSuffStats):
+        """Rescale a batch of normalized stats in-place. Fields have shape (K,...).
         
-        Resulting fields have shape (B,K,...).
+        Mathematically the same as the rescaling code used in hmm.m_step.
+        Note the special treatment of initial_probs. Since we assume data is seen
+        sequentially, we only want to keep the initial probs of the first batch.
         """
-        self.marginal_loglik = self.marginal_loglik.reshape(-1)
-        self.initial_probs = self.initial_probs.reshape(-1, self.num_states)
-        self.trans_probs = self.trans_probs.reshape(-1, self.num_states, self.num_states)
-
-        self.sum_w = self.sum_w.reshape(-1, self.num_states)
-        self.normd_x = self.normd_x.reshape(-1, self.num_states, self.num_obs)
-        self.normd_xxT = self.normd_xxT.reshape(-1, self.num_states, self.num_obs, self.num_obs)
-        return
-
-    def normalize(self, ):
-        """Normalizes fields across the batch.
         
-        Resulting fields have shape (K,...).
+        ss = NormalizedGaussianHMMSuffStats.flatten(ss)
         
-        NB special treatment of initial_probs: Since we assume that data is
-        streamed sequentially, initial_probs should be entirely determined
-        by the initial_probs of the first batch.
+        # ---------------------------------------------
+        ss.marginal_loglik = ss.marginal_loglik.sum()
+        ss.initial_probs = ss.initial_probs[0]
+        ss.trans_probs = ss.trans_probs.sum(axis=0)
+
+        # ---------------------------------------------
+        new_sum_w = ss.sum_w.sum(axis=0)
+        normd_w = ss.sum_w / new_sum_w
+        
+        ss.normd_x = (ss.normd_x * normd_w[...,None]).sum(axis=0)
+        ss.normd_xxT = (ss.normd_xxT * normd_w[...,None,None]).sum(axis=0)
+        ss.sum_w = new_sum_w
+        return ss
+
+    def accumulate(self, other):
+        """Add the sufficient stats of `other` into the rolling sufficient stats.
+
+        NB the special treatment of initial_probs: Since we assume data is seen
+        sequentially, we only the values from the very first set of suff stats.
+        Assumes an empty instance is allocated, with initial_probs set to 0.
+
+        Parameters
+            other: NormalizedGaussianHMMSuffStats, rescaled so fields have
+                   shape (K,...)
         """
-        self.flatten()
-
-        self.marginal_loglik = self.marginal_loglik.sum()
-        self.initial_probs = self.initial_probs[0]
-        self.trans_probs = self.trans_probs.sum(axis=0)
-
-        new_sum_w = self.sum_w.sum(axis=0)
-        normd_w = self.sum_w / new_sum_w
-        
-        self.normd_x = (self.normd_x * normd_w[...,None]).sum(axis=0)
-        self.normd_xxT = (self.normd_xxT * normd_w[...,None,None]).sum(axis=0)
-        self.sum_w = new_sum_w
-        return
-
-    def add(self, other):
-        # Accumulate the sum
-        self.initial_probs += other.initial_probs if jnp.all(self.initial_probs==0.) \
-                              else jnp.zeros_like(other.initial_probs)
         self.marginal_loglik += other.marginal_loglik
+
+        if jnp.all(self.initial_probs==0.):
+            self.initial_probs += other.initial_probs 
         self.trans_probs += other.trans_probs
 
         # Compute running weighted average
@@ -125,7 +112,7 @@ class StreamingSuffStats:
         self.sum_w = new_sum_w
         return
     
-def streaming_parallel_e_step(hmm, emissions_dl):
+def streaming_parallel_e_step(hmm, emissions_dl) -> StreamingSuffStats:
     """Performs parallelized E-step on a 'streaming' (sequentially-loaded set of emissions).
 
     This function is useful when the full set of emissions are too large to be
@@ -141,38 +128,9 @@ def streaming_parallel_e_step(hmm, emissions_dl):
         suff_stats: dataclass containing posterior normalized sufficient statistics
     """
     stats = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
-
     for batch_emissions in emissions_dl:
-        batch_stats = jax.pmap(hmm.e_step)(batch_emissions)
-        rescaled_stats = StreamingSuffStats(
-            marginal_loglik=batch_stats.marginal_loglik,
-            initial_probs=batch_stats.initial_probs,
-            trans_probs=batch_stats.trans_probs,
-            sum_w=batch_stats.sum_w,
-            normd_x=batch_stats.normd_x,
-            normd_xxT=batch_stats.normd_xxT,
-        )
-
-        rescaled_stats.normalize()
-
-        stats.add(rescaled_stats)
-    # from itertools import islice
-    # import pdb
-    # for batch_emissions in emissions_dl:
-    #     batch_stats = sharded_e_step(hmm, batch_emissions)
-    #     batch_stats.normalize()
-    #     stats.add(batch_stats)
-
-    # # all close EXCEPT
-    # stats2.sum_w == stats.sum_w / 2
-    # stats2.trans_prob == stats.trans_probs / 2
-    # stats2 = StreamingSuffStats.empty((1, hmm.num_states, hmm.num_obs))
-    # for batch_emissions in emissions_dl:
-    #     batch_stats2 = sharded_e_step2(hmm, batch_emissions)
-    #     batch_stats2.normalize()
-    #     stats2.add(batch_stats2)
-
-    # import pdb; pdb.set_trace()
-
+        batch_stats = pmap(hmm.e_step)(batch_emissions)
+        batch_stats = StreamingSuffStats.rescale(batch_stats)
+        stats.accumulate(batch_stats)
 
     return stats
