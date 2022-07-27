@@ -311,7 +311,7 @@ class FishPCDataloader():
     @property
     def batch_shape(self) -> chex.Shape:
         """Return shape of each batch of data"""
-        return (self.batch_size, self.num_frames_per_batch, self.dataset.dim)
+        return (self.batch_size, 1, self.num_frames_per_batch, self.dataset.dim)
 
     @property
     def num_minibatches(self) -> int:
@@ -366,7 +366,7 @@ class FishPCDataloader():
                 s_ = np.s_[s_ds[0]*self.num_frames_per_batch : s_ds[1]*self.num_frames_per_batch]
                 self._buffer = self._buffer \
                     .at[i_buff : i_buff+n_buff] \
-                    .set(self.dataset[i_ds][s_].reshape(n_buff, self.num_frames_per_batch, -1))
+                    .set(self.dataset[i_ds][s_].reshape(n_buff, 1, self.num_frames_per_batch, -1))
 
                 i_buff += n_buff
         
