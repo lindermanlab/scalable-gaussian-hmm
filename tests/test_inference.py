@@ -157,8 +157,8 @@ def test_streaming_pmap():
     # -------------------------------------------------------------------------
     assert jnp.all(get_leading_dim(test_nss)==1)
     
-    assert_allclose_with_errmsg(ref_nss.marginal_loglik,
-                                test_nss.marginal_loglik,
+    assert_allclose_with_errmsg(test_nss.marginal_loglik,
+                                ref_nss.marginal_loglik,
                                 rtol=1e-2, title='marginal_loglik')
 
     assert_allclose_with_errmsg(test_hmm.emission_means,
@@ -166,7 +166,7 @@ def test_streaming_pmap():
                                 rtol=1e-1, atol=1e-1,
                                 title='emission_means')
     
-    assert_allclose_with_errmsg(ref_hmm.emission_covariance_matrices,
-                                test_hmm.emission_covariance_matrices,
+    assert_allclose_with_errmsg(test_hmm.emission_covariance_matrices,
+                                ref_hmm.emission_covariance_matrices,
                                 rtol=1e-1, atol=1e-1,
                                 title='emission_covariance_matrices')

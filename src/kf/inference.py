@@ -177,7 +177,7 @@ def streaming_parallel_e_step(hmm, emissions_dl):
     parallel_e_step = jax.pmap(hmm.e_step)   
 
     # Add leading dimension for m-step to sum over
-    suff_stats = SplitBatchOnlineSuffStats.empty((hmm.num_states, hmm.num_obs))
+    suff_stats = SplitBatchOnlineSuffStats.empty((1, hmm.num_states, hmm.num_obs))
     
     p_emiss_shape = (num_devices, emissions_dl.batch_shape[0]//num_devices, *emissions_dl.batch_shape[1:])
 
