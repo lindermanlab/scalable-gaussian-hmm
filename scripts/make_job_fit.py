@@ -73,6 +73,9 @@ parser.add_argument(
     '--mprof', action='store_true',
     help='If specified, profile memory usage with memory_profiler.')
 parser.add_argument(
+    '--savefit', action='store_true',
+    help='If specified, save fitted HMM.')
+parser.add_argument(
     '--norun', action='store_true',
     help='If specified, only generate job scripts but do not run')
 
@@ -165,7 +168,7 @@ def parse_and_split_args(args):
 
     return sb_args, py_args, iterable
 
-def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False):
+def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False, savefit=False):
     """Generate job script for fitting HMM.
 
     Params
@@ -202,21 +205,20 @@ def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False):
             f.writelines('echo {} {}\n'.format(k, v))
         f.writelines('\n')
 
-        # Execute code
-        if mprof:
-            f.writelines('mpfile={}\n'.format(os.path.join(logdir, prefix+'.$SLURM_JOB_ID')))
-            f.writelines('mprof run -M -o $mpfile --backend psutil_pss \\\n')
-            f.writelines('\t{} \\\n'.format(py_script_name))
-        else:
-            f.writelines('python {}.py \\\n'.format(py_script_name))
+        # Python command
+        f.writelines('python {}.py \\\n'.format(py_script_name))
 
         for k, v in py_args.items():
             f.writelines('\t--{} {} \\\n'.format(k,v))
         f.writelines('\t--log_dir {}\\\n'.format(logdir))
         f.writelines('\t--log_prefix {}\\\n'.format(prefix))
+        if mprof:
+            f.writelines('\t--mprof\\\n')
+        if savefit:
+            f.writelines('\t--savefit\\\n')
+        f.writelines('\n')
         
         if mprof:
-            f.writelines('\n')
             f.writelines('mprof peak $mpfile.mprof                      # Print peak memory usage\n')
             f.writelines('mprof plot $mpfile.mprof -o $mpfile.png -s    # Make figure (-o), with slope (-s)\n')
     return fpath
@@ -242,7 +244,8 @@ def main():
                 os.system("sbatch {}".format(jobpath))
     else:
         prefix = "{}-{}".format(timestamp, py_args['method'])
-        jobpath = generate_script(prefix, sb_args, py_args, mprof=args['mprof'])
+        jobpath = generate_script(prefix, sb_args, py_args,
+                                  mprof=args['mprof'], savefit=args['savefit'])
         
         if args['norun']:
             print(f"--norun specified. jobscript generated:\n\t{job_path}")

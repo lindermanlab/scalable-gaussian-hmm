@@ -61,15 +61,15 @@ parser.add_argument(
 parser.add_argument(
     '--states', type=int, default=20,
     help='Number of HMM states to fit')
+parser.add_argument(
+    '--mprof', action='store_true',
+    help='If specified, profile memory usage with memory_profiler.')
+parser.add_argument(
+    '--savefit', action='store_true',
+    help='If specified, save fitted HMM.')
 
 def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
-    """Writes memory usage vs. time results returned by `memory_usage` to file.
-
-    Parameters:
-        path: str, path to file
-        mem_usage: list of tuples (timestamp, mem_usage [MiB])
-        mode: str, file write mode
-    """
+    """Writes time-based memory profiler results to file."""
 
     with open(path, mode) as f:
         for res in mem_usage:
@@ -98,8 +98,8 @@ def main():
     num_em_iters = args.iters
 
     # TODO Add these options into arg parser
-    mprof = True
-    save_results = False
+    mprof = args.mprof
+    save_results = args.savefit
 
     if log_prefix is None:
         timestamp = datetime.now().strftime("%y%m%d%H%M")

@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from kf.inference import (streaming_parallel_e_step, SplitBatchOnlineSuffStats)
+from kf.inference import streaming_parallel_e_step
 from kf.data_utils import FishPCDataset, FishPCDataloader
 
 from memory_profiler import profile
