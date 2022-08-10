@@ -1,26 +1,19 @@
 # Helper classes for managing killifish data
 
-from os import listdir
-from os.path import join, split, isfile
-
+import os
 import h5py
+
 import numpy as onp
+import bisect
+from functools import partial
 
-from torch.utils.data as Dataset, DataLoader, SubsetRandomSampler\
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, BatchSampler
 from torch import Generator
-
-def _extract_file_metadata(filepath):
-    """Extract metadata associated with a given file."""
-    
-    # fish_id
-    # day born, day died, cohort id?
-    num_frames = len(h5py.File(f, 'r')['stage/axis1'])
-
-    raise NotImplementedError
 
 class FishPCDataset(Dataset):
     """
-    Maps (fish_id, file_id, start_frame_idx, end_frame_idx) to the corresponding
+    Dataset class wrapping PC data of a single fish across its whole lifespan.
+    Maps (file_id, start_frame_idx, end_frame_idx) to the corresponding
     consecutive data sequence with shape (seq_length, data_dim) and data labels
     () where seq_length <= (end_frame_idx-start_frame_idx).
 
@@ -28,70 +21,163 @@ class FishPCDataset(Dataset):
     all fish and files. Note that this number may be more than the total number
     of emissions that the corresonding DataLoader may load.
 
+    Each H5 file has the following Pandas-based structure,
+    - stage
+    | - axis0: column headers (str)
+    | - axis1: row indices (int)
+    | - *_items, *_values: column headers and data array, blocked by data type
+    | - > block0_values: pc data array, f32(num_frames, dim)
+    | - > block1_values: frame timestamp, f64(num_frames,)
+    | - > block2_values: frame count, uint64(num_frames,)
+    
     Args:
-        filepaths ([str, iterable[str]]): path or list of paths to H5 files
-
+        filepaths ([str, iterable[str]]): path or list of paths to H5 files.
+        **metadata (dict):
     Returns:
 
     """
 
-    def __init__(self, filepaths, dtype=onp.float32):
-
-        # Standardize filepaths to be tuple of strings
+    def __init__(self, filepaths, **metadata):
+        # Standardize filepaths to be tuple of strings; sort alphabetically.
         if isinstance(filepaths, str):
-            self.filepaths = (filepaths,)
-        elif isinstance(filepaths, (list, tuple)):
-            if all(isinstance(path, str) for path in filepaths):
-                self.filepaths = tuple(filepaths)
-            else:
-                raise ValueError("Expected all elements of `filepaths` to be strings.")
-        else:
+            filepaths =(filepaths,)
+        elif not isinstance(filepaths, (list, tuple)):
             raise ValueError(
                 "Expected `filepaths` to be string or an iterable of strings, " \
                 + f"received {type(filepaths)}.")
+        
+        self._filepaths = sorted([
+            fp for fp in filepaths if os.path.isfile(fp) and fp.endswith('.h5')
+        ],)
+        assert len(self._filepaths) > 0, 'No files found. Make sure that e.g. absolute paths are passed in.'
 
-        # Extract metadata from each file
-        self.metadata = {
-            lambda f: _extract_metadata(f) for f in self.filepaths
-        }
+        # Store data (obs) dimensions, cumulative sum of number of frames per file
+        file_data_shape = onp.stack([
+            h5py.File(fp, 'r')['stage/block0_values'].shape for fp in self._filepaths
+        ],)
+        self._num_frames_per_file = file_data_shape[:,0]
+        self._cumulative_frames = onp.cumsum(self._num_frames_per_file)
+        self._dim = file_data_shape[-1,-1]
+              
+        # TODO Pass in metadata and process (if needed)
+        self.metadata = metadata
 
     @property
     def dim(self,):
         """Return data dimension of dataset."""
-        pass 
+        return self._dim
+    
+    @property
+    def cumulative_frames(self,):
+        """Return data dimension of dataset."""
+        return self._cumulative_frames
 
     def __len__(self,):
         """Return total number of frames, across all fish and files."""
-        pass
+        return self._cumulative_frames[-1]
     
-    def __getitem__(self, key):
-        """Return specificed data array and identifying labels
+    def argseqsubsets(self, seq_length: int, step_size: int=1,
+                      drop_incomplete_seqs: bool=True):
+        """Return the list of index tuples to subset data sequentially for given
+        sequence length and step size.
+        
+        If drop_incomplete_seqs is True, resulting sequences will all have
+        the same length (seq_length, ). Else, some sequences may be shorter.
+        """
+
+        abs_seq_length = seq_length * step_size
+        
+        subset_keys = []
+        for i_file in range(len(self.cumulative_frames)):
+            f_start_idx = 0 if i_file == 0 else self.cumulative_frames[i_file-1] 
+            f_end_idx = self.cumulative_frames[i_file] 
+            seq_start_indices = onp.arange(f_start_idx, f_end_idx, abs_seq_length)
+            
+            if drop_incomplete_seqs:
+                seq_end_indices = seq_start_indices + abs_seq_length
+                if seq_end_indices[-1] >= f_end_idx:
+                    seq_start_indices = seq_start_indices[:-1]
+                    seq_end_indices = seq_end_indices[:-1]
+            else:
+                seq_end_indices = \
+                    onp.minimum(seq_start_indices + abs_seq_length, f_end_idx)
+
+            subset_keys.extend([
+                (int(start_idx), int(end_idx), int(step_size))
+                for start_idx, end_idx in zip(seq_start_indices, seq_end_indices)
+            ])
+
+        return subset_keys
+
+    def __getitem__(self, ds_indices):
+        """Return specificed data array and identifying labels.
+
+        Only returns data from a single file, i.e. the file indexed by start_idx.
+
         Args:
-            key (tuple), consisting of elements
-                fish_id (str)
-                file_id (str)
-                start_frame_idx (int)
-                end_frame_idx (int)
+            indices (int or tuple[int]), consisting of
+                (ds_start_idx, [ds_end_idx, [step_size]]).
         
         Returns:
-            data (onp.ndarray), shape (seq_length, obs_dim)
+            data (onp.ndarray), shape (seq_len, obs_dim) where seq_len is
+                (ds_end_idx - ds_start_idx) // step_size. Array is 2d
             label (tuple), consisting of elements
-                fish_id (str)
-                timestamps (onp.ndarray, float64 dtype)
+                timestamps (onp.ndarray, shape (seq_len,))
         """
-        raise NotImplementedError
 
-        # TODO
-        def _get_filepath(fish_id, file_id):
-            raise NotImplementedError
+        try: # int-like
+            ds_indices = (int(ds_indices), int(ds_indices)+1, 1)
+        except TypeError: # ds_indices is not an int or scalar
+            pass
+        try: # array-like
+            if len(ds_indices) == 1:
+                ds_indices = (int(ds_indices), int(ds_indices)+1, 1)
+            elif len(ds_indices) == 2:
+                ds_indices = (int(ds_indices[0]), int(ds_indices[1]), 1)
+            elif len(ds_indices) == 3:
+                ds_indices = (int(ds_indices[0]), int(ds_indices[1]), int(ds_indices[2]))
+            else:
+                raise ValueError(f'Expected int or array-like with length <= 3, received {len(ds_indices)}')
+        except TypeError: # ds_indices is also not array-like
+            raise TypeError(f'Expected int or array-like with length <= 3, received {type(ds_indices)}')
+        
+        ds_start_idx, ds_end_idx, step_size = ds_indices
+        abs_seq_length = ds_end_idx - ds_start_idx
+        
+        i_file = bisect.bisect_right(self.cumulative_frames, ds_start_idx)
+        f_start_idx = 0 if i_file == 0 else self.cumulative_frames[i_file-1] 
+        f_end_idx = self.cumulative_frames[i_file] 
+        
+        start_idx = ds_start_idx - f_start_idx
+        end_idx = onp.minimum(start_idx + abs_seq_length, f_end_idx)
+        with h5py.File(self._filepaths[i_file], 'r') as f:
+            data = onp.asarray(
+                f['stage/block0_values'][start_idx:end_idx:step_size],
+                dtype=onp.dtype('float32')
+            )
 
-        fish_id, file_id, start_frame_idx, end_frame_idx = key
+            timestamp = onp.asarray(
+                f['stage/block1_values'][start_idx:end_idx:step_size],
+                dtype=onp.dtype('float64')
+            )
 
-        with h5py.File(_get_filepath(fish_id, file_id)), 'r') as tmp:
-            # TODO return data (here), return labels
-            return onp.array(tmp['stage/block0_values'][()])
+        # TODO Return (fish_id, age, time-of-day) instead of timestamp
+        return data.squeeze(), timestamp.squeeze()
 
-def FishPCLoader(DataLoader):
+    @staticmethod
+    def collate(sequences):
+        """Stack a list of sequences (or samples) along new leading dimension.
+        This function will be dependent on what __getitem__ returns.
+        """
+        # If uniform sequence lengths, return tuple of stacked arrays
+        try:
+            return tuple(map(onp.stack, zip(*sequences)))
+        # If non-uniform sequence lengths, return tuple of lists
+        except ValueError:
+            return tuple(zip(*sequences))
+        
+
+class FishPCLoader(DataLoader):
     """Provides an iterable over FishPCDataset. Randomly selects subsets of
     consecutive frames of length (seq_length,) from the Dataset, returns a batch
     of emissions of shape (batch_size, seq_length, data_dim).
@@ -101,9 +187,9 @@ def FishPCLoader(DataLoader):
         batch_size (int): Number of samples per batch to load.
         seq_length (int): Number of consecutive frames to load per sequence.
         batch_size (int): Number of "independent" sequences to load per minibatch.
-        drop_incomplete_batches (bool): If True, drops batches which are smaller
-            than seq_length. Similar to `drop_last` argument, but handled in a 
-            custom fashion, since each by data file may have an incomplete batch.
+        drop_incomplete_seqs (bool): If True, drops sequences which are shorter
+            than seq_length. Similar to `drop_last` argument, but when level in.
+        drop_last (bool): If True, drops (last) batch if it is not full
         shuffle (bool): If True, shuffles the batches of sequences at every epoch,
             i.e. after every Stopiteration. Else, batches are loaded in the same
             standard alphanumeric order each epoch.
@@ -113,64 +199,37 @@ def FishPCLoader(DataLoader):
             relevant if shuffle is True.
     """
 
-    def __init__(self, dataset, seq_length=7200, batch_size=1,
-                 drop_incomplete_batches=True, shuffle=False, seed=None):
+    def __init__(self, dataset, seq_length=72000, batch_size=1, collate_fn=None,
+                 drop_incomplete_seqs=True, drop_last=True,
+                 shuffle=False, seed=None):
 
         # Define strategy to sample batches of data
         # |- Get Dataset keys that index into files to get sequences of seq_length
-        subset_keys = self._make_subset_keys(dataset, seq_length, drop_incomplete_batches)
+        step_size = 1
+        subset_indices = dataset.argseqsubsets(seq_length, step_size, drop_incomplete_seqs)
 
         # |- if shuffle, specify RNG and use a Sampler
         if shuffle:
             torch_rng = Generator()
             if seed: torch_rng.manual_seed(seed)
-            seq_sampler = SubsetRandomSampler(subset_keys, torch_rng)
+            seq_sampler = SubsetRandomSampler(subset_indices, torch_rng)
         # |- else, just pass in alphanumerically ordered keys
         else:
             torch_rng = None
-            seq_sampler = subset_keys
+            seq_sampler = subset_indices
         
         batch_sampler = BatchSampler(seq_sampler, batch_size, drop_last)
 
         # Function to merge a list of sequences to form a mini-batch
-        collate_fn = lambda batch: jnp.asarray(onp.stack(batch, axis=0))
+        collate_fn = dataset.collate if collate_fn is None else collate_fn
 
-        super.(self.__class__, self).__init__(
+        super(self.__class__, self).__init__(
             dataset,
             batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             generator=torch_rng,
         )
-
-    @static_method
-    def _make_subset_keys(dataset, seq_length: int, drop_incomplete_batches: bool):
-        """Construct a list of keys to take subsets of data from the dataset.
-        
-        If drop_incomplete_batches is True, resulting sequences will all have
-        the same length (seq_length, ). Else, some sequences may be shorter.
-        """
-
-        subset_keys = []
-        for _metadata in dataset.file_metadata:
-            fish_id = _metadata['fish_id']
-            file_id = _metadata['file_id']
-            num_frames = _metadata['num_frames']
-            start_indices = onp.arange(0, num_frames, seq_length)
-            
-            if drop_incomplete_batches:
-                end_indices = start_indices + seq_length
-                if end_indices[-1] >= num_frames:
-                    start_indices = start_indices[:-1]
-                    end_indices = end_indices[:-1]
-            else:
-                end_indices = onp.minimum(start_indices+seq_length, num_frames)
-
-            subset_keys.extend([
-                (fish_id, file_path, start_idx, end_idx)
-                for start_idx, end_idx in zip(start_indices, end_indices)
-            ])
-
-        return subset_keys
+    
 
 # ==============================================================================
 
@@ -246,7 +305,7 @@ def arg_uniform_split(target_set_size, set_sizes, set_ids=None):
             return _fn(n, i_set+1, 0, out)
 
     target_num_sets = sum(set_sizes) // target_set_size                # The number of evenly-sized sets that will result
-    set_ids = np.arange(len(set_sizes)) if set_ids is None else set_ids    
+    set_ids = onp.arange(len(set_sizes)) if set_ids is None else set_ids    
     i_set = i_within_set = 0
     all_args = []
     for _ in range(target_num_sets):
@@ -265,8 +324,7 @@ def save_hmm(fpath: str, hmm, **kwargs):
         hmm: GaussianHMM
         kwargs: Other arrays to save in the same file.
     """
-    import numpy as np  # jax.numpy has not yet implemented this method
-    np.savez_compressed(fpath, 
+    onp.savez_compressed(fpath, 
         initial_probabilities = hmm.initial_probabilities,
         transition_matrix = hmm.transition_matrix,
         emission_means = hmm.emission_means,
@@ -283,7 +341,7 @@ def load_hmm(fpath: str):
             'emission_means',
             'emission_covariance_matrices']
 
-    with np.load(fpath) as f:
+    with onp.load(fpath) as f:
         hmm = GaussianHMM(**{k: f[k] for k in keys})
 
     return hmm

@@ -219,6 +219,7 @@ def generate_script(prefix, sb_args, py_args, logdir=TEMPDIR, mprof=False, savef
         f.writelines('\n')
         
         if mprof:
+            f.writelines('mpfile={}\n'.format(os.path.join(logdir,prefix)))
             f.writelines('mprof peak $mpfile.mprof                      # Print peak memory usage\n')
             f.writelines('mprof plot $mpfile.mprof -o $mpfile.png -s    # Make figure (-o), with slope (-s)\n')
     return fpath

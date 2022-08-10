@@ -4,11 +4,10 @@ import os
 import argparse
 from datetime import datetime
 
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as jr
 from ssm_jax.hmm.models import GaussianHMM
-from kf.data_utils import FishPCDataset, FishPCDataloader, save_hmm
-from kf.fit import fit_pmap
+from kf.data_utils import FishPCDataset, FishPCLoader, save_hmm
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['TEMPDIR']
@@ -108,41 +107,50 @@ def main():
     print("")
     print(f"Output files will be logged to: {log_dir}")
     # ==========================================================================
-    seed_split_data, seed_init_hmm = jr.split(seed, 2)
+    seed_train, seed_test, seed_init_hmm = jr.split(seed, 3)
 
-    full_ds = FishPCDataset(fish_id, DATADIR,
-                            data_subset='all',
-                            min_frames_per_file=frames_per_batch,
-                            max_frames_per_file=max_frames_per_day)
-    train_ds, test_ds = full_ds.train_test_split(num_train=num_train,
-                                                 num_test=num_test,
-                                                 seed=seed_split_data)
+    fish_dir = os.path.join(DATADIR, fish_id)
+    filepaths = sorted([os.path.join(fish_dir, f) for f in os.listdir(fish_dir)])
     
-    del full_ds
+    num_train = int(num_train) if num_train >= 1 else int(len(filepaths) * num_train)
+    num_test = int(num_test) if num_test >= 1 else int(len(filepaths) * num_test)
+    
+    train_filepaths = filepaths[:num_train]
+    test_filepaths = filepaths[num_train:num_train+num_test]
 
-    # TODO Move train_test_split function to FishPCDataloader class
-    # so that we can shuffle over batches (and not just over days)
-    # Load all emissions, shape (num_days, num_frames_per_batch, dim)
-    train_dl = FishPCDataloader(train_ds,
-                                batch_size=batch_size,
-                                num_frames_per_batch=frames_per_batch)
-    
-    test_dl  = FishPCDataloader(test_ds,
-                                batch_size=batch_size,
-                                num_frames_per_batch=frames_per_batch)
-    
-    print(f"Initialized datasets ({len(train_ds)} days training, {len(test_ds)} days testing)")
-    print(f"\ttrain: {len(train_dl):3d} batches of shape {train_dl.batch_shape}")
-    print(f"\ttest : {len(test_dl):3d} batches of shape {test_dl.batch_shape}")
+    # Define training and test datasets and data loaders
+    train_ds = FishPCDataset(train_filepaths)
+    test_ds = FishPCDataset(test_filepaths)
+
+    # We don't care about labels right now
+    collate_fn = lambda seq_label_pairs: tuple(map(jnp.stack, zip(*seq_label_pairs)))[0]
+    train_dl = FishPCLoader(train_ds,
+                            seq_length=frames_per_batch,
+                            batch_size=batch_size,
+                            collate_fn=collate_fn,
+                            shuffle=True,
+                            seed=int(seed_train[-1]))
+    total_num_train = len(train_dl) * batch_size * frames_per_batch
+
+    test_dl = FishPCLoader(test_ds,
+                           seq_length=frames_per_batch,
+                           batch_size=batch_size,
+                           collate_fn=collate_fn,
+                           shuffle=True,
+                           seed=int(seed_test[-1]))
+
+    print(f"Initialized datasets ({num_train} days training, {num_test} days testing)")
+    print(f"\ttrain: {len(train_dl):3d} batches of shape {(batch_size, frames_per_batch, train_ds.dim)}")
+    print(f"\ttest : {len(test_dl):3d} batches of shape {(batch_size, frames_per_batch, test_ds.dim)}")
         
     # --------------------------------------------------------------------------
     # Initialize hidden Markov model
     print(f'\nInitializing HMM with {num_hmm_states} states...\n')
-    init_hmm = GaussianHMM.random_initialization(seed_init_hmm, num_hmm_states, train_ds.dim)
+    hmm = GaussianHMM.random_initialization(seed_init_hmm, num_hmm_states, train_ds.dim)
 
     # Run function
-    fn_args = (train_dl, test_dl, init_hmm,)
-    fn_kwargs = {'num_iters': num_em_iters, 'll_fmt':'.4f'}
+    fn_args = (train_dl, total_num_train)
+    fn_kwargs = {'num_epochs': num_em_iters}
 
     if mprof:
         from memory_profiler import memory_usage
@@ -156,8 +164,8 @@ def main():
         #   correct process id and throws a NoProcessFound error. It still seems
         #   to be able record it when submitted as non-interactive job, but
         #   program fails when submitted interactively
-        mem_usage, (hmm, train_lls, test_lls) = memory_usage(
-                proc=(fit_pmap, fn_args, fn_kwargs), retval=True,
+        mem_usage, (train_lls) = memory_usage(
+                proc=(hmm.fit_stochastic_em, fn_args, fn_kwargs), retval=True,
                 backend='psutil_pss',
                 stream=False, timestamps=True, max_usage=False,
                 include_children=True, multiprocess=True,
@@ -166,14 +174,30 @@ def main():
         f_mprof = os.path.join(log_dir, log_prefix+'.mprof')
         write_mprof(f_mprof, mem_usage)
     else:
-        hmm, train_lls, test_lls = fit_pmap(*fn_args, **fn_kwargs)
+        train_lls = hmm.fit_stochastic_em(*fn_args, **fn_kwargs)
         train_lls.block_until_ready()
 
+    print('expected_train_lls:')
+    num_train_emissions = len(train_dl) / batch_size / frames_per_batch
+    train_lls /= num_train_emissions
+    for epoch, ll in enumerate(train_lls):
+        print(f"{epoch:2d}: {ll:.4f}")
+    
+    # Evaluate on test data
+    print("Evaluating test log likelihood")
+    test_ll = 0.
+    num_test_emissions = len(test_dl) / batch_size / frames_per_batch
+    for batch_emissions in test_dl:
+        batch_stats = hmm.e_step(batch_emissions)
+        test_ll += batch_stats.marginal_loglik.sum()
+    test_ll /= num_test_emissions
+    print(f'average_test_ll: {test_ll:.4f}')
+    
     # --------------------------------------------------------------------------
     # Save likelihoods and hmm
     if save_results:
         fpath = os.path.join(log_dir, log_prefix+'.npz')
-        save_hmm(fpath, hmm, train_lls=train_lls, test_lls=test_lls)
+        save_hmm(fpath, hmm, train_lls=train_lls, test_lls=test_ll)
     return
 
 if __name__ == '__main__':
