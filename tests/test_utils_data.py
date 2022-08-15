@@ -8,7 +8,7 @@ import numpy as onp
 
 import jax.random as jr
 
-from kf.data_utils import (FishPCDataset, FishPCLoader, arg_uniform_split)
+from kf import (FishPCDataset, FishPCLoader)
 
 DATADIR = os.environ['DATADIR']
 fish_name = 'fish0_137'
@@ -117,54 +117,3 @@ def test_dataloader_shuffled():
         if i==0:
             assert not onp.all(batch_data==batch_0)
             break
-
-# ==============================================================================
-# Legacy
-# ==============================================================================
-def test_uniform_split():
-    """Use elements from multiple sets."""
-    # Original sets = [0,1,2,3], [4], [5,6,7], [8,9], [10,11,12,13]
-    original_sets = onp.split(onp.arange(14), (4,5,8,10))
-    batch_size = 3
-
-    # Get args to split, then split original set
-    original_set_sizes = list(map(len, original_sets))
-    num_batches = sum(original_set_sizes) // batch_size
-    args = arg_uniform_split(batch_size, original_set_sizes)
-    uniform_sets = onp.empty((num_batches, batch_size))
-    for i_batch, b_args in enumerate(args):
-        # uniform_sets = \
-            # uniform_sets.at[i_batch] \
-            #             .set(onp.concatenate([original_sets[i_set][s_set[0]:s_set[1]] \
-            #                                     for (i_set, s_set) in b_args]))
-        uniform_sets[i_batch] = onp.concatenate(
-            [original_sets[i_set][s_set[0]:s_set[1]] for (i_set, s_set) in b_args]
-        )
-
-    expected_sets = onp.arange(12).reshape(4, 3)
-    assert onp.all(uniform_sets==expected_sets)
-
-def test_uniform_split_2():
-    """Middle sets have clean finishes."""
-    # Original sets: [0,1,2,3], [4,5,6,7,8,9], ...
-    #                [10,11,12,13,14], [15,16,17,18,19,20,21]
-    original_sets = onp.split(onp.arange(22), (4,10,15))
-    batch_size = 5
-
-    # Get args to split, then split original set
-    original_set_sizes = list(map(len, original_sets))
-    num_batches = sum(original_set_sizes) // batch_size
-    args = arg_uniform_split(batch_size, original_set_sizes)
-    uniform_sets = onp.empty((num_batches, batch_size))
-    for i_batch, b_args in enumerate(args):
-        # uniform_sets = \
-        #     uniform_sets.at[i_batch]\
-        #                 .set(onp.concatenate([original_sets[i_set][s_set[0]:s_set[1]] \
-        #                                         for (i_set, s_set) in b_args]))
-        uniform_sets[i_batch] = onp.concatenate(
-            [original_sets[i_set][s_set[0]:s_set[1]] for (i_set, s_set) in b_args]
-        )
-
-    expected_sets = onp.arange(20).reshape(4,5)
-
-    assert onp.all(uniform_sets==expected_sets)

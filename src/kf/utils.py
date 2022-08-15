@@ -1,14 +1,25 @@
 # Helper classes for managing killifish data
 
 import os
+import glob
 import h5py
 
 import numpy as onp
 import bisect
 from functools import partial
 
+from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, BatchSampler
 from torch import Generator
+
+from ssm_jax.hmm.models import GaussianHMM
+
+__all__ = [
+    'FishPCDataset',
+    'FishPCLoader',
+    'CheckpointDataclass',
+    'train_and_checkpoint',
+]
 
 class FishPCDataset(Dataset):
     """
@@ -176,7 +187,6 @@ class FishPCDataset(Dataset):
         except ValueError:
             return tuple(zip(*sequences))
         
-
 class FishPCLoader(DataLoader):
     """Provides an iterable over FishPCDataset. Randomly selects subsets of
     consecutive frames of length (seq_length,) from the Dataset, returns a batch
@@ -229,119 +239,116 @@ class FishPCLoader(DataLoader):
             collate_fn=collate_fn,
             generator=torch_rng,
         )
-    
 
+        self.total_emissions = len(self) * batch_size * seq_length
+    
 # ==============================================================================
 
-def arg_uniform_split(target_set_size, set_sizes, set_ids=None):
-    """Returns a function that splits the original set of different sizes into
-    sets of uniforms sizes, in order. drop_last behavior automatically enforced.
-
-    Suppose we'd like to create even batches of 3 elements from the following
-    unevenly-sized sets:
-        {a,b,c,d}, {e}, {f,g,h}, {i,j}, {k,l,m,n}
-    Each letter is a distinct elemnt within the set. When for-looping through
-    this function returns
-        [(i=0,s_[0:3]],
-        [(i=0,s_[3:4], (i=1,s_[0:1], (i=2,s_[0:1]],
-        [(i=2,s_[1:3], (i=3,s_[0:1]],
-        [(i=3,s_[1:2], (i=4,s_[0:2]]
-    which would result in the sets:
-        {a,b,c}, {d,e,f}, {g,h,i}, {j,k,l}
-
-    Example usage:
-        num_batches, split_fn = arg_uniform_split(batches_per_file, batch_size)
-        i_file = i_in_file = 0      # File index, batch within file index to current file
-        for i in range(num_batches):
-            b_args, i_file, i_in_file = split_fn([], i_file, i_in_file)
-
-    parameters:
-        target_set_size: int
-        set_sizes: sequence of ints indicate original set sizes
-        set_ids: sequence of ints. Used when shuffling original set sizes
+@dataclass
+class CheckpointDataclass:
+    """Container for holding training checkpoint information.
     
-    returns:
-        list, length (target_num_sets,) of lists with elements (set_id, (frame_start, frame_end))
+    Args
+        directory (str): Path to directory to store checkpoint files in.
+        prefix (str): Prefix of checkpoint file names.
+        interval (int): Number of epochs to train between checkpoints.
+            Default: -1 (no intermediate checkpointing).
+        keep (int): Number of past checkpoints to keep. Default: -1 (keep all).
+            TODO: Implement in save_checkpoint (pop first and add to last);
+            Implement in post_init, to find all existing checkpoints
     """
-    def _format(i_set, i_within_start, i_within_end):
-        """Defines how resulting args are presented formatted."""
-        # return (i_set, np.s_[int(i_within_start):int(i_within_end)])
-        return (int(i_set), (int(i_within_start), int(i_within_end)))
+    directory: str
+    prefix: str='checkpoint_'
+    interval: int=-1
+    keep: int=-1
 
-    def _fn(n, i_set, i_within_set, out):
-        """Recursively returns the args of the sets and elements within sets
-        needed to make an even function set.
+    def _make_file_path(self, val):
+        return os.path.join(self.directory, f'{self.checkpoint}{val}.ckp')
 
-        Parameters:
-            n: int. Number of elements needed to complete an event set.
-            i_set: int. Index of current set
-            i_within_set: int. Index of current element within set
-            out: Current list of arguments
+    def _get_existing_files(self,):
+        return glob.glob(self._make_file_path('*'))
 
-        Returns: 
-            i_set: Updated index of current set
-            i_within_set: Updated index of unallocated element within set
-            out: Updated list of arguments
+    def save(self, hmm, this_epoch, **arrs):
         """
-        n_set = set_sizes[i_set]                   # Size of this set
+            hmm (GaussianHMM): Model to save
+            this_epoch (int): Epoch this HMM just finished training.
+            **arrs: dict of additional arrays to save
+        """
+        ckp_path = os.path.join(self.directory, f'{self.prefix}{this_epoch+1-self.interval}.ckp')
+
+        # Make directory (recursively) if it does not exist
+        if not os.path.exists(self.directory):
+            os.makedirs(self.directory)
+
+        # TODO Is there a better way to save using i.e. hmm.unconstrained_params?
+        onp.savez_compressed(
+            ckp_path,
+            initial_probabilities = hmm.initial_probs.value,
+            transition_matrix = hmm.transition_matrix.value,
+            emission_means = hmm.emission_means.value,
+            emission_covariance_matrices = hmm.emission_covariance_matrices.value,
+            epochs_completed = this_epoch,
+            **arrs)
         
-        # This set can complete the remainder of the uniform set: Take as many
-        # elements as needed and return to main loop
-        if n <= (n_set - i_within_set):
-            out.append(_format(set_ids[i_set], i_within_set, i_within_set+n))
-            
-            # Increase within-set index. If we reached end of set, reset 
-            # within-set index to 0 (%) and increase set index
-            i_within_set = (i_within_set + n) % n_set
-            i_set = i_set + 1 if i_within_set == 0 else i_set
-            return i_set, i_within_set, out
-
-        # This set cannot complete the remainder of the uniform set: Take all
-        # remaining elements from this set and update number of elements still
-        # needed. Then, call function to perform on next set
-        else:
-            out.append(_format(set_ids[i_set], i_within_set, n_set))
-            n -= (n_set - i_within_set)
-            return _fn(n, i_set+1, 0, out)
-
-    target_num_sets = sum(set_sizes) // target_set_size                # The number of evenly-sized sets that will result
-    set_ids = onp.arange(len(set_sizes)) if set_ids is None else set_ids    
-    i_set = i_within_set = 0
-    all_args = []
-    for _ in range(target_num_sets):
-        i_set, i_within_set, set_args = _fn(target_set_size, i_set, i_within_set, [],)
-        all_args.append(set_args)
-    return all_args
-
-# ==============================================================================
-
-def save_hmm(fpath: str, hmm, **kwargs):
-    """Save GaussianHMM in .npz format.
+        return ckp_path + '.npz'
     
-    Parameters:
-        fpath: str
-            Path to file (including name of file)
-        hmm: GaussianHMM
-        kwargs: Other arrays to save in the same file.
+    def load(self, path):
+        """Load checkpoint from specified path."""
+        # TODO Allow no ckp_file specific, automatically load the last one
+
+        hmm_keys = ['initial_probabilities',
+                    'transition_matrix',
+                    'emission_means',
+                    'emission_covariance_matrices']
+        
+        with onp.load(path) as f:
+            epochs_completed = f['epochs_completed']
+            hmm = GaussianHMM(**{k: f[k] for k in hmm_keys})
+            all_lps = f['all_lps'] if 'all_lps' in f else []
+            
+        return hmm, epochs_completed, all_lps
+
+def train_and_checkpoint(emissions_loader,
+                         hmm: GaussianHMM,
+                         num_epochs: int,
+                         checkpoint: CheckpointDataclass,
+                         starting_epoch: int=0,
+                         prev_lps=[],
+                         ):
+    """Fit HMM via stochastic EM, with intermediate checkpointing.
+
+    After all training, HMM will automatically be checkpointed a final time.
+
+    Args
+        emissions_loader (torch.utils.data.DataLoader): Iterable over emissions
+        hmm (GaussianHMM): GaussianHMM to train. May be partially trained.
+        num_epochs (int): (Total) number of epochs to train.
+        checkpoint (CheckpointDataclass): Container with checkpoint parameters.
+        starting_epoch (int): Starting epoch of this training (i.e. hmm has already
+            been partially trained; warm-start). Default: 0 (cold-start).
+        prev_lps (array-like, length starting_epoch): Mean expected log
+            probabilities from previous epochs, if HMM is being warm-started.
+            Default: [] (cold-start, no previous training).
+    
+    Returns
+        all_lps (array-like, length num_epochs): Mean expected log probabilities
+        ckp_path (str): Path to last checkpoint file
     """
-    onp.savez_compressed(fpath, 
-        initial_probabilities = hmm.initial_probabilities,
-        transition_matrix = hmm.transition_matrix,
-        emission_means = hmm.emission_means,
-        emission_covariance_matrices = hmm.emission_covariance_matrices,
-        **kwargs)
-    return 
+    assert starting_epoch >= 0
+    assert checkpoint.interval < num_epochs  
 
-def load_hmm(fpath: str):
-    """Loads a GaussianHMM from .npz format."""
-    from ssm_jax.hmm.models import GaussianHMM
+    # If no interval specified, run (remaining) number of epochs
+    if checkpoint.interval < 1:
+        checkpoint.interval = num_epochs - starting_epoch
 
-    keys = ['initial_probabilities',
-            'transition_matrix',
-            'emission_means',
-            'emission_covariance_matrices']
+    all_lps = prev_lps
+    for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
 
-    with onp.load(fpath) as f:
-        hmm = GaussianHMM(**{k: f[k] for k in keys})
+        lps = hmm.fit_stochastic_em(emissions_loader,
+                                    emissions_loader.total_emissions,
+                                    num_epochs=checkpoint.interval)
+        all_lps = onp.concatenate([all_lps, lps])
+        this_epoch = last_epoch + checkpoint.interval
+        ckp_path = checkpoint.save(hmm, this_epoch, all_lps=all_lps)
 
-    return hmm
+    return all_lps, ckp_path

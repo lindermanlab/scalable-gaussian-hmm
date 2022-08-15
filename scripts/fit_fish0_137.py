@@ -130,7 +130,8 @@ def main():
                             collate_fn=collate_fn,
                             shuffle=True,
                             seed=int(seed_train[-1]))
-    total_num_train = len(train_dl) * batch_size * frames_per_batch
+    # total_num_train = len(train_dl) * batch_size * frames_per_batch
+    total_num_train = train_dl.total_emissions
 
     test_dl = FishPCLoader(test_ds,
                            seq_length=frames_per_batch,
