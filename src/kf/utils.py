@@ -5,6 +5,7 @@ import glob
 import h5py
 
 import numpy as onp
+import jax.random as jr
 import bisect
 from functools import partial
 
@@ -87,18 +88,25 @@ class FishPCDataset(Dataset):
         """Return total number of frames, across all fish and files."""
         return self._cumulative_frames[-1]
     
-    def argseqsubsets(self, seq_length: int, step_size: int=1,
-                      drop_incomplete_seqs: bool=True):
-        """Return the list of index tuples to subset data sequentially for given
-        sequence length and step size.
+    def slice_seq(self, seq_length, step_size=1, drop_incomplete_seqs=True):
+        """Return the list of index tuples to slice into data sequentially for
+        given sequence length and step size.
+        Each index tuple produces values in the interval [start, stop) where
+            seq_length = (stop - start) * step_size.
         
-        If drop_incomplete_seqs is True, resulting sequences will all have
-        the same length (seq_length, ). Else, some sequences may be shorter.
+        Args:
+            seq_length (int): Number of consecutive frames in a sequence
+            step_size (int): Spacing between consecutive frames
+            drop_incomplete_seqs (bool): If True, slices would result in sequences
+                with the same length (seq_length, ). If False, some sequences
+                may be shorter. Default: True
+        Returns:
+            slices (list): List of tuples consist of (start, stop, step) values
         """
 
         abs_seq_length = seq_length * step_size
         
-        subset_keys = []
+        slices = []
         for i_file in range(len(self.cumulative_frames)):
             f_start_idx = 0 if i_file == 0 else self.cumulative_frames[i_file-1] 
             f_end_idx = self.cumulative_frames[i_file] 
@@ -113,12 +121,50 @@ class FishPCDataset(Dataset):
                 seq_end_indices = \
                     onp.minimum(seq_start_indices + abs_seq_length, f_end_idx)
 
-            subset_keys.extend([
+            slices.extend([
                 (int(start_idx), int(end_idx), int(step_size))
                 for start_idx, end_idx in zip(seq_start_indices, seq_end_indices)
             ])
 
-        return subset_keys
+        return slices
+
+    def split_seq(self, split_sizes, seed=None,
+                  seq_length=72000, step_size=1, drop_incomplete_seqs=True):
+        """Return list of index tuples that split dataset into specified sizes.
+
+        Parameters:
+            split_sizes (list or tuple, length S): Float or int of number of
+                sequences per split. If float, interpreted as percentage of all
+                slices. Else, if int, interpreted as number of slices.
+            seed (jr.PRNGKey or None): If specified, sequence slices are shuffled.
+                Else, if None, sequence slices are kept sequentially.
+            seq_length, step_size, drop_incomplete_seqs: See `get_slices` fxn.
+        
+        Returns:
+            split_slices (list, length S): List of list of tuples.
+        """
+
+        all_slices = self.slice_seq(seq_length, step_size, drop_incomplete_seqs)
+        n_slices = len(all_slices)        
+        
+        idx = onp.asarray(jr.permutation(seed, n_slices)) \
+              if seed is not None else onp.arange(n_slices)
+        
+        # Standardize split sizes into number of sequence slices.
+        split_sizes = [
+            int(size*n_slices) if size < 1 else int(size)
+            for size in split_sizes
+        ]
+        
+        # Start and stop indices of each split
+        split_indices = onp.concatenate([onp.zeros(1), onp.cumsum(split_sizes)])
+        split_indices[-1] = onp.minimum(split_indices[-1], n_slices)
+        split_indices = split_indices.astype(int)
+
+        return [
+            all_slices[start:stop]
+            for start, stop in zip(split_indices[:-1], split_indices[1:])
+        ]
 
     def __getitem__(self, ds_indices):
         """Return specificed data array and identifying labels.
@@ -194,11 +240,10 @@ class FishPCLoader(DataLoader):
 
     Args:
         dataset (FishPCDataset): Dataset from which to load data.
-        batch_size (int): Number of samples per batch to load.
-        seq_length (int): Number of consecutive frames to load per sequence.
+        seq_slices (list): Specifies the subset (or whole set) of the dataset to
+            load. List of (start, stop, step) slice tuples. Generate via
+            FishPCDataset.get_slices(...) or FishPCDataset.split(...)
         batch_size (int): Number of "independent" sequences to load per minibatch.
-        drop_incomplete_seqs (bool): If True, drops sequences which are shorter
-            than seq_length. Similar to `drop_last` argument, but when level in.
         drop_last (bool): If True, drops (last) batch if it is not full
         shuffle (bool): If True, shuffles the batches of sequences at every epoch,
             i.e. after every Stopiteration. Else, batches are loaded in the same
@@ -209,24 +254,23 @@ class FishPCLoader(DataLoader):
             relevant if shuffle is True.
     """
 
-    def __init__(self, dataset, seq_length=72000, batch_size=1, collate_fn=None,
-                 drop_incomplete_seqs=True, drop_last=True,
-                 shuffle=False, seed=None):
+    def __init__(self, dataset, seq_slices, batch_size=1, collate_fn=None,
+                 drop_last=True, shuffle=False, seed=None):
+
+        self.total_emissions = sum(
+            [(stop-start)//step for start, stop, step in seq_slices]
+        )
 
         # Define strategy to sample batches of data
-        # |- Get Dataset keys that index into files to get sequences of seq_length
-        step_size = 1
-        subset_indices = dataset.argseqsubsets(seq_length, step_size, drop_incomplete_seqs)
-
         # |- if shuffle, specify RNG and use a Sampler
         if shuffle:
             torch_rng = Generator()
             if seed: torch_rng.manual_seed(seed)
-            seq_sampler = SubsetRandomSampler(subset_indices, torch_rng)
+            seq_sampler = SubsetRandomSampler(seq_slices, torch_rng)
         # |- else, just pass in alphanumerically ordered keys
         else:
             torch_rng = None
-            seq_sampler = subset_indices
+            seq_sampler = seq_slices
         
         batch_sampler = BatchSampler(seq_sampler, batch_size, drop_last)
 
@@ -239,8 +283,6 @@ class FishPCLoader(DataLoader):
             collate_fn=collate_fn,
             generator=torch_rng,
         )
-
-        self.total_emissions = len(self) * batch_size * seq_length
     
 # ==============================================================================
 

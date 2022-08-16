@@ -55,19 +55,39 @@ def test_dataset():
     # TODO Check labels
     pass
 
-def test_dataloader_sequential_nonuniform():
+def test_split_dataset():
+    """Split dataset into three sets."""
+    ds = make_dataset(2)
+
+    seq_length = 72000   # 1 hr worth of data
+
+    split_sizes = (0.5, 0.2, 0.6) # Adds to more than 1, so last split should be smaller
+    seq_slices = ds.split_seq(split_sizes, seed=jr.PRNGKey(0),
+                              seq_length=seq_length, drop_incomplete_seqs=True)
+
+    # CHECK Split should return nested lists, outside list same length is num sets
+    assert len(seq_slices) == len(split_sizes)
+    
+    # CHECK split_sizes adds to more than 1, so last set should be smaller than specified
+    all_slices = ds.slice_seq(seq_length, drop_incomplete_seqs=True)
+    assert len(seq_slices[0]) == int(split_sizes[0] * len(all_slices))
+    assert len(seq_slices[1]) == int(split_sizes[1] * len(all_slices))
+    assert len(seq_slices[2]) < int(split_sizes[2] * len(all_slices))
+
+def test_sequential_nonuniform_dataloader():
     """Test DataLoader with no shuffle and incomplete sequence and batch_sizes.
         - Verify dataloader loads correct number of batches per epcoh
         - Verify correct handling of non-uniform batch/sequence lengths
         - verify that dataloder loads batches in exact same sequence each time
     """
     ds = make_dataset(2)
+    seq_length = 72000   # 1 hr worth of data
+    seq_slices = ds.slice_seq(seq_length, drop_incomplete_seqs=False)
     
     # Create dataloader
-    seq_length = 72000   # 1 hr worth of data
     batch_size = 4
-    dl = FishPCLoader(ds, seq_length, batch_size,
-                      drop_incomplete_seqs=False, drop_last=False, shuffle=False)
+    dl = FishPCLoader(ds, seq_slices, batch_size,
+                      drop_last=False, shuffle=False)
 
     # CHECK Correct num batches per epoch, given non-unfirom seq and batch sizes
     assert len(dl) == int(onp.ceil(len(ds) / seq_length / batch_size))
@@ -93,17 +113,17 @@ def test_dataloader_sequential_nonuniform():
             assert onp.all(batch_data==batch_0)
             break
 
-def test_dataloader_shuffled():
+def test_shuffle_dataloader():
     ds = make_dataset(2)
     seq_length = 72000   # 1 hr worth of data
+    seq_slices = ds.slice_seq(seq_length, drop_incomplete_seqs=False)
+
     batch_size = 4
-    dl = FishPCLoader(ds, seq_length, batch_size,
-                      drop_incomplete_seqs=True, drop_last=True,
-                      shuffle=True, seed=459260)
+    dl = FishPCLoader(ds, seq_slices, batch_size,
+                      drop_last=True, shuffle=True, seed=459260)
     
     # CHECK Correct num batches per epoch, given uniform seq and batch sizes
-    num_seqs_per_file = ds._num_frames_per_file // seq_length
-    assert len(dl) == sum(num_seqs_per_file) // batch_size
+    assert len(dl) == len(seq_slices) // batch_size
 
     for i, (batch_data, batch_labels) in enumerate(dl):
         if i==0: # Uniform batch size and sequence lengths, onp.ndarray
