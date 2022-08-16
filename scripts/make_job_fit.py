@@ -13,7 +13,7 @@ DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['TEMPDIR']
 SCRIPTDIR = os.path.dirname(os.path.realpath(__file__))
 
-py_script_name = 'fit_fish0_137'
+py_script_name = 'pmap_fit-fish0_137'
 
 SBATCH_ARGS = {
     'partition': dict(

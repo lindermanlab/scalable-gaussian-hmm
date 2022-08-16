@@ -96,7 +96,7 @@ def test_warmstart(num_files=2):
     partial_epochs = 6
 
     tempdir = tempfile.TemporaryDirectory()
-    checkpoint = CheckpointDataclass(directory=tempdir.name, prefix='tmp_', interval=checkpoint_interval)
+    checkpoint = CheckpointDataclass(directory=tempdir.name, prefix='tmp', interval=checkpoint_interval)
 
     _, last_ckp_path = train_and_checkpoint(dl, test_hmm, partial_epochs, checkpoint)
     
@@ -125,3 +125,37 @@ def test_warmstart(num_files=2):
     assert jnp.allclose(test_hmm.emission_covariance_matrices.value,
                         refr_hmm.emission_covariance_matrices.value,
                         atol=1)
+
+def test_autoload_empty():
+    """Load latest checkpoint file from empty directory."""
+    tempdir = tempfile.TemporaryDirectory()
+    checkpoint = CheckpointDataclass(directory=tempdir.name)
+
+    hmm, prev_epoch, prev_lps = checkpoint.load_latest()
+    assert hmm is None
+    assert prev_epoch == -1
+    assert len(prev_lps) == 0
+    
+
+def test_autoload():
+    """Load latest checkpoint file from directory."""
+
+    tempdir = tempfile.TemporaryDirectory()
+    checkpoint = CheckpointDataclass(directory=tempdir.name)
+
+    # Save some dummy files to directory
+    hmm = GaussianHMM.random_initialization(jr.PRNGKey(0), 5, 2)
+    checkpoint.save(hmm, 1, all_lps=[0])
+    checkpoint.save(hmm, 2, all_lps=[0,1])
+    checkpoint.save(hmm, 10, all_lps=[0,1,2,3])
+
+    # CHECK: Private function correctly finds 3 files created
+    assert len(checkpoint._get_existing_files()) == 3
+
+    # CHECK: Load last checkpoint
+    hmm, prev_epoch, prev_lps, ckp_path = checkpoint.load_latest(return_path=True)
+    print(ckp_path)
+    assert hmm is not None
+    assert prev_epoch == 10
+    assert len(prev_lps) == 4
+    

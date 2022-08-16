@@ -141,7 +141,7 @@ class FishPCDataset(Dataset):
             seq_length, step_size, drop_incomplete_seqs: See `get_slices` fxn.
         
         Returns:
-            split_slices (list, length S): List of list of tuples.
+            split_slices (array-like, length S): List of array-like of tuples.
         """
 
         all_slices = self.slice_seq(seq_length, step_size, drop_incomplete_seqs)
@@ -162,7 +162,7 @@ class FishPCDataset(Dataset):
         split_indices = split_indices.astype(int)
 
         return [
-            all_slices[start:stop]
+            tuple(onp.asarray(all_slices)[idx[start:stop]])
             for start, stop in zip(split_indices[:-1], split_indices[1:])
         ]
 
@@ -300,12 +300,15 @@ class CheckpointDataclass:
             Implement in post_init, to find all existing checkpoints
     """
     directory: str
-    prefix: str='checkpoint_'
+    prefix: str='ckp'
     interval: int=-1
     keep: int=-1
 
     def _make_file_path(self, val):
-        return os.path.join(self.directory, f'{self.checkpoint}{val}.ckp')
+        if isinstance(val, int):
+            return os.path.join(self.directory, f'{self.prefix}_{val:03d}.ckp.npz')
+        else:
+            return os.path.join(self.directory, f'{self.prefix}_{val}.ckp.npz')
 
     def _get_existing_files(self,):
         return glob.glob(self._make_file_path('*'))
@@ -316,7 +319,7 @@ class CheckpointDataclass:
             this_epoch (int): Epoch this HMM just finished training.
             **arrs: dict of additional arrays to save
         """
-        ckp_path = os.path.join(self.directory, f'{self.prefix}{this_epoch+1-self.interval}.ckp')
+        ckp_path = self._make_file_path(this_epoch+1-self.interval)
 
         # Make directory (recursively) if it does not exist
         if not os.path.exists(self.directory):
@@ -332,11 +335,10 @@ class CheckpointDataclass:
             epochs_completed = this_epoch,
             **arrs)
         
-        return ckp_path + '.npz'
+        return ckp_path
     
     def load(self, path):
         """Load checkpoint from specified path."""
-        # TODO Allow no ckp_file specific, automatically load the last one
 
         hmm_keys = ['initial_probabilities',
                     'transition_matrix',
@@ -349,6 +351,27 @@ class CheckpointDataclass:
             all_lps = f['all_lps'] if 'all_lps' in f else []
             
         return hmm, epochs_completed, all_lps
+    
+    def load_latest(self, return_path=False):
+        """Load latest checkpoint (alphanumerically) in this instance's directory.
+        
+        Returns:
+            hmm (GaussianHMM)
+            prev_epoch (int):
+            prev_lps (array-like):
+            ckp_path (str, optional): Path of file, returned if return_path=True
+        """
+
+        existing_ckps = sorted(self._get_existing_files())
+        
+        if existing_ckps:
+            last_ckp_path = existing_ckps[-1]
+            out = self.load(existing_ckps[-1])
+        else:   # No checkpoints in this directory
+            last_ckp_path = None
+            out = (None, -1, [])
+        
+        return (*out, last_ckp_path) if return_path else out
 
 def train_and_checkpoint(emissions_loader,
                          hmm: GaussianHMM,
