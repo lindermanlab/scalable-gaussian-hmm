@@ -44,10 +44,12 @@ def main():
     timestamp = datetime.now().strftime("%y%m%d%H%M")
     session_name = args.session_name if args.session_name is not None else timestamp
 
+    # On 6G memory, process killed for 864K frames * 64 batch_size
     batch_sizes = [4, 16, 64]
     seq_lengths = [864000, 432000, 72000, 36000, 18000] # 12hrs, 6hrs, 1hr, 0.5, 0.25 hr worth of data
     
-    pbar = tqdm(product(batch_sizes, seq_lengths),
+    # pbar = tqdm(product(batch_sizes, seq_lengths),
+    pbar = tqdm([(64,18000), (64,36000), (64,72000), (64,432000), (64,18000), (32,864000)],
                 file=sys.stdout,
                 postfix={'batch_size': 'n/a', 'seq_length': 'n/a', 'n_batches': 'n/a'})
 
