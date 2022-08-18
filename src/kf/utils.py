@@ -5,6 +5,7 @@ import glob
 import h5py
 
 import numpy as onp
+import jax.numpy as jnp
 import jax.random as jr
 import bisect
 from functools import partial
@@ -262,6 +263,49 @@ class FishPCDataset(Dataset):
             return self._collate_seq_label_pairs(batch_of_items)
         else:
             return self._collate_sequences(batch_of_items)
+
+    def get_frames(self, indices):
+        """Returns specified data array and identifying labels.
+
+        Optimized for getting individual frames, whereas __getitem__ as
+        optimized for getting sequences (consecutive frames).
+
+        Args:
+            indices (array-like of ints, length N)
+        
+        Returns:
+            data (onp.ndarray), shape (N, obs_dim) where seq_len is
+                (ds_end_idx - ds_start_idx) // step_size. Array is 2d
+            label (tuple), consisting of elements
+                timestamps (onp.ndarray, shape (seq_len,))
+        """
+
+        indices = onp.sort(onp.asarray(indices))
+
+        arg_filesplits= [onp.argmax(indices>cf) for cf in self.cumulative_frames[:-1]]
+        indices_split_by_file = onp.split(indices, arg_filesplits)
+
+        data = onp.empty((len(indices), self.dim), dtype='float32')
+        i_count = 0
+        for _indices in indices_split_by_file:
+            if len(_indices) == 0:
+                continue
+
+            i_file = bisect.bisect_right(self.cumulative_frames, _indices[0])
+            idx_offset = 0 if i_file == 0 else self.cumulative_frames[i_file-1] 
+
+            with h5py.File(self._filepaths[i_file], 'r') as f:
+                data[i_count:i_count+len(_indices)] = \
+                    f['stage/block0_values'][_indices-idx_offset]
+                
+                if self.return_labels:
+                    print("WARNING: get_frames does not return labels yet")
+                    # # TODO Return (fish_id, age, time-of-day) instead of timestamp
+                    # timestamp = onp.asarray(
+                    #     f['stage/block1_values'][_indices-idx_offset], dtype=onp.dtype('float64')
+                    # )
+            i_count += len(_indices)
+        return data
         
 class FishPCLoader(DataLoader):
     """Provides an iterable over FishPCDataset. Randomly selects subsets of

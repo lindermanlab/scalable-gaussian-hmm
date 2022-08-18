@@ -74,6 +74,24 @@ def test_split_dataset():
     assert len(seq_slices[1]) == int(split_sizes[1] * len(all_slices))
     assert len(seq_slices[2]) < int(split_sizes[2] * len(all_slices))
 
+def test_dataset_get_frames():
+    """Efficiently get individual frames (non-sequential). Used in kmeans init."""
+    num_emissions = 100
+    ds = make_dataset(3)
+
+    # Get frames from across all files
+    idxs = jr.permutation(jr.PRNGKey(0), len(ds))[:num_emissions]
+    out = ds.get_frames(idxs)
+    assert out.shape == (num_emissions, ds.dim)
+
+    # Get frames from 1st and 3rd file
+    idxs = onp.concatenate([
+        jr.permutation(jr.PRNGKey(1), ds.cumulative_frames[0])[:num_emissions//2],
+        jr.permutation(jr.PRNGKey(2), onp.arange(ds.cumulative_frames[1], ds.cumulative_frames[2]))[:num_emissions//2]
+    ])
+    out = ds.get_frames(idxs)
+    assert out.shape == (num_emissions, ds.dim)
+
 def test_sequential_nonuniform_dataloader():
     """Test DataLoader with no shuffle and incomplete sequence and batch_sizes.
         - Verify dataloader loads correct number of batches per epcoh
