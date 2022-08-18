@@ -23,6 +23,7 @@ import jax.random as jr
 
 from ssm_jax.hmm.models import GaussianHMM
 from kf import (FishPCDataset, FishPCLoader,
+                kmeans_initialization,
                 CheckpointDataclass, train_and_checkpoint,)
 
 DATADIR = os.environ['DATADIR']
@@ -98,20 +99,16 @@ def setup_data(seed, batch_size, seq_length, split_sizes):
     fish_dir = os.path.join(DATADIR, fish_id)
     filepaths = sorted([os.path.join(fish_dir, f) for f in os.listdir(fish_dir)])
 
-    # DEBUG Hard limiting number of filepaths
+    # FIXME Hard limiting number of filepaths. Remove when done debugging
     filepaths = filepaths[:10]
-    dataset = FishPCDataset(filepaths)
+    dataset = FishPCDataset(filepaths, return_labels=False)
 
     train_slices, test_slices = \
         dataset.split_seq(split_sizes, seed_split, seq_length,
                           step_size=1, drop_incomplete_seqs=True)
-
-    # We don't care about labels (i.e. timestamp), so dataloaders should just
-    # produce batches of emissions
-    _collate_fn = lambda seq_label_pairs: tuple(map(jnp.stack, zip(*seq_label_pairs)))[0]
-    train_dl = FishPCLoader(dataset, train_slices, batch_size, _collate_fn,
+    train_dl = FishPCLoader(dataset, train_slices, batch_size,
                             drop_last=True, shuffle=True, seed=int(seed_dl_train[-1]))
-    test_dl  = FishPCLoader(dataset, test_slices, batch_size, _collate_fn,
+    test_dl  = FishPCLoader(dataset, test_slices, batch_size,
                             drop_last=True, shuffle=False)
     
     print("Initialized training dataset with "
@@ -152,11 +149,8 @@ def main():
         setup_data(seed_data, args.batch_size, args.seq_length, (args.train, args.test))
     
     if hmm is None:
-        # TODO Intializes with kmeans++ on random subset of data
-        # Use torch data SubsetRandomSampler or jr.permute, and it doesn't need
-        # to be on sequences, just random samples...Need to specify how much data
         print(f'Initializing HMM with {args.states} states...\n')
-        hmm = GaussianHMM.random_initialization(seed_hmm, args.states, dataset.dim)
+        hmm = kmeans_initialization(seed_hmm, args.states, dataset, subset_size=144000)
     else:
         print(f"Warm-starting from {warm_ckp_path}, training from epoch {starting_epoch}...\n")
 

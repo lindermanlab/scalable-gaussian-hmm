@@ -13,12 +13,14 @@ from functools import partial
 from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, BatchSampler
 from torch import Generator
+from sklearn.cluster import KMeans
 
 from ssm_jax.hmm.models import GaussianHMM
 
 __all__ = [
     'FishPCDataset',
     'FishPCLoader',
+    'kmeans_initialization',
     'CheckpointDataclass',
     'train_and_checkpoint',
 ]
@@ -357,7 +359,55 @@ class FishPCLoader(DataLoader):
             collate_fn=collate_fn,
             generator=torch_rng,
         )
+
+# ==============================================================================
+
+def kmeans_initialization(seed, num_states, dataset, subset_size=0.001, emission_covs_scale=1.):
+    """Initalize a GaussianHMM using k-means algorithm.
     
+    Args:
+        seed (jr.PRNGKey):
+        num_states (int): Number of clusters to fit
+        dataset (torch.utils.data.Dataset):
+        subset_size (float): Size of dataset to use in kmeans fit. If >1, value
+            is interpreted as number of samples. If (0, 1], value is interpreted
+            as fraction of dataset. Note the difference in how a value of 1 is
+            interpreted here, vs. e.g. FisPCDataset.split_seq. Default: 0.001.
+        emission_covs_scale (float or None): Scale of emission covariances
+            initialized to block identity matrices. If None, bootstrap emission
+            covariances from kmeans labels.
+
+    Returns:
+        GaussianHMM
+    """
+
+    seed_data, seed_kmeans, seed_initial, seed_transition = jr.split(seed, 4)
+
+    # Get subset of data from dataset
+    num_emissions = int(len(dataset)*subset_size) if subset_size < 1 else int(subset_size)
+    idxs = jr.permutation(seed_data, len(dataset))[:num_emissions]
+
+    # emissions = onp.stack([dataset[idx] for idx in idxs], axis=0)
+    emissions = dataset.get_frames(idxs)
+
+    # Set emission means and covariances based on fitted k-means clusters
+    kmeans = KMeans(num_states, random_state=int(seed_kmeans[-1])).fit(emissions)
+    emission_means = jnp.asarray(kmeans.cluster_centers_)
+
+    if emission_covs_scale is None:
+        labels = kmeans.labels_
+        emission_covs = onp.stack([
+            jnp.cov(emissions[labels==state], rowvar=False) for state in range(num_states)
+        ])
+    else: 
+        emission_covs = jnp.tile(jnp.eye(dataset.dim) * emission_covs_scale, (num_states, 1, 1))
+
+    # Randomly set initial state and state transition probabilities
+    initial_probs = jr.dirichlet(seed_initial, jnp.ones(num_states))
+    transition_matrix = jr.dirichlet(seed_transition, jnp.ones(num_states), (num_states,))
+
+    return GaussianHMM(initial_probs, transition_matrix, emission_means, emission_covs)
+
 # ==============================================================================
 
 @dataclass
