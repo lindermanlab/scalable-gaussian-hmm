@@ -8,7 +8,7 @@ tensorflow-probability>=0.17.0
 torch[cpu]
 
 # probml/ssm-jax Commit Aug. 8, 2022
-pip install git+https://github.com/probml/ssm-jax.git@10e4c73c254cf8f3ed66a4c79477a9ba05db61ff#egg=ssm-jax
+git+https://github.com/probml/ssm-jax.git@10e4c73c254cf8f3ed66a4c79477a9ba05db61ff#egg=ssm-jax
 
 h5py==3.7.0
 tqdm
