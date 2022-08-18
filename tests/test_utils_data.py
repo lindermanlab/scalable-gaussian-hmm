@@ -22,7 +22,7 @@ def make_dataset(num_files=2):
     # Create dataset from randomly shuffled filepaths
     # TODO include metadata information such as hatch date
     random.shuffle(filepaths)
-    return FishPCDataset(filepaths)
+    return FishPCDataset(filepaths, return_labels=True)
 
 def test_dataset():
     ds = make_dataset(50)

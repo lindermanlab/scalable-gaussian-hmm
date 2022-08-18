@@ -44,12 +44,14 @@ class FishPCDataset(Dataset):
     
     Args:
         filepaths ([str, iterable[str]]): path or list of paths to H5 files.
+        return_labels (bool): If True, return labels (fish_id, age, ) associated
+            each sample. Default: False, only return PC data.
         **metadata (dict):
     Returns:
 
     """
 
-    def __init__(self, filepaths, **metadata):
+    def __init__(self, filepaths, return_labels=False, **metadata):
         # Standardize filepaths to be tuple of strings; sort alphabetically.
         if isinstance(filepaths, str):
             filepaths =(filepaths,)
@@ -70,6 +72,8 @@ class FishPCDataset(Dataset):
         self._num_frames_per_file = file_data_shape[:,0]
         self._cumulative_frames = onp.cumsum(self._num_frames_per_file)
         self._dim = file_data_shape[-1,-1]
+
+        self.return_labels = return_labels
               
         # TODO Pass in metadata and process (if needed)
         self.metadata = metadata
@@ -213,25 +217,51 @@ class FishPCDataset(Dataset):
                 dtype=onp.dtype('float32')
             )
 
-            timestamp = onp.asarray(
-                f['stage/block1_values'][start_idx:end_idx:step_size],
-                dtype=onp.dtype('float64')
-            )
+            if self.return_labels:
+                # TODO Return (fish_id, age, time-of-day) instead of timestamp
+                timestamp = onp.asarray(
+                    f['stage/block1_values'][start_idx:end_idx:step_size],
+                    dtype=onp.dtype('float64')
+                )
+                retval = data.squeeze(), timestamp.squeeze()
+            else:
+                retval = data.squeeze()
 
-        # TODO Return (fish_id, age, time-of-day) instead of timestamp
-        return data.squeeze(), timestamp.squeeze()
+        return retval
 
-    @staticmethod
-    def collate(sequences):
-        """Stack a list of sequences (or samples) along new leading dimension.
-        This function will be dependent on what __getitem__ returns.
+    def _collate_seq_label_pairs(self, seq_label_pairs):
+        """Collate a list of (sequence, labels) tuples.
+
+        Returns: 
+            sequences (array or list)
+            labels (array or list)
         """
-        # If uniform sequence lengths, return tuple of stacked arrays
         try:
-            return tuple(map(onp.stack, zip(*sequences)))
-        # If non-uniform sequence lengths, return tuple of lists
+            return tuple(map(onp.stack, zip(*seq_label_pairs)))
         except ValueError:
-            return tuple(zip(*sequences))
+            return tuple(zip(*seq_label_pairs))
+    
+    def _collate_sequences(self, sequences):
+        """Collate a list of sequences.
+        
+        Returns: 
+            sequences (array or list)
+        """
+        try:
+            return onp.stack(sequences, axis=0)
+        except ValueError:
+            return sequences
+            
+    def collate(self, batch_of_items):
+        """Collate a batch of items.
+        
+        If sequence lengths are all the same, we can stack them and return
+        arrays for sequences (and labels). Else, lists are returned.
+        """
+        if self.return_labels:
+            return self._collate_seq_label_pairs(batch_of_items)
+        else:
+            return self._collate_sequences(batch_of_items)
         
 class FishPCLoader(DataLoader):
     """Provides an iterable over FishPCDataset. Randomly selects subsets of
