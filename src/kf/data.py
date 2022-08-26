@@ -265,7 +265,7 @@ class FishPCDataset(Dataset):
 
         indices = onp.sort(onp.asarray(indices))
 
-        arg_filesplits= [onp.argmax(indices>cf) for cf in self.cumulative_frames[:-1]]
+        arg_filesplits= [onp.argmax(indices>=cf) for cf in self.cumulative_frames[:-1]]
         indices_split_by_file = onp.split(indices, arg_filesplits)
 
         data = onp.empty((len(indices), self.dim), dtype='float32')
@@ -282,11 +282,8 @@ class FishPCDataset(Dataset):
                     f['stage/block0_values'][_indices-idx_offset]
                 
                 if self.return_labels:
-                    print("WARNING: get_frames does not return labels yet")
-                    # # TODO Return (fish_id, age, time-of-day) instead of timestamp
-                    # timestamp = onp.asarray(
-                    #     f['stage/block1_values'][_indices-idx_offset], dtype=onp.dtype('float64')
-                    # )
+                    print("WARNING: get_frames does not support returning labels yet")
+
             i_count += len(_indices)
         return data
         

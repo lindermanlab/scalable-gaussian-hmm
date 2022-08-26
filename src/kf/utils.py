@@ -17,6 +17,25 @@ __all__ = [
     'train_and_checkpoint',
 ]
 
+# def minibatch_kmeans(...):
+#     """Cluster dataset using mini-batch K-means algorithm.
+
+#     Uses a Dataloader object to shuffle data.
+    
+#     References
+#         [1] Sculley, D. (2010). "Web-scale k-means clustering." In Proceedings
+#             of the 19th Int'l Conference on World Wide Web, pp. 1177–1178. ACM.
+#         [2] Bejar, J. (2013). "K-means vs Mini Batch K-means: A comparison."
+#             https://upcommons.upc.edu/bitstream/handle/2117/23414/R13-8.pdf
+
+#     Args
+
+#     Returns
+
+#     """
+#     raise NotImplementedError
+#     return
+
 def kmeans_initialization(seed, num_states, dataset, subset_size=0.001, emission_covs_scale=1.):
     """Initalize a GaussianHMM using k-means algorithm.
     

@@ -101,6 +101,7 @@ def setup_data(seed, batch_size, seq_length, split_sizes):
 
     # FIXME Hard limiting number of filepaths. Remove when done debugging
     filepaths = filepaths[:10]
+    print(f"WARNING: FORCING DATASET TO ONLY LOAD {len(filepaths)} files of data")
     dataset = FishPCDataset(filepaths, return_labels=False)
 
     train_slices, test_slices = \
