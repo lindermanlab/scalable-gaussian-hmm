@@ -24,8 +24,6 @@ parser.add_argument(
     '--size', type=float, default=25000,
     help='Number of samples to fit. If >1, interpret as an integer. If [0, 1], interpreted as fraction of dataset.')
 
-
-# @profile
 def kmeans_sklearn_individual(seed, n_clusters, dataset, subset_size=0.001):
     """Randomly select N datapoints from dataset.
     
@@ -57,7 +55,6 @@ def kmeans_sklearn_individual(seed, n_clusters, dataset, subset_size=0.001):
 
     return kmeans
 
-# @profile
 def kmeans_sklearn_interval(seed, n_clusters, dataset, subset_size=0.001,
                             seq_length=250, step_size=6000):
     """Lloyd's batch k-means using sklearn implementation. Selects datasets at
@@ -100,7 +97,6 @@ def kmeans_sklearn_interval(seed, n_clusters, dataset, subset_size=0.001,
     emissions = emissions.reshape(-1, 15)
 
     print(f'\tLoaded {len(emissions)} samples')
-    # import pdb; pdb.set_trace()
 
     # Set emission means and covariances based on fitting k-means clusters
     kmeans = KMeans(n_clusters, random_state=int(seed_kmeans[-1])).fit(emissions)
@@ -128,12 +124,15 @@ if __name__ == '__main__':
     dataset = FishPCDataset(filepaths, return_labels=False)
 
     # Run
+    profile = LineProfiler()
     args = (seed, n_clusters, dataset, subset_size)
     if method == 'interval':
-        fn = LineProfiler()(kmeans_sklearn_interval)
+        fn = profile(kmeans_sklearn_interval)
         kwargs = {'seq_length': 250, 'step_size': 6000}
         fn(*args, **kwargs)
     else:
-        fn = LineProfiler()(kmeans_sklearn_interval)
+        fn = profile(kmeans_sklearn_individual)
         kwargs = {}
         fn(*args, **kwargs)
+
+    profile.print_stats()
