@@ -11,7 +11,7 @@ from sklearn.cluster import KMeans
 
 from kf import FishPCDataset
 
-NUM_FILES = 15                  # 15 files ~= 1 file / 2 weeks
+NUM_FILES = 36                  # 30 files ~= 1 file / 1 weeks
 FPATH = os.getenv('DATADIR')
 
 parser = argparse.ArgumentParser(description='Cluster validity')
@@ -29,17 +29,27 @@ parser.add_argument(
     '--size', type=float, default=25000,
     help='Number of samples to fit. If >1, interpret as an integer. If [0, 1], interpreted as fraction of dataset.')
 
-def make_reference_data(seed, all_filepaths, subset_size=0.001):
+def make_reference_data(seed, all_filepaths, step_size=1200, seq_length=180):
     """
 
-    Default values of subset_size=0.002, step_size=1200, seq_length=125 result in:
-        10.4 hrs of data per sequence @ 1 sample every 5 minutes, XXX samples
+    Default values of step_size=2400, seq_length=300 result in:
+        3 hrs of data per sequence @ 1 sample every 1 min
     """
 
-    raise NotImplementedError
+    # Randomly selected NUM_FILES uniformly from lifespan
+    idxs = jr.permutation(seed, len(all_filepaths))[:NUM_FILES]
+    filepaths = [all_filepaths[i] for i in idxs]
+    dataset = FishPCDataset(filepaths, return_labels=False, min_frames=seq_length*step_size)
 
+    # Define fine grid of seq slices and choose
+    seq_slices = dataset.slice_seq(seq_length, step_size, drop_incomplete_seqs=True)
 
-def get_random_slices(seed, dataset, num_seqs, seq_length, step_size=1):
+    emissions = onp.stack([dataset[slc] for slc in seq_slices], axis=0)
+    emissions = emissions.reshape(-1, 15)
+
+    return emissions
+
+def get_random_slices(seed, dataset, num_seqs, seq_length, step_size):
     """Return the list of random index tuples to slice into data sequentially for
     given sequence length and step size. Automatically drops incomplete sequences.
     
@@ -76,7 +86,7 @@ def get_random_slices(seed, dataset, num_seqs, seq_length, step_size=1):
 
     return list(zip(start_frames, start_frames + abs_seq_length, onp.ones(num_seqs)*step_size))
 
-def make_interval_data(seed, all_filepaths, subset_size=0.001, step_size=2400, seq_length=120):
+def make_interval_data(seed, all_filepaths, num_samples, step_size=2400, seq_length=120):
     """Get emissions from randomly interval-sliced dataset.
  
     Default values of subset_size=0.001, step_size=6000, seq_length=125 result in:
@@ -84,9 +94,7 @@ def make_interval_data(seed, all_filepaths, subset_size=0.001, step_size=2400, s
     Args
         seed (jr.PRNGKey): RNG seed
         all_filepaths (list): Files to load data from
-        subset_size (float): Size of dataset to use in kmeans fit. If >1, value
-            is interpreted as number of samples. If (0, 1], value is interpreted
-            as fraction of dataset. Note the difference in how a value of 1 is
+        num_samples (float): Target number of samples to fit kmeans over.
             interpreted here, vs. e.g. FishPCDataset.split_seq. Default: 0.001.
         step_size (int): Number of frames between consecutive frames in a sequence.
             If too small, the selcted data will all be similar. Default: 6000,
@@ -96,19 +104,15 @@ def make_interval_data(seed, all_filepaths, subset_size=0.001, step_size=2400, s
             to algorithm will be very similar. Default: With step_size, set so
             that ~< 1 full day 
     """
-    # Create dataset from all files, except omit those that don't have enough
-    # for a single sequence
+    
+    # Create dataset from all long-enough files
     abs_seq_length = seq_length * step_size
     dataset = FishPCDataset(all_filepaths, return_labels=False, min_frames=abs_seq_length)
-    # seq_slices = dataset.slice_seq(seq_length, step_size=step_size, drop_incomplete_seqs=True)
 
-    num_samples = int(len(dataset) * subset_size) \
-                  if subset_size < 1 else int(subset_size)
+    # Randomly get slices of specified step size and length
     num_seqs = num_samples // seq_length
-
     seq_slices = get_random_slices(seed, dataset, num_seqs, seq_length, step_size)
     
-    print(f'Attempting to load {num_samples} samples')
     emissions = onp.stack([dataset[slc] for slc in seq_slices], axis=0)
     emissions = emissions.reshape(-1, 15)
 
@@ -124,26 +128,32 @@ if __name__ == '__main__':
         seed_data, seed_kmeans = jr.split(jr.PRNGKey(args.seed))
         n_clusters = args.clusters
         # subset_size = args.size
-        subset_size = 0.0001
+        
+        num_samples = 35280 # subset_size = 0.0001 of most filepaths
+        print(f'Attempting to load {num_samples} samples...')
 
         DATADIR = os.environ['DATADIR']
         fish_id = 'fish0_137'
         fish_dir = os.path.join(DATADIR, fish_id)
         filepaths = sorted([os.path.join(fish_dir, f) for f in os.listdir(fish_dir)])
 
+        # -------------------
         tic = time.time()
         if args.run == 'ref':
             fpath = os.path.join(DATADIR, 'validate_cluster-ref.npz')
-            emissions = make_reference_data(seed_data, filepaths, subset_size)
+            emissions = make_reference_data(seed_data, filepaths)
 
         elif args.run == 'test':
+            # RESULTS: 352800 samples, 1.62 min
             fpath = os.path.join(DATADIR, 'validate_cluster-interval.npz')
-            emissions = make_interval_data(seed_data, filepaths, subset_size)
+            emissions = make_interval_data(seed_data, filepaths, num_samples)
 
         # Run K-means and save results
         print(f'\tLoaded {len(emissions)} samples. Running k-means...')
         kmeans = KMeans(n_clusters, random_state=int(seed_kmeans[-1])).fit(emissions)
         toc = time.time()
+        # -------------------
+
         onp.savez(fpath,
                 cluster_means=kmeans.cluster_centers_,
                 cluster_label=kmeans.labels_,
