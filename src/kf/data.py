@@ -4,6 +4,7 @@ import os
 import h5py
 
 import bisect
+import itertools
 import numpy as onp
 import jax.random as jr
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, BatchSampler
@@ -38,12 +39,14 @@ class FishPCDataset(Dataset):
         filepaths ([str, iterable[str]]): path or list of paths to H5 files.
         return_labels (bool): If True, return labels (fish_id, age, ) associated
             each sample. Default: False, only return PC data.
+        min_frames (int): Minimum number of frames that a file needs to have in
+            order to be included. Default: -1, no minimum.
         **metadata (dict):
     Returns:
 
     """
 
-    def __init__(self, filepaths, return_labels=False, **metadata):
+    def __init__(self, filepaths, return_labels=False, min_frames=-1, **metadata):
         # Standardize filepaths to be tuple of strings; sort alphabetically.
         if isinstance(filepaths, str):
             filepaths =(filepaths,)
@@ -57,11 +60,25 @@ class FishPCDataset(Dataset):
         ],)
         assert len(self._filepaths) > 0, 'No files found. Make sure that e.g. absolute paths are passed in.'
 
-        # Store data (obs) dimensions, cumulative sum of number of frames per file
         file_data_shape = onp.stack([
             h5py.File(fp, 'r')['stage/block0_values'].shape for fp in self._filepaths
         ],)
+
+        # Ensure all files have required minimum number of files. If not, remove.
+        has_min_frames = file_data_shape[:,0] >= min_frames \
+                         if min_frames > 0 else onp.ones(len(self._filepaths))
+
+        if not onp.all(has_min_frames):
+            print(f'The following files will be omitted because they have <{min_frames} frames:')
+            print(list(itertools.compress(self._filepaths, ~has_min_frames)))
+            print()
+
+            self._filepaths = list(itertools.compress(self._filepaths, has_min_frames))
+            file_data_shape = file_data_shape[has_min_frames,:]
+
         self._num_frames_per_file = file_data_shape[:,0]
+
+        # Store cumulative number of frames, data dimension
         self._cumulative_frames = onp.cumsum(self._num_frames_per_file)
         self._dim = file_data_shape[-1,-1]
 
