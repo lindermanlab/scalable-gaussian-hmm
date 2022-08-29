@@ -14,10 +14,11 @@ from ssm_jax.hmm.models import GaussianHMM
 __all__ = [
     'kmeans_initialization',
     'CheckpointDataclass',
-    'train_and_checkpoint',
 ]
 
-def kmeans_initialization(seed, num_states, dataset, step_size=1200, seq_length=180, emission_covs_scale=1.):
+def kmeans_initialization(seed, num_states, dataset,
+                          step_size=1200, seq_length=180,
+                          emission_covs_scale=1.):
     """Initalize a GaussianHMM using k-means algorithm.
     
     Args:
@@ -158,48 +159,3 @@ class CheckpointDataclass:
             out = (None, -1, [])
         
         return (*out, last_ckp_path) if return_path else out
-
-def train_and_checkpoint(emissions_loader,
-                         hmm: GaussianHMM,
-                         num_epochs: int,
-                         checkpoint: CheckpointDataclass,
-                         starting_epoch: int=0,
-                         prev_lps=[],
-                         ):
-    """Fit HMM via stochastic EM, with intermediate checkpointing.
-
-    After all training, HMM will automatically be checkpointed a final time.
-
-    Args
-        emissions_loader (torch.utils.data.DataLoader): Iterable over emissions
-        hmm (GaussianHMM): GaussianHMM to train. May be partially trained.
-        num_epochs (int): (Total) number of epochs to train.
-        checkpoint (CheckpointDataclass): Container with checkpoint parameters.
-        starting_epoch (int): Starting epoch of this training (i.e. hmm has already
-            been partially trained; warm-start). Default: 0 (cold-start).
-        prev_lps (array-like, length starting_epoch): Mean expected log
-            probabilities from previous epochs, if HMM is being warm-started.
-            Default: [] (cold-start, no previous training).
-    
-    Returns
-        all_lps (array-like, length num_epochs): Mean expected log probabilities
-        ckp_path (str): Path to last checkpoint file
-    """
-    assert starting_epoch >= 0
-    assert checkpoint.interval < num_epochs  
-
-    # If no interval specified, run (remaining) number of epochs
-    if checkpoint.interval < 1:
-        checkpoint.interval = num_epochs - starting_epoch
-
-    all_lps = prev_lps
-    for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
-
-        lps = hmm.fit_stochastic_em(emissions_loader,
-                                    emissions_loader.total_emissions,
-                                    num_epochs=checkpoint.interval)
-        all_lps = onp.concatenate([all_lps, lps])
-        this_epoch = last_epoch + checkpoint.interval
-        ckp_path = checkpoint.save(hmm, this_epoch, all_lps=all_lps)
-
-    return all_lps, ckp_path

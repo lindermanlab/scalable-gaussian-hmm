@@ -19,13 +19,14 @@ from datetime import datetime
 from memory_profiler import memory_usage
 import time
 
+import numpy as onp
 import jax.numpy as jnp
 import jax.random as jr
 
 from ssm_jax.hmm.models import GaussianHMM
 from kf import (FishPCDataset, FishPCLoader,
                 kmeans_initialization,
-                CheckpointDataclass, train_and_checkpoint,)
+                CheckpointDataclass)
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['DATADIR']
@@ -144,6 +145,123 @@ def setup_data(seed, batch_size, seq_length, split_sizes, starting_epoch=0, DEBU
 
     return dataset, train_dl, test_dl
 
+def compute_exact_lp(hmm, dataloader):
+    """Compute exact average log likelihood for a given HMM and dataset"""
+
+    lp = 0.
+    for batch_emissions in dataloader:
+        batch_stats = hmm.e_step(batch_emissions)
+        lp += batch_stats.marginal_loglik.sum() / dataloader.total_emissions
+    return lp
+
+def train_and_checkpoint(train_dataloader,
+                         hmm: GaussianHMM,
+                         num_epochs: int,
+                         checkpoint: CheckpointDataclass,
+                         starting_epoch: int=0,
+                         prev_lps=[],
+                         test_dataloader=None,
+                         ):
+    """Fit HMM via stochastic EM, with intermediate checkpointing. After final
+    epoch, HMM is automatically checkpointed a final time.
+
+    Args
+        train_dataloader (torch.utils.data.DataLoader): Iterable over training data
+        hmm (GaussianHMM): GaussianHMM to train. May be partially trained.
+        num_epochs (int): (Total) number of epochs to train.
+        checkpoint (CheckpointDataclass): Container with checkpoint parameters.
+        starting_epoch (int): Starting epoch of this training (i.e. hmm has already
+            been partially trained; warm-start). Default: 0 (cold-start).
+        prev_lps (array-like, length starting_epoch): Mean expected log
+            probabilities from previous epochs, if HMM is being warm-started.
+            Default: [] (cold-start, no previous training).
+        test_dataloader (torch.utils.data.DataLoader): Iterable over test data.
+            Exact log probability calculated at the end of each epoch. If None
+            provided, do not calculate. Default: None
+    
+    Returns
+        all_lps (array-like, length num_epochs): Mean expected log probabilities
+        ckp_path (str): Path to last checkpoint file
+    
+    TODO expose learning_rate
+    """
+    assert starting_epoch >= 0
+    assert checkpoint.interval < num_epochs  
+
+    # If no interval specified, run (remaining) number of epochs
+    if checkpoint.interval < 1:
+        checkpoint.interval = num_epochs - starting_epoch
+
+    all_lps = prev_lps
+    for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
+
+        lps = hmm.fit_stochastic_em(train_dataloader,
+                                    train_dataloader.total_emissions,
+                                    num_epochs=checkpoint.interval)
+        
+        if test_dataloader:
+            test_lp = compute_exact_lp(hmm, test_dataloader)
+        
+        all_lps = onp.concatenate([all_lps, lps])
+        this_epoch = last_epoch + checkpoint.interval
+        ckp_path = checkpoint.save(hmm, this_epoch, all_lps=all_lps)
+
+    return all_lps, ckp_path
+
+def train_val_and_checkpoint(train_dataloader,
+                                hmm: GaussianHMM,
+                                num_epochs: int,
+                                checkpoint: CheckpointDataclass,
+                                starting_epoch: int=0,
+                                prev_lps=onp.empty((0,2)),
+                                test_dataloader=None,
+                                ):
+    """Fit HMM via stochastic EM and evaluate on test data, with intermediate
+    checkpointing. After final epoch, HMM is automatically checkpointed a final time.
+
+    Args
+        train_dataloader (torch.utils.data.DataLoader): Iterable over training data
+        hmm (GaussianHMM): GaussianHMM to train. May be partially trained.
+        num_epochs (int): (Total) number of epochs to train.
+        checkpoint (CheckpointDataclass): Container with checkpoint parameters.
+        starting_epoch (int): Starting epoch of this training (i.e. hmm has already
+            been partially trained; warm-start). Default: 0 (cold-start).
+        prev_lps (array-like, length starting_epoch): Mean expected log
+            probabilities from previous epochs, if HMM is being warm-started.
+            Default: [] (cold-start, no previous training).
+        test_dataloader (torch.utils.data.DataLoader): Iterable over test data.
+            Exact log probability calculated at the end of each epoch. If None
+            provided, do not calculate. Default: None
+    
+    Returns
+        all_lps (array-like, length num_epochs): Mean expected log probabilities
+        ckp_path (str): Path to last checkpoint file
+    
+    TODO expose learning_rate
+    """
+    assert starting_epoch >= 0
+    assert checkpoint.interval < num_epochs  
+
+    # If no interval specified, run (remaining) number of epochs
+    if checkpoint.interval < 1:
+        checkpoint.interval = num_epochs - starting_epoch
+
+    all_lps = prev_lps
+    these_lps = onp.zeros((checkpoint.interval, 2))
+    for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
+            
+        for _epoch in range(checkpoint.interval):
+            these_lps[_epoch, 0] = hmm.fit_stochastic_em(
+                train_dataloader, train_dataloader.total_emissions, num_epochs=1
+            )
+            these_lps[_epoch, 1] = compute_exact_lp(hmm, test_dataloader)
+    
+        all_lps = onp.concatenate([all_lps, these_lps], -1)
+        this_epoch = last_epoch + checkpoint.interval
+        ckp_path = checkpoint.save(hmm, this_epoch, all_lps=all_lps)
+
+    return all_lps, ckp_path
+
 def main():
     args = parser.parse_args()
 
@@ -174,56 +292,59 @@ def main():
                    args.debug_max_files)
     
     if hmm is None:
-        print(f'Initializing HMM with {args.states} states...\n')
         
         tic = time.time()
         if args.hmm_init_method == 'random':
             hmm = GaussianHMM.random_initialization(seed_hmm, args.states, dataset.dim)
         elif args.hmm_init_method == 'kmeans':
-            # TODO Parameterize subset_size
             print("!!! WARNING !!! kmeans initialization specified -- currently slow and not optimized.")
-
-            hmm = kmeans_initialization(seed_hmm, args.states, dataset)
+            # Subsampling at 1 frame/min
+            # TODO check-in with Claire: Here, where we don't use time data, 
+            # would it still be better to have several 1 minute chunks at 20 Hz
+            # or subsample?
+            # TODO Consider bootstrapping covariance values (as opposed to using I)
+            hmm = kmeans_initialization(seed_hmm, args.states, dataset, step_size=1200, seq_length=180)
         toc = time.time()
-        print(f"initialized GaussianHMM using {args.hmm_init_method} init")
-        print(f"Elapsed fit time {toc-tic:.1f}s")
+        print(f"Initialized GaussianHMM using {args.hmm_init_method} init with {args.states} states. Elapsed time: {toc-tic:.1f}s\n")
 
     else:
         print(f"Warm-starting from {warm_ckp_path}, training from epoch {starting_epoch}...\n")
 
+    # ==========================================================================
     # Run
-    fn = train_and_checkpoint
+    fn = train_val_and_checkpoint
     fn_args = (train_dl, hmm, args.epochs, checkpointer)
-    fn_kwargs = {'starting_epoch': starting_epoch, 'prev_lps': prev_lps}
-    if args.mprof:        
-        mem_usage, (train_lps, last_ckp_path) = memory_usage(
+    fn_kwargs = {'starting_epoch': starting_epoch, 'prev_lps': prev_lps, 'test_dataloader': test_dl}
+    
+    if args.mprof:
+        mem_usage, (lps, last_ckp_path) = memory_usage(
                 proc=(fn, fn_args, fn_kwargs), retval=True,
                 backend='psutil_pss',
                 stream=False, timestamps=True, max_usage=False,
                 include_children=True, multiprocess=True,
         )
 
-        # train_lps.block_until_ready()
-
+        # Save memory profiler results
         f_mprof = os.path.join(log_dir, 'train_and_checkpoint.mprof')
         write_mprof(f_mprof, mem_usage)
     else:
-        train_lps, last_ckp_path = fn(*fn_args, **fn_kwargs)
-        # train_lps.block_until_ready()
+        lps, last_ckp_path = fn(*fn_args, **fn_kwargs)
 
-    print('expected_train_lls:')
-    train_lps /= train_dl.total_emissions
-    for epoch, lp in enumerate(train_lps):
-        print(f"{epoch:2d}: {lp:.4f}")
+    print('\nexpected_train_lls:')
+    lps /= onp.array([train_dl.total_emissions, test_dl.total_emissions])
+    for epoch, lp in enumerate(lps):
+        print(f"{epoch:2d}: expected train {lp[0]:.4f}, exact test {lp[1]:.4f}")
+
+    print (f"\nTraining completed, latest checkpoint saved at {last_ckp_path}")
     
     # ==========================================================================
-    # Evaluate on test data
-    print("Evaluating test log likelihood")
-    test_lp = 0.
-    for batch_emissions in test_dl:
-        batch_stats = hmm.e_step(batch_emissions)
-        test_lp += batch_stats.marginal_loglik.sum() / test_dl.total_emissions
-    print(f'average_test_lp: {test_lp:.4f}')
+    # # Evaluate on test data
+    # print("Evaluating test log likelihood")
+    # test_lp = 0.
+    # for batch_emissions in test_dl:
+    #     batch_stats = hmm.e_step(batch_emissions)
+    #     test_lp += batch_stats.marginal_loglik.sum() / test_dl.total_emissions
+    # print(f'average_test_lp: {test_lp:.4f}')
     
     return
 
