@@ -17,6 +17,7 @@ import os
 import argparse
 from datetime import datetime
 from memory_profiler import memory_usage
+import time
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -27,7 +28,7 @@ from kf import (FishPCDataset, FishPCLoader,
                 CheckpointDataclass, train_and_checkpoint,)
 
 DATADIR = os.environ['DATADIR']
-TEMPDIR = os.environ['TEMPDIR']
+TEMPDIR = os.environ['DATADIR']
 fish_id = 'fish0_137'
 
 # -------------------------------------
@@ -109,7 +110,7 @@ def setup_data(seed, batch_size, seq_length, split_sizes, starting_epoch=0, DEBU
     # order of the minibatches should be shuffled every epoch. We can't control
     # this precisely with torch.Generator, however, we can at least make sure
     # it is different -> seed_dl_train folds in epoch information.
-    seed_split, seed_dl = jr.split(seed,)
+    seed_split, seed_dl, seed_debug = jr.split(seed, 3)
     seed_dl_train = jr.fold_in(seed_dl, starting_epoch)
 
     # TODO This is hard fixed to single subject for now
@@ -119,7 +120,8 @@ def setup_data(seed, batch_size, seq_length, split_sizes, starting_epoch=0, DEBU
     # TODO Hard limiting number of filepaths. Remove when done debugging
     if DEBUG_MAX_FILES > 0:
         print(f"!!! WARNING !!! Limiting total number of files loaded to {DEBUG_MAX_FILES}.")
-    filepaths = filepaths[:DEBUG_MAX_FILES]
+        idxs = jr.permutation(seed_debug, len(filepaths))[:DEBUG_MAX_FILES]
+        filepaths = [filepaths[i] for i in idxs]
     dataset = FishPCDataset(filepaths, return_labels=False)
 
     # Split dataset into a training set and a test.
@@ -168,18 +170,24 @@ def main():
     
     dataset, train_dl, test_dl = \
         setup_data(seed_data, args.batch_size, args.seq_length,
-                   (args.train, args.test),
-                   starting_epoch,
+                   (args.train, args.test), starting_epoch,
                    args.debug_max_files)
     
     if hmm is None:
         print(f'Initializing HMM with {args.states} states...\n')
+        
+        tic = time.time()
         if args.hmm_init_method == 'random':
             hmm = GaussianHMM.random_initialization(seed_hmm, args.states, dataset.dim)
         elif args.hmm_init_method == 'kmeans':
             # TODO Parameterize subset_size
             print("!!! WARNING !!! kmeans initialization specified -- currently slow and not optimized.")
-            hmm = kmeans_initialization(seed_hmm, args.states, dataset, subset_size=144000)
+
+            hmm = kmeans_initialization(seed_hmm, args.states, dataset)
+        toc = time.time()
+        print(f"initialized GaussianHMM using {args.hmm_init_method} init")
+        print(f"Elapsed fit time {toc-tic:.1f}s")
+
     else:
         print(f"Warm-starting from {warm_ckp_path}, training from epoch {starting_epoch}...\n")
 

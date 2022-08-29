@@ -17,17 +17,22 @@ __all__ = [
     'train_and_checkpoint',
 ]
 
-def kmeans_initialization(seed, num_states, dataset, subset_size=0.001, emission_covs_scale=1.):
+def kmeans_initialization(seed, num_states, dataset, step_size=1200, seq_length=180, emission_covs_scale=1.):
     """Initalize a GaussianHMM using k-means algorithm.
     
     Args:
         seed (jr.PRNGKey):
         num_states (int): Number of clusters to fit
         dataset (torch.utils.data.Dataset):
-        subset_size (float): Size of dataset to use in kmeans fit. If >1, value
-            is interpreted as number of samples. If (0, 1], value is interpreted
-            as fraction of dataset. Note the difference in how a value of 1 is
-            interpreted here, vs. e.g. FisPCDataset.split_seq. Default: 0.001.
+        step_size (int): Number of frames between selected frames of a sequence,
+            a larger value results in greater subsampling. Choose large enough
+            that we get meaninful data reduction but not so small that kmeans
+            fit takes too long. Default: 1200, corresponding to 1 fr/min @ 20 Hz.
+        seq_length (int): Number of frames per sequence. Choose it to be large
+            enough such that data is accessed efficiently, but not so large that
+            lots of sequences may be dropped if they are cannot reach minimum
+            length before end of file. Default: 180, which corresponds to seqs
+            spanning 3 hrs.
         emission_covs_scale (float or None): Scale of emission covariances
             initialized to block identity matrices. If None, bootstrap emission
             covariances from kmeans labels.
@@ -35,15 +40,17 @@ def kmeans_initialization(seed, num_states, dataset, subset_size=0.001, emission
     Returns:
         GaussianHMM
     """
-
+    # TODO seed_data not used...
     seed_data, seed_kmeans, seed_initial, seed_transition = jr.split(seed, 4)
 
-    # Get subset of data from dataset
-    num_emissions = int(len(dataset)*subset_size) if subset_size < 1 else int(subset_size)
-    idxs = jr.permutation(seed_data, len(dataset))[:num_emissions]
+    # Subsample data at specific step_size and for specific sequence lenth
+    # TODO need to set seq_length*step_size when creating dataset...
+    seq_slices = dataset.slice_seq(seq_length, step_size, drop_incomplete_seqs=True)
+    emissions = onp.stack([dataset[slc] for slc in seq_slices], axis=0)
+    emissions = emissions.reshape(-1, dataset.dim)
 
-    # emissions = onp.stack([dataset[idx] for idx in idxs], axis=0)
-    emissions = dataset.get_frames(idxs)
+    print(f'Fitting k-means with {len(emissions)}/{len(dataset)} frames, ~{len(emissions)/len(dataset)*100:.2f}% of dataset...')
+    print(f'subsampled at {step_size / 60 / 20:.2f} frames / min. sequences span {step_size*seq_length/60/60:.1f} hr')
 
     # Set emission means and covariances based on fitted k-means clusters
     kmeans = KMeans(num_states, random_state=int(seed_kmeans[-1])).fit(emissions)
