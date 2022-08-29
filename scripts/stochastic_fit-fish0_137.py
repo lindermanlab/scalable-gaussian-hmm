@@ -27,7 +27,7 @@ from kf import (FishPCDataset, FishPCLoader,
                 CheckpointDataclass, train_and_checkpoint,)
 
 DATADIR = os.environ['DATADIR']
-TEMPDIR = os.environ['TEMPDIR']
+TEMPDIR = os.environ['DATADIR']
 fish_id = 'fish0_137'
 
 # -------------------------------------
@@ -57,6 +57,10 @@ parser.add_argument(
     help='If specified, profile memory usage with memory_profiler.')
 
 parser.add_argument(
+    '--hmm_init_method', type=str, default='random',
+    choices=['random', 'kmeans'],
+    help='HMM initialization method in the first epoch.')
+parser.add_argument(
     '--seed', type=int, default=45212276,
     help='Initial RNG seed, for splitting data and intializing HMM.')
 parser.add_argument(
@@ -78,6 +82,10 @@ parser.add_argument(
     '--states', type=int, default=20,
     help='Number of HMM states to fit')
 
+parser.add_argument(
+    '--debug_max_files', type=int, default=-1,
+    help='FOR DEBUGGING: Maximum number of files (~days of recording) in directory to expose. Default: -1, expose all.')
+
 def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
     """Writes time-based memory profiler results to file."""
     with open(path, mode) as f:
@@ -87,23 +95,35 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
 
 # -------------------------------------
 
-def setup_data(seed, batch_size, seq_length, split_sizes):
-    """Construct training and validation dataloaders"""
+def setup_data(seed, batch_size, seq_length, split_sizes, starting_epoch=0, DEBUG_MAX_FILES=-1):
+    """Construct training and validation dataloaders
+    
+    TODO Remove DEBUG_MAX_FILES argument (args.argparse, filepaths)
+    """
 
     print("\n======================")
     print("Setting up dataset...")
 
-    seed_split, seed_dl_train, seed_dl_test = jr.split(seed, 3)
+    # We want dataset to be split the same way across epochs, to properly reserve
+    # test data -> so seed_split as independent of starting_epoch. However, the
+    # order of the minibatches should be shuffled every epoch. We can't control
+    # this precisely with torch.Generator, however, we can at least make sure
+    # it is different -> seed_dl_train folds in epoch information.
+    seed_split, seed_dl = jr.split(seed,)
+    seed_dl_train = jr.fold_in(seed_dl, starting_epoch)
 
     # TODO This is hard fixed to single subject for now
     fish_dir = os.path.join(DATADIR, fish_id)
     filepaths = sorted([os.path.join(fish_dir, f) for f in os.listdir(fish_dir)])
 
-    # FIXME Hard limiting number of filepaths. Remove when done debugging
-    filepaths = filepaths[:10]
-    print(f"WARNING: FORCING DATASET TO ONLY LOAD {len(filepaths)} files of data")
+    # TODO Hard limiting number of filepaths. Remove when done debugging
+    if DEBUG_MAX_FILES > 0:
+        print(f"!!! WARNING !!! Limiting total number of files loaded to {DEBUG_MAX_FILES}.")
+    filepaths = filepaths[:DEBUG_MAX_FILES]
     dataset = FishPCDataset(filepaths, return_labels=False)
 
+    # Split dataset into a training set and a test.
+    # test_dl does not need to be shuffled since we use full E-step to evaluate
     train_slices, test_slices = \
         dataset.split_seq(split_sizes, seed_split, seq_length,
                           step_size=1, drop_incomplete_seqs=True)
@@ -144,14 +164,26 @@ def main():
     hmm, prev_epoch, prev_lps, warm_ckp_path = checkpointer.load_latest(return_path=True)
     starting_epoch = prev_epoch + 1
     
-    seed_data, seed_hmm = jr.split(jr.fold_in(jr.PRNGKey(args.seed), starting_epoch))
+    seed_data, seed_hmm = jr.split(jr.PRNGKey(args.seed))
     
     dataset, train_dl, test_dl = \
-        setup_data(seed_data, args.batch_size, args.seq_length, (args.train, args.test))
+        setup_data(seed_data, args.batch_size, args.seq_length,
+                   (args.train, args.test), starting_epoch,
+                   args.debug_max_files)
     
     if hmm is None:
         print(f'Initializing HMM with {args.states} states...\n')
-        hmm = kmeans_initialization(seed_hmm, args.states, dataset, subset_size=144000)
+        import time
+        tic = time.time()
+        if args.hmm_init_method == 'random':
+            hmm = GaussianHMM.random_initialization(seed_hmm, args.states, dataset.dim)
+        elif args.hmm_init_method == 'kmeans':
+            # TODO Parameterize subset_size
+            print("!!! WARNING !!! kmeans initialization specified -- currently slow and not optimized.")
+            hmm = kmeans_initialization(seed_hmm, args.states, dataset)
+        toc = time.time()
+        print(f"initialized GaussianHMM using {args.hmm_init_method} init")
+        print(f"Elapsed fit time {toc-tic:.1f}s")
     else:
         print(f"Warm-starting from {warm_ckp_path}, training from epoch {starting_epoch}...\n")
 
