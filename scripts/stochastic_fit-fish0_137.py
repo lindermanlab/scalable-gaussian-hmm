@@ -97,9 +97,9 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
 
 # -------------------------------------
 
-def setup_data(seed, batch_size, seq_length, split_sizes, starting_epoch=0, DEBUG_MAX_FILES=-1):
+def setup_data(seed, batch_size, seq_length, split_sizes,
+               starting_epoch=0, DEBUG_MAX_FILES=-1):
     """Construct training and validation dataloaders
-    
     TODO Remove DEBUG_MAX_FILES argument (args.argparse, filepaths)
     """
 
@@ -159,7 +159,7 @@ def train_and_checkpoint(train_dataloader,
                          num_epochs: int,
                          checkpoint: CheckpointDataclass,
                          starting_epoch: int=0,
-                         prev_lps=[],
+                         prev_lps=None,
                          test_dataloader=None,
                          ):
     """Fit HMM via stochastic EM, with intermediate checkpointing. After final
@@ -292,18 +292,13 @@ def main():
                    args.debug_max_files)
     
     if hmm is None:
-        
         tic = time.time()
         if args.hmm_init_method == 'random':
             hmm = GaussianHMM.random_initialization(seed_hmm, args.states, dataset.dim)
         elif args.hmm_init_method == 'kmeans':
-            print("!!! WARNING !!! kmeans initialization specified -- currently slow and not optimized.")
+            # TODO Consider bootstrapping covariance values (as opposed to using identity covariance)
             # Subsampling at 1 frame/min
-            # TODO check-in with Claire: Here, where we don't use time data, 
-            # would it still be better to have several 1 minute chunks at 20 Hz
-            # or subsample?
-            # TODO Consider bootstrapping covariance values (as opposed to using I)
-            hmm = kmeans_initialization(seed_hmm, args.states, dataset, step_size=1200, seq_length=180)
+            hmm = kmeans_initialization(seed_hmm, args.states, train_dl, step_size=1200)
         toc = time.time()
         print(f"Initialized GaussianHMM using {args.hmm_init_method} init with {args.states} states. Elapsed time: {toc-tic:.1f}s\n")
 

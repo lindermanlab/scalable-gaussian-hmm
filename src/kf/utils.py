@@ -16,54 +16,53 @@ __all__ = [
     'CheckpointDataclass',
 ]
 
-def kmeans_initialization(seed, num_states, dataset,
-                          step_size=1200, seq_length=180,
+def kmeans_initialization(seed, num_states, dataloader, step_size=1200,
                           emission_covs_scale=1.):
     """Initalize a GaussianHMM using k-means algorithm.
     
     Args:
         seed (jr.PRNGKey):
         num_states (int): Number of clusters to fit
-        dataset (torch.utils.data.Dataset):
+        dataloader (torch.utils.data.Dataloader):
         step_size (int): Number of frames between selected frames of a sequence,
             a larger value results in greater subsampling. Choose large enough
             that we get meaninful data reduction but not so small that kmeans
-            fit takes too long. Default: 1200, corresponding to 1 fr/min @ 20 Hz.
-        seq_length (int): Number of frames per sequence. Choose it to be large
-            enough such that data is accessed efficiently, but not so large that
-            lots of sequences may be dropped if they are cannot reach minimum
-            length before end of file. Default: 180, which corresponds to seqs
-            spanning 3 hrs.
+            fit takes too long. Default: 1200, corresponding to 1 fr/min @ 20 Hz
+            (assuming that dataloader sequences are NOT subsampled)
         emission_covs_scale (float or None): Scale of emission covariances
             initialized to block identity matrices. If None, bootstrap emission
             covariances from kmeans labels.
-
-    Returns:
-        GaussianHMM
     """
-    # TODO seed_data not used...
-    seed_data, seed_kmeans, seed_initial, seed_transition = jr.split(seed, 4)
+    
+    seed_kmeans, seed_initial, seed_transition = jr.split(seed, 3)
 
-    # Subsample data at specific step_size and for specific sequence lenth
-    # TODO need to set seq_length*step_size when creating dataset...
-    seq_slices = dataset.slice_seq(seq_length, step_size, drop_incomplete_seqs=True)
-    emissions = onp.stack([dataset[slc] for slc in seq_slices], axis=0)
-    emissions = emissions.reshape(-1, dataset.dim)
+    # Get single batch from dataloader and pre-allocate array
+    _batch = next(iter(dataloader))
+    batch_size, seq_length, dim = _batch.shape
+    subsampled = onp.empty((len(dataloader), batch_size, seq_length//step_size, dim))
 
-    print(f'Fitting k-means with {len(emissions)}/{len(dataset)} frames, ~{len(emissions)/len(dataset)*100:.2f}% of dataset...')
-    print(f'subsampled at {step_size / 60 / 20:.2f} frames / min. sequences span {step_size*seq_length/60/60:.1f} hr')
+    # Get data from dataloader, and reshape to a 2-d array
+    for i, batch_emissions in enumerate(dataloader):
+        subsampled[i] = batch_emissions[...,::step_size,:]
+    subsampled = subsampled.reshape(-1, dim)
+
+    # Print out some stats
+    train_emissions = len(dataloader) * batch_size * seq_length
+    print(f'Fitting k-means with {len(subsampled)}/{train_emissions} frames, ' + \
+          f'{len(subsampled)/train_emissions*100:.2f}% of training data...' + \
+          f'Subsampled at {step_size / 60 / 20:.2f} frames / min.')
 
     # Set emission means and covariances based on fitted k-means clusters
-    kmeans = KMeans(num_states, random_state=int(seed_kmeans[-1])).fit(emissions)
+    kmeans = KMeans(num_states, random_state=int(seed_kmeans[-1])).fit(subsampled)
     emission_means = jnp.asarray(kmeans.cluster_centers_)
 
     if emission_covs_scale is None:
         labels = kmeans.labels_
         emission_covs = onp.stack([
-            jnp.cov(emissions[labels==state], rowvar=False) for state in range(num_states)
+            jnp.cov(subsampled[labels==state], rowvar=False) for state in range(num_states)
         ])
     else: 
-        emission_covs = jnp.tile(jnp.eye(dataset.dim) * emission_covs_scale, (num_states, 1, 1))
+        emission_covs = jnp.tile(jnp.eye(dim) * emission_covs_scale, (num_states, 1, 1))
 
     # Randomly set initial state and state transition probabilities
     initial_probs = jr.dirichlet(seed_initial, jnp.ones(num_states))
@@ -134,7 +133,7 @@ class CheckpointDataclass:
         
         with onp.load(path) as f:
             epochs_completed = f['epochs_completed']
-            hmm = GaussianHMM(**{k: f[k] for k in hmm_keys})
+            hmm = GaussianHMM(**{k: jnp.asarray(f[k]) for k in hmm_keys})
             all_lps = f['all_lps'] if 'all_lps' in f else []
             
         return hmm, epochs_completed, all_lps
@@ -156,6 +155,6 @@ class CheckpointDataclass:
             out = self.load(existing_ckps[-1])
         else:   # No checkpoints in this directory
             last_ckp_path = None
-            out = (None, -1, [])
+            out = (None, -1, None)
         
         return (*out, last_ckp_path) if return_path else out
