@@ -168,7 +168,7 @@ def train_and_checkpoint(train_dataloader,
     Args
         train_dataloader (torch.utils.data.DataLoader): Iterable over training data
         hmm (GaussianHMM): GaussianHMM to train. May be partially trained.
-        num_epochs (int): (Total) number of epochs to train.
+        num_epochs (int): (Total) nuber of epochs to train.
         checkpoint (CheckpointDataclass): Container with checkpoint parameters.
         starting_epoch (int): Starting epoch of this training (i.e. hmm has already
             been partially trained; warm-start). Default: 0 (cold-start).
@@ -191,72 +191,34 @@ def train_and_checkpoint(train_dataloader,
     # If no interval specified, run (remaining) number of epochs
     if checkpoint.interval < 1:
         checkpoint.interval = num_epochs - starting_epoch
-
-    all_lps = prev_lps
-    for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
-
+    
+    def _train():
         lps = hmm.fit_stochastic_em(train_dataloader,
                                     train_dataloader.total_emissions,
                                     num_epochs=checkpoint.interval)
-        
-        if test_dataloader:
-            test_lp = compute_exact_lp(hmm, test_dataloader)
-        
-        all_lps = onp.concatenate([all_lps, lps])
-        this_epoch = last_epoch + checkpoint.interval
-        ckp_path = checkpoint.save(hmm, this_epoch, all_lps=all_lps)
+        return lps
 
-    return all_lps, ckp_path
-
-def train_val_and_checkpoint(train_dataloader,
-                                hmm: GaussianHMM,
-                                num_epochs: int,
-                                checkpoint: CheckpointDataclass,
-                                starting_epoch: int=0,
-                                prev_lps=onp.empty((0,2)),
-                                test_dataloader=None,
-                                ):
-    """Fit HMM via stochastic EM and evaluate on test data, with intermediate
-    checkpointing. After final epoch, HMM is automatically checkpointed a final time.
-
-    Args
-        train_dataloader (torch.utils.data.DataLoader): Iterable over training data
-        hmm (GaussianHMM): GaussianHMM to train. May be partially trained.
-        num_epochs (int): (Total) number of epochs to train.
-        checkpoint (CheckpointDataclass): Container with checkpoint parameters.
-        starting_epoch (int): Starting epoch of this training (i.e. hmm has already
-            been partially trained; warm-start). Default: 0 (cold-start).
-        prev_lps (array-like, length starting_epoch): Mean expected log
-            probabilities from previous epochs, if HMM is being warm-started.
-            Default: [] (cold-start, no previous training).
-        test_dataloader (torch.utils.data.DataLoader): Iterable over test data.
-            Exact log probability calculated at the end of each epoch. If None
-            provided, do not calculate. Default: None
-    
-    Returns
-        all_lps (array-like, length num_epochs): Mean expected log probabilities
-        ckp_path (str): Path to last checkpoint file
-    
-    TODO expose learning_rate
-    """
-    assert starting_epoch >= 0
-    assert checkpoint.interval < num_epochs  
-
-    # If no interval specified, run (remaining) number of epochs
-    if checkpoint.interval < 1:
-        checkpoint.interval = num_epochs - starting_epoch
-
-    all_lps = prev_lps
-    these_lps = onp.zeros((checkpoint.interval, 2))
-    for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
-            
+    def _train_and_val():
+        lps = onp.empty((checkpoint.interval, 2))
         for _epoch in range(checkpoint.interval):
-            these_lps[_epoch, 0] = hmm.fit_stochastic_em(
+            train_lp = hmm.fit_stochastic_em(
                 train_dataloader, train_dataloader.total_emissions, num_epochs=1
             )
-            these_lps[_epoch, 1] = compute_exact_lp(hmm, test_dataloader)
-    
-        all_lps = onp.concatenate([all_lps, these_lps], -1)
+            test_lp = compute_exact_lp(hmm, test_dataloader)
+            lps[_epoch] = onp.array([train_lp, test_lp])
+
+            print(f'Epoch {_epoch}: train={train_lp}, test={test_lp:.2f}')
+        return lps
+
+    if prev_lps is None:
+        prev_lps = onp.empty((0,2)) if test_dataloader else onp.empty((0,1))
+    all_lps = prev_lps
+
+    for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
+        lps = _train_and_val() if test_dataloader else _train()
+
+        all_lps = onp.vstack([all_lps, lps], -1)
+
         this_epoch = last_epoch + checkpoint.interval
         ckp_path = checkpoint.save(hmm, this_epoch, all_lps=all_lps)
 
@@ -307,7 +269,7 @@ def main():
 
     # ==========================================================================
     # Run
-    fn = train_val_and_checkpoint
+    fn = train_and_checkpoint
     fn_args = (train_dl, hmm, args.epochs, checkpointer)
     fn_kwargs = {'starting_epoch': starting_epoch, 'prev_lps': prev_lps, 'test_dataloader': test_dl}
     
