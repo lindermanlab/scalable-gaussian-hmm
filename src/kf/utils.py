@@ -134,9 +134,10 @@ class CheckpointDataclass:
         with onp.load(path) as f:
             epochs_completed = f['epochs_completed']
             hmm = GaussianHMM(**{k: jnp.asarray(f[k]) for k in hmm_keys})
-            all_lps = f['all_lps'] if 'all_lps' in f else []
+            all_train_lps = f['all_lps'] if 'all_train_lps' in f else None
+            all_test_lps = f['all_lps'] if 'all_train_lps' in f else None
             
-        return hmm, epochs_completed, all_lps
+        return hmm, epochs_completed, all_train_lps, all_test_lps
     
     def load_latest(self, return_path=False):
         """Load latest checkpoint (alphanumerically) in this instance's directory.
@@ -144,7 +145,8 @@ class CheckpointDataclass:
         Returns:
             hmm (GaussianHMM)
             prev_epoch (int):
-            prev_lps (array-like):
+            prev_train_lps (array-like or None):
+            prev_test_lps (array-like or None):
             ckp_path (str, optional): Path of file, returned if return_path=True
         """
 
@@ -155,6 +157,6 @@ class CheckpointDataclass:
             out = self.load(existing_ckps[-1])
         else:   # No checkpoints in this directory
             last_ckp_path = None
-            out = (None, -1, None)
+            out = (None, -1, None, None)
         
         return (*out, last_ckp_path) if return_path else out

@@ -159,7 +159,8 @@ def train_and_checkpoint(train_dataloader,
                          num_epochs: int,
                          checkpoint: CheckpointDataclass,
                          starting_epoch: int=0,
-                         prev_lps=None,
+                         prev_train_lps=None,
+                         prev_test_lps=None,
                          test_dataloader=None,
                          ):
     """Fit HMM via stochastic EM, with intermediate checkpointing. After final
@@ -168,7 +169,7 @@ def train_and_checkpoint(train_dataloader,
     Args
         train_dataloader (torch.utils.data.DataLoader): Iterable over training data
         hmm (GaussianHMM): GaussianHMM to train. May be partially trained.
-        num_epochs (int): (Total) nuber of epochs to train.
+        num_epochs (int): (Total) number of epochs to train.
         checkpoint (CheckpointDataclass): Container with checkpoint parameters.
         starting_epoch (int): Starting epoch of this training (i.e. hmm has already
             been partially trained; warm-start). Default: 0 (cold-start).
@@ -199,30 +200,45 @@ def train_and_checkpoint(train_dataloader,
         return lps
 
     def _train_and_val():
-        lps = onp.empty((checkpoint.interval, 2))
+        # lps = onp.empty((checkpoint.interval, 2))
+        train_lps = onp.empty((checkpoint.interval, len(train_dataloader)))
+        test_lps = onp.empty((checkpoint.interval, 1))
         for _epoch in range(checkpoint.interval):
             train_lp = hmm.fit_stochastic_em(
                 train_dataloader, train_dataloader.total_emissions, num_epochs=1
             )
             test_lp = compute_exact_lp(hmm, test_dataloader)
-            lps[_epoch] = onp.array([train_lp, test_lp])
+
+            # lps[_epoch] = onp.array([train_lp, test_lp])
+            train_lps[_epoch] = train_lp
+            test_lps[_epoch] = test_lp
 
             print(f'Epoch {_epoch}: train={train_lp}, test={test_lp:.2f}')
-        return lps
+        return (train_lps, test_lps)
 
-    if prev_lps is None:
-        prev_lps = onp.empty((0,2)) if test_dataloader else onp.empty((0,1))
-    all_lps = prev_lps
-
+    if prev_train_lps is None:
+        prev_train_lps = onp.empty((0,len(train_dataloader)))
+    if prev_test_lps is None and test_dataloader:
+        prev_test_lps = onp.empty((0,1))
+    
+    all_train_lps = prev_train_lps
+    all_test_lps = prev_test_lps
     for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
-        lps = _train_and_val() if test_dataloader else _train()
-
-        all_lps = onp.vstack([all_lps, lps], -1)
+        if test_dataloader:
+            train_lps, test_lps = _train_and_val()
+            all_test_lps = onp.vstack([all_test_lps, test_lps])
+        else:
+            train_lps = _train()
+        
+        all_train_lps = onp.vstack([all_train_lps, train_lps], -1)
 
         this_epoch = last_epoch + checkpoint.interval
-        ckp_path = checkpoint.save(hmm, this_epoch, all_lps=all_lps)
+        
+        ckp_path = checkpoint.save(hmm, this_epoch,
+                                   all_train_lps=all_train_lps,
+                                   all_test_lps=all_test_lps)
 
-    return all_lps, ckp_path
+    return all_train_lps, all_test_lps, ckp_path
 
 def main():
     args = parser.parse_args()
@@ -243,7 +259,8 @@ def main():
 
     # ==========================================================================
     # Warm-start from last checkpoint, if available. Else, initialize hmm.
-    hmm, prev_epoch, prev_lps, warm_ckp_path = checkpointer.load_latest(return_path=True)
+    hmm, prev_epoch, prev_train_lps, prev_test_lps, warm_ckp_path \
+                                    = checkpointer.load_latest(return_path=True)
     starting_epoch = prev_epoch + 1
     
     seed_data, seed_hmm = jr.split(jr.PRNGKey(args.seed))
@@ -271,7 +288,10 @@ def main():
     # Run
     fn = train_and_checkpoint
     fn_args = (train_dl, hmm, args.epochs, checkpointer)
-    fn_kwargs = {'starting_epoch': starting_epoch, 'prev_lps': prev_lps, 'test_dataloader': test_dl}
+    fn_kwargs = {'starting_epoch': starting_epoch,
+                 'prev_train_lps': prev_train_lps,
+                 'prev_test_lps': prev_test_lps,
+                 'test_dataloader': test_dl}
     
     if args.mprof:
         mem_usage, (lps, last_ckp_path) = memory_usage(
