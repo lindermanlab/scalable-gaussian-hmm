@@ -137,10 +137,10 @@ def setup_data(seed, batch_size, seq_length, split_sizes,
     
     print("Initialized training dataset with "
           + f"{len(train_slices):3d} sets of {seq_length/72000:.1f} hr sequences; "
-          + f"{len(train_dl):3d} batches of {batch_size} sequences")
+          + f"{len(train_dl):3d} batches of {batch_size} sequences per batch")
     print("Initialized testing  dataset with "
           + f"{len(test_slices):3d} sets of {seq_length/72000:.1f} hr sequences; "
-          + f"{len(test_dl):3d} batches of {batch_size} sequences")
+          + f"{len(test_dl):3d} batches of {batch_size} sequences per batch")
     print()
 
     return dataset, train_dl, test_dl
@@ -151,7 +151,7 @@ def compute_exact_lp(hmm, dataloader):
     lp = 0.
     for batch_emissions in dataloader:
         batch_stats = hmm.e_step(batch_emissions)
-        lp += batch_stats.marginal_loglik.sum() / dataloader.total_emissions
+        lp += batch_stats.marginal_loglik.sum()
     return lp
 
 def train_and_checkpoint(train_dataloader,
@@ -177,43 +177,35 @@ def train_and_checkpoint(train_dataloader,
             probabilities from previous epochs, if HMM is being warm-started.
             Default: [] (cold-start, no previous training).
         test_dataloader (torch.utils.data.DataLoader): Iterable over test data.
-            Exact log probability calculated at the end of each epoch. If None
-            provided, do not calculate. Default: None
+            If not None, evaluate exact log probability on test data after each
+            epoch. If None, do not calculate. Default: None
     
     Returns
         all_lps (array-like, length num_epochs): Mean expected log probabilities
         ckp_path (str): Path to last checkpoint file
     
-    TODO expose learning_rate
+    TODO Expose learning_rate
     """
     assert starting_epoch >= 0
     assert checkpoint.interval < num_epochs  
+    assert starting_epoch < num_epochs
 
     # If no interval specified, run (remaining) number of epochs
     if checkpoint.interval < 1:
         checkpoint.interval = num_epochs - starting_epoch
-    
-    def _train():
-        lps = hmm.fit_stochastic_em(train_dataloader,
-                                    train_dataloader.total_emissions,
-                                    num_epochs=checkpoint.interval)
-        return lps
 
     def _train_and_val():
-        # lps = onp.empty((checkpoint.interval, 2))
+        """Train model, and validate on test data after every epoch."""
         train_lps = onp.empty((checkpoint.interval, len(train_dataloader)))
         test_lps = onp.empty((checkpoint.interval, 1))
         for _epoch in range(checkpoint.interval):
             train_lp = hmm.fit_stochastic_em(
                 train_dataloader, train_dataloader.total_emissions, num_epochs=1
             )
-            test_lp = compute_exact_lp(hmm, test_dataloader)
 
-            # lps[_epoch] = onp.array([train_lp, test_lp])
             train_lps[_epoch] = train_lp
-            test_lps[_epoch] = test_lp
+            test_lps[_epoch] = compute_exact_lp(hmm, test_dataloader)
 
-            print(f'Epoch {_epoch}: train={train_lp}, test={test_lp:.2f}')
         return (train_lps, test_lps)
 
     if prev_train_lps is None:
@@ -228,9 +220,11 @@ def train_and_checkpoint(train_dataloader,
             train_lps, test_lps = _train_and_val()
             all_test_lps = onp.vstack([all_test_lps, test_lps])
         else:
-            train_lps = _train()
+            train_lps = hmm.fit_stochastic_em(train_dataloader,
+                                              train_dataloader.total_emissions,
+                                              num_epochs=checkpoint.interval)
         
-        all_train_lps = onp.vstack([all_train_lps, train_lps], -1)
+        all_train_lps = onp.vstack([all_train_lps, train_lps])
 
         this_epoch = last_epoch + checkpoint.interval
         
@@ -238,7 +232,7 @@ def train_and_checkpoint(train_dataloader,
                                    all_train_lps=all_train_lps,
                                    all_test_lps=all_test_lps)
 
-    return all_train_lps, all_test_lps, ckp_path
+    return (all_train_lps, all_test_lps), ckp_path
 
 def main():
     args = parser.parse_args()
@@ -308,21 +302,23 @@ def main():
         lps, last_ckp_path = fn(*fn_args, **fn_kwargs)
 
     print('\nexpected_train_lls:')
-    lps /= onp.array([train_dl.total_emissions, test_dl.total_emissions])
-    for epoch, lp in enumerate(lps):
-        print(f"{epoch:2d}: expected train {lp[0]:.4f}, exact test {lp[1]:.4f}")
+    train_lps, test_lps = lps
+    train_lps /= train_dl.total_emissions
+    if test_lps is not None:
+        test_lps /= test_dl.total_emissions
+
+    for epoch in range(len(train_lps)):
+        print(f"\nEpoch {epoch:2d}\n---------")
+        print(f"Expected train:\n", train_lps[epoch])
+        if test_lps is not None:
+            print(f"\nExact test:\n", test_lps[epoch])
+    
+    if test_lps is None:
+        test_lp = compute_exact_lp(hmm, test_dataloader) / test_dl.total_emissions
+        print("\n Final test_lp: ", test_lp)
 
     print (f"\nTraining completed, latest checkpoint saved at {last_ckp_path}")
-    
-    # ==========================================================================
-    # # Evaluate on test data
-    # print("Evaluating test log likelihood")
-    # test_lp = 0.
-    # for batch_emissions in test_dl:
-    #     batch_stats = hmm.e_step(batch_emissions)
-    #     test_lp += batch_stats.marginal_loglik.sum() / test_dl.total_emissions
-    # print(f'average_test_lp: {test_lp:.4f}')
-    
+
     return
 
 if __name__ == '__main__':

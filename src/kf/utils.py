@@ -134,8 +134,8 @@ class CheckpointDataclass:
         with onp.load(path) as f:
             epochs_completed = f['epochs_completed']
             hmm = GaussianHMM(**{k: jnp.asarray(f[k]) for k in hmm_keys})
-            all_train_lps = f['all_lps'] if 'all_train_lps' in f else None
-            all_test_lps = f['all_lps'] if 'all_train_lps' in f else None
+            all_train_lps = f['all_train_lps'] if 'all_train_lps' in f else None
+            all_test_lps = f['all_test_lps'] if 'all_test_lps' in f else None
             
         return hmm, epochs_completed, all_train_lps, all_test_lps
     
