@@ -25,8 +25,8 @@ import jax.random as jr
 
 from ssm_jax.hmm.models import GaussianHMM
 from kf import (FishPCDataset, FishPCLoader,
-                kmeans_initialization,
-                CheckpointDataclass)
+                initialize_gaussian_hmm, CheckpointDataclass
+               )
 
 DATADIR = os.environ['DATADIR']
 TEMPDIR = os.environ['DATADIR']
@@ -265,17 +265,24 @@ def main():
                    args.debug_max_files)
     
     if hmm is None:
+        prior_kwargs = dict(
+            emission_prior_scale= 1e-3, # default: 1e-4,
+            emission_prior_extra_df= 0.5, # default: 0.,
+        )
+
         tic = time.time()
-        if args.hmm_init_method == 'random':
-            hmm = GaussianHMM.random_initialization(seed_hmm, args.states, dataset.dim)
-        elif args.hmm_init_method == 'kmeans':
-            # TODO Consider bootstrapping covariance values (as opposed to using identity covariance)
-            # Subsampling at 1 frame/min
-            hmm = kmeans_initialization(seed_hmm, args.states, train_dl, step_size=1200)
+
+        # In kmeans, default step_size=1200 corresponds to subsampling at 1 frame/min
+        # FUTURE For k-means, consider bootstrapping covariance values (as opposed to using identity covariance).
+        hmm = initialize_gaussian_hmm(args.hmm_init_method,
+                                      seed_hmm, args.states, dataset.dim,
+                                      dataloader=train_dl, step_size=1200,
+                                      **prior_kwargs)
         toc = time.time()
         print(f"Initialized GaussianHMM using {args.hmm_init_method} init with {args.states} states. Elapsed time: {toc-tic:.1f}s\n")
 
     else:
+        # TODO Make sure "warm-start" takes prior values into account
         print(f"Warm-starting from {warm_ckp_path}, training from epoch {starting_epoch}...\n")
 
     # ==========================================================================

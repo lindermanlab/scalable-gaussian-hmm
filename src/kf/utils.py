@@ -12,17 +12,26 @@ from sklearn.cluster import KMeans
 from ssm_jax.hmm.models import GaussianHMM
 
 __all__ = [
-    'kmeans_initialization',
+    'initialize_gaussian_hmm',
     'CheckpointDataclass',
 ]
 
-def kmeans_initialization(seed, num_states, dataloader, step_size=1200,
-                          emission_covs_scale=1.):
-    """Initalize a GaussianHMM using k-means algorithm.
+def _random_init(seed, num_states, emission_dim):
+    """Randomly initialize GaussianHMM emissions parameters."""
+   
+    emission_means = jr.normal(seed, (num_states, emission_dim))
+    emission_covs = jnp.tile(jnp.eye(emission_dim), (num_states, 1, 1))
+
+    return emission_means, emission_covs
+
+def _kmeans_init(seed, num_states, emissions_dim, dataloader,
+                 step_size=1200, emission_covs_scale=1.,):
+    """Initialize GaussianHMM emission parameters from data via k-means algorithm.
     
     Args:
         seed (jr.PRNGKey):
         num_states (int): Number of clusters to fit
+        emissions_dim (int): Dimension of emissions
         dataloader (torch.utils.data.Dataloader):
         step_size (int): Number of frames between selected frames of a sequence,
             a larger value results in greater subsampling. Choose large enough
@@ -31,20 +40,18 @@ def kmeans_initialization(seed, num_states, dataloader, step_size=1200,
             (assuming that dataloader sequences are NOT subsampled)
         emission_covs_scale (float or None): Scale of emission covariances
             initialized to block identity matrices. If None, bootstrap emission
-            covariances from kmeans labels.
+            covariances from kmeans labels. TODO
     """
     
-    seed_kmeans, seed_initial, seed_transition = jr.split(seed, 3)
-
     # Get single batch from dataloader and pre-allocate array
     _batch = next(iter(dataloader))
-    batch_size, seq_length, dim = _batch.shape
-    subsampled = onp.empty((len(dataloader), batch_size, seq_length//step_size, dim))
+    batch_size, seq_length = _batch.shape[:-1]
+    subsampled = onp.empty((len(dataloader), batch_size, seq_length//step_size, emissions_dim))
 
-    # Get data from dataloader, and reshape to a 2-d array
+    # Get data from dataloader, and reshape to (num_samples, emission_dim) array
     for i, batch_emissions in enumerate(dataloader):
         subsampled[i] = batch_emissions[...,::step_size,:]
-    subsampled = subsampled.reshape(-1, dim)
+    subsampled = subsampled.reshape(-1, emissions_dim)
 
     # Print out some stats
     train_emissions = len(dataloader) * batch_size * seq_length
@@ -53,7 +60,7 @@ def kmeans_initialization(seed, num_states, dataloader, step_size=1200,
           f'Subsampled at {step_size / 60 / 20:.2f} frames / min.')
 
     # Set emission means and covariances based on fitted k-means clusters
-    kmeans = KMeans(num_states, random_state=int(seed_kmeans[-1])).fit(subsampled)
+    kmeans = KMeans(num_states, random_state=int(seed[-1])).fit(subsampled)
     emission_means = jnp.asarray(kmeans.cluster_centers_)
 
     if emission_covs_scale is None:
@@ -62,13 +69,48 @@ def kmeans_initialization(seed, num_states, dataloader, step_size=1200,
             jnp.cov(subsampled[labels==state], rowvar=False) for state in range(num_states)
         ])
     else: 
-        emission_covs = jnp.tile(jnp.eye(dim) * emission_covs_scale, (num_states, 1, 1))
+        emission_covs = jnp.tile(jnp.eye(emissions_dim) * emission_covs_scale, (num_states, 1, 1))
 
-    # Randomly set initial state and state transition probabilities
-    initial_probs = jr.dirichlet(seed_initial, jnp.ones(num_states))
-    transition_matrix = jr.dirichlet(seed_transition, jnp.ones(num_states), (num_states,))
+    return emission_means, emission_covs
 
-    return GaussianHMM(initial_probs, transition_matrix, emission_means, emission_covs)
+def initialize_gaussian_hmm(method, seed, num_states, emissions_dim,
+                            dataloader=None, step_size=1200, **prior_kwargs):
+    """Initialize GaussianHMM via random or k-means initialization.
+
+    Args
+        method (str): Initialization method, either 'random' or 'kmeans'
+        seed (jr.PRNGKey)
+        num_states (int)
+        emissions_dim (int)
+        dataloader (torch.utils.data.Dataloader): Training dataset that
+            k-means algorithm should fit to. Only used if method == 'kmeans'.
+        step_size (int): Training dataset subsampling rate. See description
+            in `_kmeans_init`. Only used if method == 'kmeans'.
+        **prior_kwargs: Prior parameters in specifying GaussianHMM. See
+            docs for GaussianHMM for list of parameters.
+    """
+    
+    seed_init, seed_trans, seed_emissions = jr.split(seed, 3)
+    
+    initial_probs = jr.dirichlet(seed_init, jnp.ones(num_states))
+    transition_matrix = jr.dirichlet(seed_trans, jnp.ones(num_states), (num_states,))
+    
+    if method == 'random':
+        emission_means, emission_covs \
+                        = _random_init(seed_emissions, num_states, emissions_dim)
+    elif method == 'kmeans':
+        emission_means, emission_covs \
+                        = _kmeans_init(seed_emissions, num_states, emissions_dim,
+                                       dataloader, step_size)
+    else:
+        raise ValueError(f"Expected method to be one of 'random' or 'kmeans', received {method}.")
+
+    return GaussianHMM(initial_probs,
+                       transition_matrix,
+                       emission_means,
+                       emission_covs,
+                       **prior_kwargs)
+        
 
 # ==============================================================================
 
