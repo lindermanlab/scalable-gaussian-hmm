@@ -29,7 +29,7 @@ from kf import (FishPCDataset, FishPCLoader,
                )
 
 DATADIR = os.environ['DATADIR']
-TEMPDIR = os.environ['DATADIR']
+TEMPDIR = os.environ['TEMPDIR']
 fish_id = 'fish0_137'
 
 # -------------------------------------
@@ -145,6 +145,8 @@ def setup_data(seed, batch_size, seq_length, split_sizes,
 
     return dataset, train_dl, test_dl
 
+# -------------------------------------
+
 def compute_exact_lp(hmm, dataloader):
     """Compute exact average log likelihood for a given HMM and dataset"""
 
@@ -162,6 +164,7 @@ def train_and_checkpoint(train_dataloader,
                          prev_train_lps=None,
                          prev_test_lps=None,
                          test_dataloader=None,
+                         verbose=False,
                          ):
     """Fit HMM via stochastic EM, with intermediate checkpointing. After final
     epoch, HMM is automatically checkpointed a final time.
@@ -179,9 +182,12 @@ def train_and_checkpoint(train_dataloader,
         test_dataloader (torch.utils.data.DataLoader): Iterable over test data.
             If not None, evaluate exact log probability on test data after each
             epoch. If None, do not calculate. Default: None
+        verbose (boolean): If True, print log-probabilities for each minibatch
+            in each epoch after each checkpoint interval. Default: False
     
     Returns
-        all_lps (array-like, length num_epochs): Mean expected log probabilities
+        all_lps (tuple of arrays): Mean expected log probabilities of model on
+            train (and test) datasets. Array shapes: (num_epochs, num_batches)
         ckp_path (str): Path to last checkpoint file
     
     TODO Expose learning_rate
@@ -223,8 +229,16 @@ def train_and_checkpoint(train_dataloader,
             train_lps = hmm.fit_stochastic_em(train_dataloader,
                                               train_dataloader.total_emissions,
                                               num_epochs=checkpoint.interval)
-        
+
         all_train_lps = onp.vstack([all_train_lps, train_lps])
+
+
+        if verbose:
+            for _epoch in range(len(train_lps)):
+                print(f"\nEpoch {last_epoch+_epoch:2d}\n---------")
+                print(f"Expected train:\n", train_lps[_epoch] / train_dataloader.total_emissions)
+                if test_lps is not None:
+                    print(f"\nExact test:\n", test_lps[_epoch / test_dataloader.total_emissions])
 
         this_epoch = last_epoch + checkpoint.interval
         
@@ -292,7 +306,8 @@ def main():
     fn_kwargs = {'starting_epoch': starting_epoch,
                  'prev_train_lps': prev_train_lps,
                  'prev_test_lps': prev_test_lps,
-                 'test_dataloader': test_dl}
+                 'test_dataloader': test_dl,
+                 'verbose': True}
     
     if args.mprof:
         mem_usage, (lps, last_ckp_path) = memory_usage(
@@ -308,20 +323,8 @@ def main():
     else:
         lps, last_ckp_path = fn(*fn_args, **fn_kwargs)
 
-    print('\nexpected_train_lls:')
-    train_lps, test_lps = lps
-    train_lps /= train_dl.total_emissions
-    if test_lps is not None:
-        test_lps /= test_dl.total_emissions
-
-    for epoch in range(len(train_lps)):
-        print(f"\nEpoch {epoch:2d}\n---------")
-        print(f"Expected train:\n", train_lps[epoch])
-        if test_lps is not None:
-            print(f"\nExact test:\n", test_lps[epoch])
-    
     if test_lps is None:
-        test_lp = compute_exact_lp(hmm, test_dataloader) / test_dl.total_emissions
+        test_lp = compute_exact_lp(hmm, test_dl) / test_dl.total_emissions
         print("\n Final test_lp: ", test_lp)
 
     print (f"\nTraining completed, latest checkpoint saved at {last_ckp_path}")
