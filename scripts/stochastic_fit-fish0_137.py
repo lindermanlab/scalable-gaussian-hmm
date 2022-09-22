@@ -11,6 +11,17 @@ how the code is written:
         correct process id and throws a NoProcessFound error. It still seems
         to be able record it when submitted as non-interactive job, but
         program fails when submitted interactively
+
+Flags to set in environment
+---------------------------
+REQUIRED
+    DATADIR - Folder path to where data folder (specified by `fish_id`) resides
+    TEMPDIR - Folder path to store output and log files
+
+OPTIONAL
+    JAX_ENABLE_X64 - True or False. If True, all computations performed in x64.
+    XLA_FLAGS=--xla_force_host_platform_device_count=
+        - Number of CPUs to make visible to JAX. Set if pmap-ing
 """
 
 import os
@@ -45,9 +56,6 @@ logger.addFilter(CheckTypesFilter())
 # -------------------------------------
 
 parser = argparse.ArgumentParser(description='Single-subject stochastic EM fit')
-parser.add_argument(
-    '--log_dir', type=str, default=TEMPDIR,
-    help='Directory to log profiles.')
 parser.add_argument(
     '--session_name', type=str, default=None,
     help='Identifying token,. Used for log and checkpoint files')
@@ -238,7 +246,7 @@ def train_and_checkpoint(train_dataloader,
                 print(f"\nEpoch {last_epoch+_epoch:2d}\n---------")
                 print(f"Expected train:\n", train_lps[_epoch] / train_dataloader.total_emissions)
                 if test_lps is not None:
-                    print(f"\nExact test:\n", test_lps[_epoch / test_dataloader.total_emissions])
+                    print(f"\nExact test:\n", test_lps[_epoch] / test_dataloader.total_emissions)
 
         this_epoch = last_epoch + checkpoint.interval
         
@@ -254,10 +262,13 @@ def main():
     # Set session name for identification and set folder to store all outputs
     timestamp = datetime.now().strftime("%y%m%d%H%M")
     session_name = timestamp if args.session_name is None else args.session_name
-    log_dir = os.path.join(args.log_dir, session_name)
+    log_dir = os.path.join(TEMP_DIR, session_name)
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     print(f"Output files will be logged to: {log_dir}\n")
+
+    # Print Jax precision
+    print(f"JAX in {jnp.array([1.2, 3.4]).dtype} mode\n")
 
     checkpointer = CheckpointDataclass(
         directory=os.path.join(log_dir, 'checkpoints'),

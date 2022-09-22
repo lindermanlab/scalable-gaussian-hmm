@@ -15,6 +15,14 @@ __all__ = [
     'FishPCLoader',
 ]
 
+# Match precision of datatype (mainly emissions) to JAX precision
+# Note that PC data is saved explicitly in float32
+if ('JAX_ENABLE_X64' in os.environ) and (os.environ['JAX_ENABLE_X64']=='True'):
+    float_precision = 'float64'
+else:
+    float_precision = 'float32'
+
+
 class FishPCDataset(Dataset):
     """
     Dataset class wrapping PC data of a single fish across its whole lifespan.
@@ -223,11 +231,12 @@ class FishPCDataset(Dataset):
         with h5py.File(self._filepaths[i_file], 'r') as f:
             data = onp.asarray(
                 f['stage/block0_values'][start_idx:end_idx:step_size],
-                dtype=onp.dtype('float32')
+                dtype=onp.dtype(float_precision)
             )
 
             if self.return_labels:
                 # TODO Return (fish_id, age, time-of-day) instead of timestamp
+                # TODO The float64 dtype will cause issues if we are in float32 mode...
                 timestamp = onp.asarray(
                     f['stage/block1_values'][start_idx:end_idx:step_size],
                     dtype=onp.dtype('float64')
