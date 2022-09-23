@@ -154,12 +154,17 @@ class CheckpointDataclass:
             os.makedirs(self.directory)
 
         # TODO Is there a better way to save using i.e. hmm.unconstrained_params?
+        emission_dim = hmm.emission_means.value.shape[-1]
         onp.savez_compressed(
             ckp_path,
             initial_probabilities = hmm.initial_probs.value,
             transition_matrix = hmm.transition_matrix.value,
             emission_means = hmm.emission_means.value,
             emission_covariance_matrices = hmm.emission_covariance_matrices.value,
+            emission_prior_mean = hmm._emission_prior_mean.value,
+            emission_prior_concentration = hmm._emission_prior_conc.value,
+            emission_prior_scale = hmm._emission_prior_scale.value,
+            emission_prior_extra_df = hmm._emission_prior_df.value - emission_dim,
             epochs_completed = this_epoch,
             **arrs)
         
@@ -171,7 +176,12 @@ class CheckpointDataclass:
         hmm_keys = ['initial_probabilities',
                     'transition_matrix',
                     'emission_means',
-                    'emission_covariance_matrices']
+                    'emission_covariance_matrices',
+                    'emission_prior_mean',
+                    'emission_prior_concentration',
+                    'emission_prior_scale',
+                    'emission_prior_extra_df',
+                    ]
         
         with onp.load(path) as f:
             epochs_completed = f['epochs_completed']
