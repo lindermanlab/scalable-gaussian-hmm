@@ -67,12 +67,12 @@ parser.add_argument(
     help='If specified, profile memory usage with memory_profiler.')
 
 parser.add_argument(
+    '--seed', type=int, required=True,
+    help='Initial RNG seed, for splitting data and intializing HMM.')
+parser.add_argument(
     '--hmm_init_method', type=str, default='random',
     choices=['random', 'kmeans'],
     help='HMM initialization method in the first epoch.')
-parser.add_argument(
-    '--seed', type=int, default=45212276,
-    help='Initial RNG seed, for splitting data and intializing HMM.')
 parser.add_argument(
     '--batch_size', type=int, default=1,
     help='Number of batches loaded per iteration.')
@@ -105,20 +105,30 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
 
 # -------------------------------------
 
-def setup_data(seed, batch_size, seq_length, split_sizes,
-               starting_epoch=0, DEBUG_MAX_FILES=-1):
-    """Construct training and validation dataloaders
-    TODO Remove DEBUG_MAX_FILES argument (args.argparse, filepaths)
-    """
+def setup(seed, checkpointer,
+         batch_size, seq_length, split_sizes, debug_max_files,
+          hmm_init_method, hmm_states):
+    """Initialize dataloaders, and initialize hmm or warm-start from last checkpoint."""
 
+    # Load checkpointed data from file, if it exists.
+    # Else, default values are (None, -1, None, None, None)
+    hmm, prev_epoch, prev_train_lps, prev_test_lps, warm_ckp_path \
+                                                    = checkpointer.load_latest()
+    starting_epoch = prev_epoch + 1
+    
+    seed_data, seed_hmm = jr.split(seed)
+    
+    # ===================
+    # SETUP DATALOADERS
+    # ===================
     print("\n======================")
     print("Setting up dataset...")
 
-    # We want dataset to be split the same way across epochs, to properly reserve
-    # test data -> so seed_split as independent of starting_epoch. However, the
-    # order of the minibatches should be shuffled every epoch. We can't control
-    # this precisely with torch.Generator, however, we can at least make sure
-    # it is different -> seed_dl_train folds in epoch information.
+    # We want dataset to be split the same way across epochs / warm-starts:
+    #   -> seed_split should be independent of starting_epoch.
+    # However, the order of the minibatches should be shuffled every epoch.
+    # We can't control this precisely with torch.Generator, but we can try:
+    #   -> seed_dl_train folds in epoch information.
     seed_split, seed_dl, seed_debug = jr.split(seed, 3)
     seed_dl_train = jr.fold_in(seed_dl, starting_epoch)
 
@@ -126,10 +136,9 @@ def setup_data(seed, batch_size, seq_length, split_sizes,
     fish_dir = os.path.join(DATADIR, fish_id)
     filepaths = sorted([os.path.join(fish_dir, f) for f in os.listdir(fish_dir)])
 
-    # TODO Hard limiting number of filepaths. Remove when done debugging
-    if DEBUG_MAX_FILES > 0:
-        print(f"!!! WARNING !!! Limiting total number of files loaded to {DEBUG_MAX_FILES}.")
-        idxs = jr.permutation(seed_debug, len(filepaths))[:DEBUG_MAX_FILES]
+    if debug_max_files > 0:
+        print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.")
+        idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
     dataset = FishPCDataset(filepaths, return_labels=False)
 
@@ -151,7 +160,29 @@ def setup_data(seed, batch_size, seq_length, split_sizes,
           + f"{len(test_dl):3d} batches of {batch_size} sequences per batch")
     print()
 
-    return dataset, train_dl, test_dl
+    # =============================
+    # INITIALIZE / WARM START HMM
+    # =============================
+    print("\n======================")
+    if hmm is not None:
+        print(f"Warm-starting from {warm_ckp_path}, training from epoch {starting_epoch}...\n")
+    else:
+        prior_kwargs = dict(
+            emission_prior_scale= 1e-3, # default: 1e-4,
+            emission_prior_extra_df= 0.5, # default: 0.,
+        )
+
+        tic = time.time()
+        # In kmeans, default step_size=1200 corresponds to subsampling at 1 frame/min
+        # FUTURE For k-means, consider bootstrapping covariance values (as opposed to using identity covariance).
+        hmm = initialize_gaussian_hmm(hmm_init_method,
+                                      seed_hmm, hmm_states, train_dl.dataset.dim,
+                                      dataloader=train_dl, step_size=1200,
+                                      **prior_kwargs)
+        toc = time.time()
+        print(f"Initialized GaussianHMM using {hmm_init_method} init with {hmm_states} states. Elapsed time: {toc-tic:.1f}s\n")        
+
+    return (train_dl, test_dl), hmm, starting_epoch, prev_train_lps, prev_test_lps
 
 # -------------------------------------
 
@@ -213,33 +244,28 @@ def train_and_checkpoint(train_dataloader,
         train_lps = onp.empty((checkpoint.interval, len(train_dataloader)))
         test_lps = onp.empty((checkpoint.interval, 1))
         for _epoch in range(checkpoint.interval):
-            train_lp = hmm.fit_stochastic_em(
+            train_lps[_epoch] = hmm.fit_stochastic_em(
                 train_dataloader, train_dataloader.total_emissions, num_epochs=1
             )
-
-            train_lps[_epoch] = train_lp
             test_lps[_epoch] = compute_exact_lp(hmm, test_dataloader)
-
         return (train_lps, test_lps)
 
-    if prev_train_lps is None:
-        prev_train_lps = onp.empty((0,len(train_dataloader)))
-    if prev_test_lps is None and test_dataloader:
-        prev_test_lps = onp.empty((0,1))
-    
-    all_train_lps = prev_train_lps
-    all_test_lps = prev_test_lps
+    # Setup log-prob trackers and begin fitting
+    all_train_lps = onp.empty((0,len(train_dataloader))) \
+                    if prev_train_lps is None \
+                    else prev_train_lps
+    all_test_lps = onp.empty((0,1)) \
+                   if ((prev_train_lps is None) and (test_dataloader is not None)) \
+                   else prev_train_lps
     for last_epoch in range(starting_epoch, num_epochs, checkpoint.interval):
-        if test_dataloader:
+        if test_dataloader is not None:
             train_lps, test_lps = _train_and_val()
             all_test_lps = onp.vstack([all_test_lps, test_lps])
         else:
             train_lps = hmm.fit_stochastic_em(train_dataloader,
                                               train_dataloader.total_emissions,
                                               num_epochs=checkpoint.interval)
-
         all_train_lps = onp.vstack([all_train_lps, train_lps])
-
 
         if verbose:
             for _epoch in range(len(train_lps)):
@@ -259,56 +285,35 @@ def train_and_checkpoint(train_dataloader,
 def main():
     args = parser.parse_args()
 
-    # Set session name for identification and set folder to store all outputs
+    # Set timestamp based default args if none specified
     timestamp = datetime.now().strftime("%y%m%d%H%M")
+    
     session_name = timestamp if args.session_name is None else args.session_name
-    log_dir = os.path.join(TEMP_DIR, session_name)
+    log_dir = os.path.join(TEMPDIR, session_name)
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     print(f"Output files will be logged to: {log_dir}\n")
 
-    # Print Jax precision
-    print(f"JAX in {jnp.array([1.2, 3.4]).dtype} mode\n")
+    # Set user-specified seed
+    seed = jr.PRNGKey(args.seed)
+    print(f"Setting user-specified seed: {args.seed}")
 
-    checkpointer = CheckpointDataclass(
-        directory=os.path.join(log_dir, 'checkpoints'),
-        interval=args.checkpoint_interval,
-        keep=-1,
-    )
+    # Print Jax precision
+    print(f"JAX using {jnp.array([1.2, 3.4]).dtype} precision\n")
 
     # ==========================================================================
     # Warm-start from last checkpoint, if available. Else, initialize hmm.
-    hmm, prev_epoch, prev_train_lps, prev_test_lps, warm_ckp_path \
-                                    = checkpointer.load_latest(return_path=True)
-    starting_epoch = prev_epoch + 1
-    
-    seed_data, seed_hmm = jr.split(jr.PRNGKey(args.seed))
-    
-    dataset, train_dl, test_dl = \
-        setup_data(seed_data, args.batch_size, args.seq_length,
-                   (args.train, args.test), starting_epoch,
-                   args.debug_max_files)
-    
-    if hmm is None:
-        prior_kwargs = dict(
-            emission_prior_scale= 1e-3, # default: 1e-4,
-            emission_prior_extra_df= 0.5, # default: 0.,
-        )
+    checkpointer = CheckpointDataclass(
+        directory=os.path.join(log_dir, 'checkpoints'),
+        interval=args.checkpoint_interval,
+    )
 
-        tic = time.time()
-
-        # In kmeans, default step_size=1200 corresponds to subsampling at 1 frame/min
-        # FUTURE For k-means, consider bootstrapping covariance values (as opposed to using identity covariance).
-        hmm = initialize_gaussian_hmm(args.hmm_init_method,
-                                      seed_hmm, args.states, dataset.dim,
-                                      dataloader=train_dl, step_size=1200,
-                                      **prior_kwargs)
-        toc = time.time()
-        print(f"Initialized GaussianHMM using {args.hmm_init_method} init with {args.states} states. Elapsed time: {toc-tic:.1f}s\n")
-
-    else:
-        # TODO Make sure "warm-start" takes prior values into account
-        print(f"Warm-starting from {warm_ckp_path}, training from epoch {starting_epoch}...\n")
+    (train_dl, test_dl), hmm, starting_epoch, prev_train_lps, prev_test_lps \
+                                        = setup(seed, checkpointer,
+                                                args.batch_size, args.seq_length,
+                                                (args.train, args.test),
+                                                args.debug_max_files,
+                                                args.hmm_init_method, args.states)
 
     # ==========================================================================
     # Run
@@ -334,6 +339,7 @@ def main():
     else:
         lps, last_ckp_path = fn(*fn_args, **fn_kwargs)
 
+    train_lps, test_lps = lps
     if test_lps is None:
         test_lp = compute_exact_lp(hmm, test_dl) / test_dl.total_emissions
         print("\n Final test_lp: ", test_lp)

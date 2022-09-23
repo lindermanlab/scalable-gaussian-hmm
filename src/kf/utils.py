@@ -191,7 +191,7 @@ class CheckpointDataclass:
             
         return hmm, epochs_completed, all_train_lps, all_test_lps
     
-    def load_latest(self, return_path=False):
+    def load_latest(self):
         """Load latest checkpoint (alphanumerically) in this instance's directory.
         
         Returns:
@@ -199,7 +199,7 @@ class CheckpointDataclass:
             prev_epoch (int):
             prev_train_lps (array-like or None):
             prev_test_lps (array-like or None):
-            ckp_path (str, optional): Path of file, returned if return_path=True
+            ckp_path (str): Path of latest file
         """
 
         existing_ckps = sorted(self._get_existing_files())
@@ -211,4 +211,4 @@ class CheckpointDataclass:
             last_ckp_path = None
             out = (None, -1, None, None)
         
-        return (*out, last_ckp_path) if return_path else out
+        return (*out, last_ckp_path)
