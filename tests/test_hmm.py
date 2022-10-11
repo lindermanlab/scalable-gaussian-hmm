@@ -178,12 +178,12 @@ def test_stochastic_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_si
     test_hmm = GaussianHMM.random_initialization(seed_init, n_states, n_dim)
 
     # Run stochastic EM to fit model to data
-    
     test_lps = test_hmm.fit_stochastic_em(emissions_loader, total_emissions, num_epochs=n_epochs)
     refr_lps = refr_hmm.fit_stochastic_em(emissions_loader, total_emissions, num_epochs=n_epochs)
 
     # Evaluate
+    
+    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-2)
+    assert jnp.allclose(refr_hmm.emission_covariance_matrices.value, test_hmm.emission_covariance_matrices.value, atol=1e-2)
+
     assert jnp.allclose(refr_lps, test_lps, atol=1e1)
-    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
-    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
-    assert jnp.allclose(refr_hmm.emission_covariance_matrices.value, test_hmm.emission_covariance_matrices.value, atol=1e-3)

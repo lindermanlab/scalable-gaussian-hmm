@@ -63,9 +63,9 @@ class NormalizedGaussianHMMSuffStats:
         normd_xxT = (normd_weights[...,None,None] * self.normd_xxT).sum(axis=axis, keepdims=keepdims)
 
         return NormalizedGaussianHMMSuffStats(
-            marginal_loglik=self.marginal_loglik.sum(axis=axis, keepdims=keepdims),
-            initial_probs=self.initial_probs.sum(axis=axis, keepdims=keepdims),
-            trans_probs=self.trans_probs.sum(axis=axis, keepdims=keepdims),
+            marginal_loglik=self.marginal_loglik.mean(axis=axis, keepdims=keepdims), # self.marginal_loglik.sum(axis=axis, keepdims=keepdims),
+            initial_probs=self.initial_probs.mean(axis=axis, keepdims=keepdims), # self.initial_probs.sum(axis=axis, keepdims=keepdims),
+            trans_probs=self.trans_probs.mean(axis=axis, keepdims=keepdims), # self.trans_probs.sum(axis=axis, keepdims=keepdims),
             weights=total_weights,
             normd_x=normd_x,
             normd_xxT=normd_xxT,
@@ -192,33 +192,6 @@ class GaussianHMM(StandardGaussianHMM):
         # Map the E step calculations over the batch_size dimension
         return vmap(_single_e_step)(batch_emissions)
 
-    # def _m_step_emissions(self, batch_emissions, batch_emission_stats, **kwargs):
-    #     """NAIVE METHOD: Unnormalize sufficient stats"""
-        # emission_stats = batch_emission_stats.reduce()
-
-        # # The expected log joint is equal to the log prob of a NIW distribution,
-        # # up to additive factors. Find this NIW distribution and take its mode.
-        # niw_prior = NormalInverseWishart(loc=self._emission_prior_mean.value,
-        #                                  mean_concentration=self._emission_prior_conc.value,
-        #                                  df=self._emission_prior_df.value,
-        #                                  scale=self._emission_prior_scale.value)
-
-        # # Find the posterior parameters of the NIW distribution
-        # def _single_m_step(sum_x, sum_xxT, sum_w):
-        #     niw_posterior = niw_posterior_update(niw_prior, (sum_x, sum_xxT, sum_w))
-        #     return niw_posterior.mode()
-
-        # import pdb; pdb.set_trace()
-
-        # # NAIVE/ORIGINAL APPROACH: Unnormalize sufficient statistics
-        # Sx, SxxT, N = emission_stats.normd_x, emission_stats.normd_xxT, emission_stats.weights
-        # Sx *= N[:,None]
-        # SxxT *= N[:,None,None]
-
-        # covs, means = vmap(_single_m_step)(Sx, SxxT, N)
-        # self.emission_covariance_matrices.value = covs
-        # self.emission_means.value = means
-
     def _m_step_emissions(self, batch_emissions, batch_emission_stats, **kwargs):
         """WISE METHOD: Calculate mode directly from normalized natural stats"""
 
@@ -237,7 +210,7 @@ class GaussianHMM(StandardGaussianHMM):
             self._emission_prior_scale.value,
             self._emission_prior_df.value
             )
-            
+
         normd_natural_prior = tree_map(
             lambda param, n: param/n,
             natural_prior, (N, N[:,None,None], N[:,None], N)
@@ -330,50 +303,56 @@ class GaussianHMM(StandardGaussianHMM):
 
             # Compute the sufficient stats given a minibatch of emissions
             self.unconstrained_params = params
-            normd_minibatch_stats = self.e_step(minibatch_emissions)            # leadig shape (B,K,...)
-            normd_minibatch_stats = normd_minibatch_stats.reduce()              # leading shape (K,...)
+            normd_minibatch_stats = self.e_step(minibatch_emissions)            # leading shape (B,K,...)
+            normd_minibatch_stats = normd_minibatch_stats.reduce(keepdims=True) # leading shape (1,K,...)
             
-
             # Incorporate the minibatch stats into the rolling averaged stats
+            # Since we are working with normd stats, do not need to include scaling...
+            # This may not be true anymore...
             normd_rolling_stats = tree_map(
                 lambda ss0, ss1: (1-learning_rate) * ss0 + learning_rate * ss1,
                 normd_rolling_stats, normd_minibatch_stats
             )
 
-            # TODO should I divide log_prior by total number of emissions?
+            # summed stats should still be scaled as
+            # (1-learning_rate) * ss0 + learning_rate * total_emissions/ * ss1
+
             # previously, this expected lp was calculated from scaled_minibatch_stats
             # (i.e scaled to be from the whole dataset). this normalized version is
             # more akin to...average margin loglik per emission?
-            expected_lp = self.log_prior() + normd_minibatch_stats.marginal_loglik
+            
+            # If we do this...consistently smaller by a factor of 5...
+            # n_batches = 5 = N/n = scaling factor!
+            # expected_lp = self.log_prior()/normd_minibatch_stats.weights.sum() + normd_minibatch_stats.marginal_loglik
+            
+            # If we do this...still consistently smaller by a factor of 5...
+            # this is because of the way we are scaling this value now, versus scaling
+            # the unnormalized vbalues
+            expected_lp = self.log_prior() + normd_minibatch_stats.marginal_loglik.squeeze()
 
-            # Add a batch dimension and call M-step
-            # TODO can this be simplified since we're performing our own M-step
-            # batched_rolling_stats = tree_map(
-            #             lambda x: jnp.expand_dims(x, axis=0), normd_rolling_stats
-            # )
-            batched_rolling_stats = normd_rolling_stats
-            self.m_step(minibatch_emissions, batched_rolling_stats)
+            # Call M-step
+            self.m_step(minibatch_emissions, normd_rolling_stats)
 
             return (self.unconstrained_params, normd_rolling_stats), expected_lp
 
         # Initialize and train
-        expected_log_probs = []
+        expected_log_probs = jnp.empty((0, len(emissions_generator)))
         params = self.unconstrained_params
         normd_rolling_stats = self._zeros_like_suff_stats()
         for epoch in trange(num_epochs):
 
-            epoch_expected_lp = 0.
+            epoch_expected_lps = []
             for minibatch, minibatch_emissions in enumerate(emissions_generator):
                 (params, normd_rolling_stats), minibatch_expected_lp = \
                     minibatch_em_step(
                         (params, normd_rolling_stats),
                         (minibatch_emissions, learning_rates[epoch][minibatch]),
                     )
-                epoch_expected_lp += minibatch_expected_lp
+                epoch_expected_lps.append(minibatch_expected_lp)
 
             # Save epoch mean of expected log probs
-            expected_log_probs.append(epoch_expected_lp / num_batches)
+            expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
 
         # Update self with fitted params
         self.unconstrained_params = params
-        return jnp.array(expected_log_probs)
+        return jnp.asarray(expected_log_probs)
