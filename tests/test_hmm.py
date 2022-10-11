@@ -133,7 +133,7 @@ class ArrayLoader(DataLoader):
             drop_last=drop_last
             )
 
-def test_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_size=4, n_epochs=10):
+def test_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_size=4, n_epochs=5):
     """Test equivalence of the full-batch EM algorithm results between this
     GaussianHMM using normalized sufficient stats with the StanfardGaussianHMM."""
 
@@ -150,12 +150,40 @@ def test_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_size=4, n_epo
     test_hmm = GaussianHMM.random_initialization(seed_init, n_states, n_dim)
 
     # Run stochastic EM to fit model to data
-    refr_lps = refr_hmm.fit_em(batch_emissions, n_epochs)
     test_lps = test_hmm.fit_em(batch_emissions, n_epochs)
+    refr_lps = refr_hmm.fit_em(batch_emissions, n_epochs)
 
     # Evaluate
     assert jnp.allclose(refr_lps, test_lps, atol=1e1)
-    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, tol=1e-3)
-    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, tol=1e-3)
+    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
+    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
     assert jnp.allclose(refr_hmm.emission_covariance_matrices.value, test_hmm.emission_covariance_matrices.value, atol=1e-3)
 
+def test_stochastic_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_size=4, n_epochs=5):
+    """Test equivalence of the stochastic EM algorithm results between this
+    GaussianHMM using normalized sufficient stats with the StanfardGaussianHMM."""
+
+    seed_sample, seed_init = jr.split(jr.PRNGKey(9238))
+    
+    # Make true HMM and generate emissions
+    true_hmm_params = make_rnd_hmm_params(n_states, n_dim)
+    true_hmm = StandardGaussianHMM(*true_hmm_params)
+    _, batch_emissions = vmap(true_hmm.sample, in_axes=(0, None))\
+                             (jr.split(seed_sample, n_batches), n_steps)
+    emissions_loader = ArrayLoader(batch_emissions, batch_size)
+    total_emissions = n_batches * n_steps
+
+    # Randomly initialize test and reference GaussianHMM
+    refr_hmm = StandardGaussianHMM.random_initialization(seed_init, n_states, n_dim)
+    test_hmm = GaussianHMM.random_initialization(seed_init, n_states, n_dim)
+
+    # Run stochastic EM to fit model to data
+    
+    test_lps = test_hmm.fit_stochastic_em(emissions_loader, total_emissions, num_epochs=n_epochs)
+    refr_lps = refr_hmm.fit_stochastic_em(emissions_loader, total_emissions, num_epochs=n_epochs)
+
+    # Evaluate
+    assert jnp.allclose(refr_lps, test_lps, atol=1e1)
+    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
+    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
+    assert jnp.allclose(refr_hmm.emission_covariance_matrices.value, test_hmm.emission_covariance_matrices.value, atol=1e-3)
