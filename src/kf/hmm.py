@@ -213,7 +213,7 @@ class GaussianHMM(StandardGaussianHMM):
         self.unconstrained_params = params
         return jnp.array(log_probs)
 
-    def fit_stochastic_em(self, emissions_generator, total_emissions, schedule=None, nepochs=50):
+    def fit_stochastic_em(self, emissions_generator, schedule=None, nepochs=50):
         """Fit this HMM by running Stochastic Expectation-Maximization.
 
         Assuming the original dataset consists of B*M independent sequences of
@@ -258,7 +258,7 @@ class GaussianHMM(StandardGaussianHMM):
         assert learning_rates[0] == 1.0, "Learning rate must start at 1."
         learning_rates = learning_rates.reshape(nepochs, nbatches)
 
-        # @jit
+        @jit
         def minibatch_em_step(carry, inputs):
             params, normd_rolling_stats = carry
             minibatch_emissions, learning_rate = inputs
