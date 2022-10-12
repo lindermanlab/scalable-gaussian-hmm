@@ -18,55 +18,6 @@ def random_initialization(seed, nstates, ndim):
     
     return initial_probs, transition_matrix, emission_means, emission_covs
 
-def test_suffstats_add_reduce():
-    """Test equivalence of sum and reduce methods for suff stats class."""
-
-    nstates = 4
-    ndim = 3
-
-    seed_1, seed_2 = jr.split(jr.PRNGKey(1283))
-
-    n_batches = 2
-    initial_probs, trans_probs, normd_x, normd_xxT = \
-        vmap(partial(random_initialization, nstates=nstates, ndim=ndim)) \
-        (jr.split(seed_1, n_batches))
-
-    weights = jr.uniform(seed_2, (n_batches, nstates), minval=0., maxval=1.,)
-    marginal_loglik = jnp.array([-340., -20])
-    ss0 = NormalizedGaussianHMMSuffStats(
-        marginal_loglik=marginal_loglik,
-        initial_probs=initial_probs,
-        trans_probs=trans_probs,
-        weights=weights,
-        normd_x=normd_x,
-        normd_xxT=normd_xxT,
-    )
-
-    ss1 = NormalizedGaussianHMMSuffStats(
-        marginal_loglik=marginal_loglik[0],
-        initial_probs=initial_probs[0],
-        trans_probs=trans_probs[0],
-        weights=weights[0],
-        normd_x=normd_x[0],
-        normd_xxT=normd_xxT[0],
-    )
-
-    ss2 = NormalizedGaussianHMMSuffStats(
-        marginal_loglik=marginal_loglik[1],
-        initial_probs=initial_probs[1],
-        trans_probs=trans_probs[1],
-        weights=weights[1],
-        normd_x=normd_x[1],
-        normd_xxT=normd_xxT[1],
-    )
-    
-    ss_reduce = ss0.reduce()
-    ss_summed = ss1 + ss2
-
-    assert ss_reduce.marginal_loglik == ss_summed.marginal_loglik == -360.
-    assert all(tree_map(lambda a,b: jnp.all(jnp.equal(a,b)), ss_reduce, ss_summed))
-
-
 def test_suffstats_reduce_batch():
     """Reducing a suff stats class with leading dimension (1,) should return itself."""
 
@@ -76,16 +27,15 @@ def test_suffstats_reduce_batch():
     seed_1, seed_2 = jr.split(jr.PRNGKey(1283))
 
     initial_probs, trans_probs, normd_x, normd_xxT = \
-        random_initialization(seed_1, nstates, ndim)
+                                random_initialization(seed_1, nstates, ndim)
     weights = jr.uniform(seed_2, (nstates,), minval=0., maxval=1.,)
     marginal_loglik = jnp.array(-120.)
     ss = NormalizedGaussianHMMSuffStats(
-        marginal_loglik=marginal_loglik,
         initial_probs=initial_probs,
         trans_probs=trans_probs,
-        weights=weights,
         normd_x=normd_x,
         normd_xxT=normd_xxT,
+        weights=weights,
     )
 
     ss_batch = tree_map(lambda x: jnp.expand_dims(x, axis=0), ss)
@@ -153,11 +103,12 @@ def test_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_size=4, n_epo
     test_lps = test_hmm.fit_em(batch_emissions, n_epochs)
     refr_lps = refr_hmm.fit_em(batch_emissions, n_epochs)
 
-    # Evaluate
-    assert jnp.allclose(refr_lps, test_lps, atol=1e1)
-    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
+    # Evaluate emission parameters, trasition parameters, lps
     assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
     assert jnp.allclose(refr_hmm.emission_covariance_matrices.value, test_hmm.emission_covariance_matrices.value, atol=1e-3)
+    assert jnp.allclose(refr_hmm.initial_probs.value, test_hmm.initial_probs.value, atol=1e-3)
+    assert jnp.allclose(refr_hmm.transition_matrix.value, test_hmm.transition_matrix.value, atol=1e-3)
+    assert jnp.allclose(refr_lps, test_lps, atol=1e1)
 
 def test_stochastic_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_size=4, n_epochs=5):
     """Test equivalence of the stochastic EM algorithm results between this
@@ -178,12 +129,12 @@ def test_stochastic_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_si
     test_hmm = GaussianHMM.random_initialization(seed_init, n_states, n_dim)
 
     # Run stochastic EM to fit model to data
-    test_lps = test_hmm.fit_stochastic_em(emissions_loader, total_emissions, num_epochs=n_epochs)
+    test_lps = test_hmm.fit_stochastic_em(emissions_loader, total_emissions, nepochs=n_epochs)
     refr_lps = refr_hmm.fit_stochastic_em(emissions_loader, total_emissions, num_epochs=n_epochs)
 
-    # Evaluate
-    
+    # Evaluate emission parameters, trasition parameters, lps
     assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-2)
     assert jnp.allclose(refr_hmm.emission_covariance_matrices.value, test_hmm.emission_covariance_matrices.value, atol=1e-2)
-
+    assert jnp.allclose(refr_hmm.initial_probs.value, test_hmm.initial_probs.value, atol=1e-2)
+    assert jnp.allclose(refr_hmm.transition_matrix.value, test_hmm.transition_matrix.value, atol=1e-2)
     assert jnp.allclose(refr_lps, test_lps, atol=1e1)

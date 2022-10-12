@@ -16,6 +16,7 @@ import optax
 from jax import vmap, lax, jit
 from jax.tree_util import register_pytree_node_class
 from jax.tree_util import tree_map
+from functools import partial
 
 from ssm_jax.hmm.inference import compute_transition_probs
 from ssm_jax.hmm.inference import hmm_smoother
@@ -47,58 +48,32 @@ def niw_natural_to_mean_params(eta_1, eta_2, eta_3, eta_4):
 
 @chex.dataclass
 class NormalizedGaussianHMMSuffStats:
-    marginal_loglik: chex.Array # scalar array
-    initial_probs: chex.Array
-    trans_probs: chex.Array
-    weights: chex.Array         # still equivalent to sum_w
-    normd_x: chex.Array
-    normd_xxT: chex.Array
+    """All sufficienti stats are weighted by `weights`."""
+    initial_probs: chex.Array   # (K,)
+    trans_probs: chex.Array     # (K,K)
+    normd_x: chex.Array         # (K,D)
+    normd_xxT: chex.Array       # (K,D,D)
+    weights: chex.Array         # (K,)
 
     def reduce(self, axis=0, keepdims=False):
-        """Perform weighted summation along specified axis to reduce batch instance."""
+        """Perform weighted summation along the indicated axes.
+        Does NOT check if dataclass is already minimal (i.e. batch_shape=()).
+        """
         
         total_weights = self.weights.sum(axis=axis, keepdims=keepdims)
         normd_weights = self.weights / total_weights
-        normd_x = (normd_weights[...,None] * self.normd_x).sum(axis=axis, keepdims=keepdims)
-        normd_xxT = (normd_weights[...,None,None] * self.normd_xxT).sum(axis=axis, keepdims=keepdims)
+        _reduce = (lambda ss, shp: 
+            (jnp.expand_dims(normd_weights, shp)*ss).sum(axis=axis, keepdims=keepdims)
+        )
 
         return NormalizedGaussianHMMSuffStats(
-            marginal_loglik=self.marginal_loglik.mean(axis=axis, keepdims=keepdims), # self.marginal_loglik.sum(axis=axis, keepdims=keepdims),
-            initial_probs=self.initial_probs.mean(axis=axis, keepdims=keepdims), # self.initial_probs.sum(axis=axis, keepdims=keepdims),
-            trans_probs=self.trans_probs.mean(axis=axis, keepdims=keepdims), # self.trans_probs.sum(axis=axis, keepdims=keepdims),
+            initial_probs=self.initial_probs.sum(axis=axis, keepdims=keepdims),
+            trans_probs=self.trans_probs.sum(axis=axis, keepdims=keepdims),
+            normd_x=_reduce(self.normd_x, (-1)),
+            normd_xxT=_reduce(self.normd_xxT, (-1,-2)),
             weights=total_weights,
-            normd_x=normd_x,
-            normd_xxT=normd_xxT,
         )
-
-    def __add__(self, other):
-        total_weights = self.weights + other.weights
-        
-        these_weights = self.weights/total_weights
-        other_weights = other.weights/total_weights
-        
-        normd_x = these_weights[...,None] * self.normd_x \
-                  + other_weights[...,None] * other.normd_x
-        normd_xxT = these_weights[...,None,None] * self.normd_xxT \
-                    + other_weights[...,None,None] * other.normd_xxT
-
-        return NormalizedGaussianHMMSuffStats(
-            marginal_loglik=self.marginal_loglik+other.marginal_loglik,
-            initial_probs=self.initial_probs+other.initial_probs,
-            trans_probs=self.trans_probs+other.trans_probs,
-            weights=total_weights,
-            normd_x=normd_x,
-            normd_xxT=normd_xxT,
-        )
-    
-    def __radd__(self, other):
-        return lax.cond(
-            other==0,
-            lambda x: x,
-            lambda x: x.__add__(other),
-            self
-        )
-        
+            
 @register_pytree_node_class
 class GaussianHMM(StandardGaussianHMM):
     def __init__(self,
@@ -127,18 +102,15 @@ class GaussianHMM(StandardGaussianHMM):
         )
     
     def _zeros_like_suff_stats(self):
-        dim = self.num_obs
-        num_states = self.num_states
+        K, D = self.num_states, self.num_obs
         return NormalizedGaussianHMMSuffStats(
-            marginal_loglik=jnp.zeros(()),
-            initial_probs=jnp.zeros((num_states,)),
-            trans_probs=jnp.zeros((num_states, num_states)),
-            weights=jnp.zeros((num_states,)),
-            normd_x=jnp.zeros((num_states, dim)),
-            normd_xxT=jnp.zeros((num_states, dim, dim)),
+            initial_probs=jnp.zeros((K,)),
+            trans_probs=jnp.zeros((K, K)),
+            normd_x=jnp.zeros((K, D)),
+            normd_xxT=jnp.zeros((K, D, D)),
+            weights=jnp.zeros((K,)),
         )
-            
-
+    
     def e_step(self, batch_emissions):
         """Compute the expected sufficient statistics under the posterior.
 
@@ -150,7 +122,8 @@ class GaussianHMM(StandardGaussianHMM):
             batch_emissions, ndarray, shape (batch_size, num_timesteps, obs_dim)
 
         Returns
-            NormalizedGaussianHMMSuffStats, dataclass with leading (batch_size,)
+            NormalizedGaussianHMMSuffStats, dataclass with leading (batch_size,...)
+            posterior_marginal_logliklihood, array with shape (batch_size,)
         """
 
         def _single_e_step(emissions):
@@ -161,49 +134,34 @@ class GaussianHMM(StandardGaussianHMM):
             # Compute the initial state and transition probabilities
             trans_probs = compute_transition_probs(self.transition_matrix.value, posterior)
 
-            # ---------------------------
-            # COMPUTE NORMALIZED WEIGHTS
-            # ---------------------------
+            # Compute normalized weights
             total_weights = jnp.einsum("tk->k", posterior.smoothed_probs)       # shape (K,)
             normd_weights = jnp.where(                                          # shape (T,K)
                 total_weights[None,:] > 0.,  
                 posterior.smoothed_probs / total_weights, 
                 0.)
             
-            # vvv THIS BREAKS THE INFERENCE vvv .. why??
-            # Equivalent to each emissions having a weight of 1
-            # total_weights = jnp.ones(self.num_states) * len(emissions)
-            # total_weights = jnp.ones(self.num_states) * 200
-            # normd_weights = posterior.smoothed_probs / total_weights
-    
-            # Compute the normalized expected sufficient statistics
-            normd_x = jnp.einsum("tk,ti->ki", normd_weights, emissions)
-            normd_xxT = jnp.einsum("tk,ti,tj->kij", normd_weights, emissions, emissions)
-
-            return NormalizedGaussianHMMSuffStats(
-                marginal_loglik=posterior.marginal_loglik,
+            # Compute normalized expected sufficient statistics, store normalizer
+            normd_stats = NormalizedGaussianHMMSuffStats(
                 initial_probs=posterior.initial_probs,
                 trans_probs=trans_probs,
+                normd_x=jnp.einsum("tk,ti->ki", normd_weights, emissions),
+                normd_xxT=jnp.einsum("tk,ti,tj->kij", normd_weights, emissions, emissions),
                 weights=total_weights,
-                normd_x=normd_x,
-                normd_xxT=normd_xxT,
             )
+
+            return (normd_stats, posterior.marginal_loglik)
 
         # Map the E step calculations over the batch_size dimension
         return vmap(_single_e_step)(batch_emissions)
 
     def _m_step_emissions(self, batch_emissions, batch_emission_stats, **kwargs):
-        """WISE METHOD: Calculate mode directly from normalized natural stats"""
+        """Calculate emission parameter mode directly from normalized posterior."""
 
-        emission_stats = batch_emission_stats.reduce()
-        normd_suff_stats = (jnp.ones(self.num_states),
-                            emission_stats.normd_xxT,
-                            emission_stats.normd_x,
-                            jnp.ones(self.num_states)
-                            )
-
-        # Normalize the natural prior params by cumulative state weight. N has shape (K,)
-        N = emission_stats.weights
+        # Reduce stats along the batch dimension. Fields have leading shape (K,...)
+        normd_emission_stats = batch_emission_stats.reduce()
+        
+        # Normalize the natural params of the prior
         natural_prior = niw_mean_to_natural_params(
             self._emission_prior_mean.value,
             self._emission_prior_conc.value,
@@ -212,23 +170,27 @@ class GaussianHMM(StandardGaussianHMM):
             )
 
         normd_natural_prior = tree_map(
-            lambda param, n: param/n,
-            natural_prior, (N, N[:,None,None], N[:,None], N)
+            lambda param, shp: param/jnp.expand_dims(normd_emission_stats.weights, shp),
+            natural_prior, ((), (-1,-2), (-1), ())
         )
 
-        # Calculate the natural posterior parameters
-        normd_natural_posterior = tree_map(jnp.add, normd_suff_stats, normd_natural_prior)
+        # Calculate the natural parameters of the posterior
+        normd_natural_posterior = tree_map(
+            jnp.add,
+            normd_natural_prior,
+            (jnp.ones(self.num_states), normd_emission_stats.normd_xxT, normd_emission_stats.normd_x, jnp.ones(self.num_states))
+        )
 
         # Compute modal mean and covariance parameters for each state
         def _single_m_step(normd_eta_1, normd_eta_2, normd_eta_3, normd_eta_4):
             loc, _, scale, _ = niw_natural_to_mean_params(
-                normd_eta_1, normd_eta_2, normd_eta_3, normd_eta_4
+                    normd_eta_1, normd_eta_2, normd_eta_3, normd_eta_4
             )
             cov = scale / normd_eta_1
             return loc, cov
         
+        # Map the M-step over the states dimension
         means, covs = vmap(_single_m_step)(*normd_natural_posterior)
-
         self.emission_covariance_matrices.value = covs
         self.emission_means.value = means
 
@@ -237,8 +199,8 @@ class GaussianHMM(StandardGaussianHMM):
         @jit
         def em_step(params):
             self.unconstrained_params = params
-            batch_posteriors = self.e_step(batch_emissions)
-            lp = self.log_prior() + batch_posteriors.marginal_loglik.sum()
+            batch_posteriors, batch_marginal_lls = self.e_step(batch_emissions)
+            lp = self.log_prior() + batch_marginal_lls.sum()
             self.m_step(batch_emissions, batch_posteriors, **kwargs)
             return self.unconstrained_params, lp
 
@@ -251,7 +213,7 @@ class GaussianHMM(StandardGaussianHMM):
         self.unconstrained_params = params
         return jnp.array(log_probs)
 
-    def fit_stochastic_em(self, emissions_generator, total_emissions, schedule=None, num_epochs=50):
+    def fit_stochastic_em(self, emissions_generator, total_emissions, schedule=None, nepochs=50):
         """Fit this HMM by running Stochastic Expectation-Maximization.
 
         Assuming the original dataset consists of B*M independent sequences of
@@ -276,25 +238,25 @@ class GaussianHMM(StandardGaussianHMM):
                 will load. Used to scale the minibatch statistics.
             schedule (optax schedule, Callable: int -> [0, 1]): Learning rate
                 schedule; defaults to exponential schedule.
-            num_epochs (int): Num of iterations made through the entire dataset.
+            nepochs (int): Num of iterations made through the entire dataset.
         Returns:
             expected_log_prob (chex.Array): Mean expected log prob of each epoch.
         """
 
-        num_batches = len(emissions_generator)
+        nbatches = len(emissions_generator)
 
-        # Set global training learning rates: shape (num_epochs, num_batches)
+        # Set global training learning rates: shape (nepochs, nbatches)
         if schedule is None:
             schedule = optax.exponential_decay(
                 init_value=1.,
                 end_value=0.,
-                transition_steps=num_batches,
+                transition_steps=nbatches,
                 decay_rate=.95,
             )
 
-        learning_rates = schedule(jnp.arange(num_epochs * num_batches))
+        learning_rates = schedule(jnp.arange(nepochs * nbatches))
         assert learning_rates[0] == 1.0, "Learning rate must start at 1."
-        learning_rates = learning_rates.reshape(num_epochs, num_batches)
+        learning_rates = learning_rates.reshape(nepochs, nbatches)
 
         # @jit
         def minibatch_em_step(carry, inputs):
@@ -303,35 +265,46 @@ class GaussianHMM(StandardGaussianHMM):
 
             # Compute the sufficient stats given a minibatch of emissions
             self.unconstrained_params = params
-            normd_minibatch_stats = self.e_step(minibatch_emissions)            # leading shape (B,K,...)
-            normd_minibatch_stats = normd_minibatch_stats.reduce(keepdims=True) # leading shape (1,K,...)
-            
-            # Incorporate the minibatch stats into the rolling averaged stats
-            # Since we are working with normd stats, do not need to include scaling...
-            # This may not be true anymore...
-            normd_rolling_stats = tree_map(
-                lambda ss0, ss1: (1-learning_rate) * ss0 + learning_rate * ss1,
-                normd_rolling_stats, normd_minibatch_stats
-            )
+            normd_minibatch_stats, minibatch_marginal_lls = self.e_step(minibatch_emissions)
 
-            # summed stats should still be scaled as
-            # (1-learning_rate) * ss0 + learning_rate * total_emissions/ * ss1
-
-            # previously, this expected lp was calculated from scaled_minibatch_stats
-            # (i.e scaled to be from the whole dataset). this normalized version is
-            # more akin to...average margin loglik per emission?
+            # Reduce batched stats so that fields have leading shape (K,...)
+            normd_minibatch_stats = normd_minibatch_stats.reduce()
             
-            # If we do this...consistently smaller by a factor of 5...
-            # n_batches = 5 = N/n = scaling factor!
-            # expected_lp = self.log_prior()/normd_minibatch_stats.weights.sum() + normd_minibatch_stats.marginal_loglik
-            
-            # If we do this...still consistently smaller by a factor of 5...
-            # this is because of the way we are scaling this value now, versus scaling
-            # the unnormalized vbalues
-            expected_lp = self.log_prior() + normd_minibatch_stats.marginal_loglik.squeeze()
+            # Calculate expected log probability of the scaled minibatch
+            expected_lp = self.log_prior() + nbatches * minibatch_marginal_lls.sum()
 
+            # Incorporate minibatch stats into the rolling averaged stats
+            def _roll_in(rr, bb): 
+                # update function for unnormalized / summed statistics
+                _update = (lambda rolling, batch:
+                    (1-learning_rate) * rolling + learning_rate * nbatches * batch
+                )
+                
+                # update function for normalized statistics
+                w_r = (1-learning_rate) * rr.weights
+                w_b = learning_rate * nbatches * bb.weights
+                w_s = w_r + w_b
+
+                _weighted_update = (lambda rolling, batch:
+                    jnp.einsum('k,k...->k...', w_r/w_s, rolling)
+                    + jnp.einsum('k,k...->k...', w_b/w_s, batch)
+                )
+
+                return NormalizedGaussianHMMSuffStats(
+                    initial_probs=_update(rr.initial_probs, bb.initial_probs),
+                    trans_probs=_update(rr.trans_probs, bb.trans_probs),
+                    normd_x=_weighted_update(rr.normd_x, bb.normd_x),
+                    normd_xxT=_weighted_update(rr.normd_xxT, bb.normd_xxT),
+                    weights=w_s,
+                )
+
+            normd_rolling_stats = _roll_in(normd_rolling_stats, normd_minibatch_stats)            
+            
             # Call M-step
-            self.m_step(minibatch_emissions, normd_rolling_stats)
+            batch_normd_rolling_stats = tree_map(
+                partial(jnp.expand_dims, axis=0), normd_rolling_stats
+            )
+            self.m_step(minibatch_emissions, batch_normd_rolling_stats)
 
             return (self.unconstrained_params, normd_rolling_stats), expected_lp
 
@@ -339,8 +312,7 @@ class GaussianHMM(StandardGaussianHMM):
         expected_log_probs = jnp.empty((0, len(emissions_generator)))
         params = self.unconstrained_params
         normd_rolling_stats = self._zeros_like_suff_stats()
-        for epoch in trange(num_epochs):
-
+        for epoch in trange(nepochs):
             epoch_expected_lps = []
             for minibatch, minibatch_emissions in enumerate(emissions_generator):
                 (params, normd_rolling_stats), minibatch_expected_lp = \
