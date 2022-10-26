@@ -1,26 +1,33 @@
 """Code for performing inference in Gaussian HMMs using normalized sufficient
 statistics and an inverse Wishart prior.
 
-Indirectly inherits heavily from the Dynamax codebase, whose functionality
-this codebase. The main changes here are the 
+Indirectly inherits heavily from the Dynamax codebase, to which this codebase was 
+once tied much more closely. The main changes here are breaking out of the class
+structure to ensure compatibility with jax and lax parallelization functions.
 """
 
 from collections import namedtuple
-from functools import partial
-from tqdm.auto import trange
-
 import jax.numpy as jnp
 import jax.random as jr
-from jax import vmap, lax, jit
+from jax import vmap, lax
 from jax.tree_util import tree_map
-import optax
 
 from tensorflow_probability.substrates.jax.distributions import (
-    Dirichlet, Categorical, MultivariateNormalFullCovariance as MVNFull
-)
+    Dirichlet, Categorical, MultivariateNormalFullCovariance as MVNFull)
 from dynamax.distributions import NormalInverseWishart
 
-from dynamax.hmm.inference import hmm_smoother, compute_transition_probs
+from dynamax.hmm.inference import hmm_smoother, hmm_posterior_mode, compute_transition_probs
+
+__all__ = [
+    'Parameters',
+    'PriorParameters',
+    'log_prob',
+    'conditional_log_likelihood',
+    'most_likely_states',
+    'sample',
+    'e_step',
+    'm_step',
+]
 
 # =============================================================================
 #
@@ -39,6 +46,7 @@ PriorParameters = namedtuple(
     defaults=[1.1, 1.1, 0.0, 1e-4, 1e-4, 0.1]
 )
 
+# TODO Remove this and just break out the values. This is superfluous.
 HiddenMarkovChainStatistics = namedtuple(
     'HiddenMarkovChainStatistics',
     ['initial_probs', 'transition_probs']
@@ -57,7 +65,7 @@ NormalizedGaussianStatistics = namedtuple(
     ['normalized_x', 'normalized_xxT', 'normalizer'])
 
 def initialize_gaussian_statistics(num_states, emissions_dim, batch_shape=()):
-    """Return NormalizedGaussianStatistics initialized shaped zero arrays."""
+    """Return NormalizedGaussianStatistics initialized with shaped zero arrays."""
     
     return NormalizedGaussianStatistics(
         normalized_x=jnp.zeros((*batch_shape, num_states, emissions_dim)),
@@ -67,15 +75,14 @@ def initialize_gaussian_statistics(num_states, emissions_dim, batch_shape=()):
 
 def reduce_gaussian_statistics(stats, axis=0):
     """Reduce NormalizedGaussianSufficientStatistics along specified axis."""
-    total_weights = stats.normalizer.sum(axis=axis)
-    normd_weights = stats.normalizer / total_weights
+    total_weights = stats.normalizer.sum(axis=axis, keepdims=True)
+    normd_weights = stats.normalizer/total_weights
 
     return NormalizedGaussianStatistics(
-        normalized_x=normd_weights[...,None] * stats.normalized_x,
-        normalized_xxT=normd_weights[...,None, None] * stats.normalized_xxT,
-        normalizer=total_weights
+        normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis),
+        normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis),
+        normalizer=total_weights.squeeze()
     )
-
 
 # =============================================================================
 #
@@ -117,7 +124,7 @@ def niw_posterior_mode(stats, prior_params):
     """
     
     # Convert prior parameters to natural parameterization
-    emission_dim = prior_params.emission_loc.shape[-1]
+    emission_dim = stats.normalized_x.shape[-1]
     natural_prior_params = niw_convert_mean_to_natural(
         prior_params.emission_loc, prior_params.emission_conc,
         emission_dim + prior_params.emission_extra_df, prior_params.emission_scale)
@@ -288,12 +295,7 @@ def sample(params, num_timesteps, seed):
     emissions = jnp.concatenate([jnp.expand_dims(initial_emission, 0), next_emissions])
 
     return states, emissions
-
-# ==============================================================================
-#
-# PARAMETER ESTIMATION
-#
-# ==============================================================================
+# -----------------------------------------------------------------------------
 
 def e_step(params: Parameters, batched_emissions: jnp.ndarray):
     """Compute expected sufficient statistics under the posterior.
@@ -327,8 +329,8 @@ def e_step(params: Parameters, batched_emissions: jnp.ndarray):
             posterior.smoothed_probs / total_weights, 
             0.)
         
-        normd_x = jnp.einsum("tk,ti->ki", normd_weights, emissions),
-        normd_xxT = jnp.einsum("tk,ti,tj->kij", normd_weights, emissions, emissions),
+        normd_x = jnp.einsum("tk,ti->ki", normd_weights, emissions)
+        normd_xxT = jnp.einsum("tk,ti,tj->kij", normd_weights, emissions, emissions)
 
         emission_stats = NormalizedGaussianStatistics(
             normalized_x=normd_x,
@@ -357,7 +359,7 @@ def m_step(prior_params, initial_stats, transition_stats, emission_stats):
     """
 
     # Calculate mode of posterior initial distribution
-    postr_initial_conc = initial_stats + prior_params.initial_conc
+    postr_initial_conc = initial_stats + prior_params.initial_prob_conc
     postr_initial_distr = Dirichlet(postr_initial_conc)
     initial_probs = postr_initial_distr.mode()
 
@@ -375,137 +377,3 @@ def m_step(prior_params, initial_stats, transition_stats, emission_stats):
         emission_means=means,
         emission_covariances=covs,
     )
-
-def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbose=True):
-    """Estimate model parameters from emissions using Expectation-Maximization (EM).
-    
-    Arguments
-        initial_params (Parameters)
-        prior_params (PriorParams)
-        batch_emissions[b,t,d]
-        num_epochs (int): Number of EM iterations to run over full dataset
-        verbose (bool): If true, print progress bar.
-    
-    Returns
-        fitted_params (Parameters)
-        lps[num_epochs,]
-    """
-
-    @jit
-    def em_step(params):
-        # Compute expected sufficient statistics
-        batched_latent_stats, batched_emission_stats, batched_lls \
-                                    = vmap(e_step, params, batched_emissions)
-
-        # Reduce expected statistics along batch dimension
-        latent_stats = tree_map(partial(jnp.sum, axis=0))
-        emission_stats = reduce_gaussian_statistics(batched_emission_stats, axis=0)
-
-        # Compute MAP estimate
-        map_params = m_step(prior_params, latent_stats, emission_stats)
-        
-        lp = log_prior(params, prior_params) + batched_lls.sum()
-        return map_params, lp
-
-    log_probs = []
-    params = initial_params
-    pbar = trange(num_epochs) if verbose else range(num_epochs)
-    for _ in pbar:
-        params, marginal_loglik = em_step(params)
-        log_probs.append(marginal_loglik)
-    return params, jnp.array(log_probs)
-
-
-def fit_stochastic_em(initial_params, prior_params, emissions_generator,
-                      schedule=None, num_epochs=5, verbose=True):
-    """Estimate model parameters from emissions using stochastic Expectation-Maximization (StEM).
-
-    Let the original dataset consists of N independent sequences of length T.
-    The StEM algorithm then performs EM on each random subset of M sequences
-    (not timesteps) during each epoch. Specifically, it will perform N//M
-    iterations of EM per epoch. The algorithm uses a learning rate schedule
-    to anneal the minibatch sufficient statistics at each stage of training.
-    If a schedule is not specified, an exponentially decaying model is used
-    such that the learning rate which decreases by 5% at each epoch.
-
-    NB: This algorithm assumes that the `emissions_generator` object automatically
-    shuffles minibatch sequences before each epoch. It is up to the user to
-    correctly instantiate this object to exhibit this property. For example,
-    `torch.utils.data.DataLoader` objects implement such a functionality.
-    
-    Arguments
-        initial_params (Parameters)
-        prior_params (PriorParams)
-        emissions_generator: An iterable that produces emission minibatches
-            of shape [m,t,d]. Automatically shuffles after each epoch.
-        schedule (optax schedule, Callable: int -> [0, 1]): Learning rate
-            schedule; defaults to exponential schedule.
-        num_epochs (int): Number of StEM iterations to run over full dataset
-        verbose (bool): If true, print progress bar.
-    
-    Returns
-        fitted_params (Parameters)
-        log_probs [num_epochs, num_batches]
-    """
-    
-    num_batches = len(emissions_generator)
-    num_states = initial_params.initial_probs.shape[-1]
-    emission_dim = initial_params.emission_means.shape[-1]
-
-    # Set global training learning rates: shape (num_epochs, num_batches)
-    if schedule is None:
-        schedule = optax.exponential_decay(
-            init_value=1.,
-            end_value=0.,
-            transition_steps=num_batches,
-            decay_rate=.95,
-        )
-
-    learning_rates = schedule(jnp.arange(num_epochs * num_batches))
-    assert learning_rates[0] == 1.0, "Learning rate must start at 1."
-    learning_rates = learning_rates.reshape(num_epochs, num_batches)
-
-    @jit
-    def minibatch_em_step(params, rolling_stats, minibatch_emissions, learning_rate):
-        
-        # Compute the sufficient stats given a minibatch of emissions
-        this_e_step = partial(e_step, params)
-        batched_latent_stats, batched_emission_stats, batched_lls \
-                                        = vmap(this_e_step)(minibatch_emissions)
-
-        # Reduce the minibatch statistics along batch dimension, fields have leading shape (K,...)
-        minibatch_latent_stats = tree_map(partial(jax.sum, axis=0), batched_latent_stats)
-        minibatch_emission_stats = reduce_gaussian_statistics(batched_emission_stats, axis=0)
-
-        # Incoporate minibatch statistics into rolling statistics
-        updated_rolling_stats = ...
-
-        # Call M-step
-        map_params = m_step(prior_params, *updated_rolling_stats)
-
-        # Calculate expected marginal log likeliood of scaled minibatch
-        expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls.sum()
-        
-        return map_params, updated_rolling_stats, expected_lp
-
-    # Initialize
-    params = initial_params
-    rolling_stats = (
-        initialize_markov_chain_statistics(num_states),
-        initialize_gaussian_statistics(num_states, emission_dim)
-    )
-    expected_log_probs = jnp.empty((0, len(emissions_generator)))
-
-    # Train
-    for epoch in trange(nepochs):
-        epoch_expected_lps = []
-        for minibatch, minibatch_emissions in enumerate(emissions_generator):
-            params, rolling_stats, minibatch_expected_lp = minibatch_em_step(
-                params, rolling_stats, minibatch_emissions, learning_rates[epoch][minibatch],
-                )
-            epoch_expected_lps.append(minibatch_expected_lp)
-
-        # Save epoch mean of expected log probs
-        expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
-
-    return params, jnp.asarray(expected_log_probs)
