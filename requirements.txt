@@ -1,14 +1,13 @@
-chex==0.1.3
-jax==0.3.13
-jaxlib==0.3.10
+chex==0.1.5
+jax[cpu]==0.3.23
+jaxlib==0.3.22
 numpy>=1.19
 scikit-learn>=1.1
-optax>=0.1.2
-tensorflow-probability>=0.17.0
+optax>=0.1.3
+tensorflow-probability==0.18.0
 torch[cpu]
 
-# probml/ssm-jax Commit Aug. 8, 2022
-git+https://github.com/probml/ssm-jax.git@10e4c73c254cf8f3ed66a4c79477a9ba05db61ff#egg=ssm-jax
+git+https://github.com/probml/dynamax
 
 h5py==3.7.0
 tqdm
@@ -17,5 +16,5 @@ tqdm
 # Dev tools (optional)
 # ---------------------
 matplotlib
-memory-profiler==0.60.0
-pytest==7.1.2
+memory-profiler
+pytest
