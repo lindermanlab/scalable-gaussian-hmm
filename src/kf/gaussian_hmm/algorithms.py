@@ -9,11 +9,12 @@ from jax.tree_util import tree_map
 from sklearn.cluster import KMeans
 import optax
 
-from kf.gaussian_hmm.model import (Parameters, reduce_gaussian_statistics,
-                                   e_step, m_step)
+from kf.gaussian_hmm.model import (Parameters, PriorParameters, reduce_gaussian_statistics,
+                                   e_step, m_step, log_prior)
 
 __all__ = [
     'initialize_gaussian_hmm',
+    'initialize_prior_from_scalar_values',
     'fit_em',
 ]
 
@@ -114,6 +115,25 @@ def initialize_gaussian_hmm(method, seed, num_states, emissions_dim,
         emission_covariances=emission_covs,
     )
 
+def initialize_prior_from_scalar_values(num_states, emission_dim,
+                                        initial_prob_conc=1.1, transition_matrix_conc=1.1,
+                                        emission_loc=0., emission_conc=1e-4,
+                                        emission_scale=1e-4, emission_extra_df=0.1,):
+    """Initialize PriorParameters from scalar values."""
+    return PriorParameters(
+        initial_prob_conc=initial_prob_conc * jnp.ones(num_states),
+        transition_matrix_conc=transition_matrix_conc * jnp.ones((num_states, num_states)),
+        emission_loc=emission_loc * jnp.ones((num_states, emission_dim)),
+        emission_conc=emission_conc * jnp.ones(num_states),
+        emission_scale=emission_scale * jnp.tile(jnp.eye(emission_dim), (num_states, 1, 1)),
+        emission_df=(emission_dim + emission_extra_df) * jnp.ones(num_states),
+    )
+    
+        #     emission_loc=emission_loc * jnp.ones(emission_dim),
+        # emission_conc=emission_conc,
+        # emission_scale=emission_scale * jnp.eye(emission_dim),
+        # emission_df=emission_dim + emission_extra_df,
+
 # ==============================================================================
 #
 # PARAMETER ESTIMATION
@@ -154,6 +174,7 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
         # Compute MAP estimate
         map_params = m_step(prior_params, initial_stats, transition_stats, emission_stats)
         
+        # calculate log likelihood
         lp = log_prior(params, prior_params) + batched_lls.sum()
         return map_params, lp
 

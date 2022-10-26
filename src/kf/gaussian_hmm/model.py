@@ -22,6 +22,7 @@ __all__ = [
     'Parameters',
     'PriorParameters',
     'log_prob',
+    'log_prior',
     'conditional_log_likelihood',
     'most_likely_states',
     'sample',
@@ -42,8 +43,7 @@ Parameters = namedtuple(
 PriorParameters = namedtuple(
     'PriorParameters',
     ['initial_prob_conc', 'transition_matrix_conc',
-     'emission_loc', 'emission_conc', 'emission_scale', 'emission_extra_df',],
-    defaults=[1.1, 1.1, 0.0, 1e-4, 1e-4, 0.1]
+     'emission_loc', 'emission_conc', 'emission_scale', 'emission_df',],
 )
 
 # TODO Remove this and just break out the values. This is superfluous.
@@ -108,45 +108,6 @@ def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
     df = eta_1 - dim - 2
     return loc, conc, df, scale
 
-def niw_posterior_mode(stats, prior_params):
-    """Compute the posterior NIW mode given Gaussian statistics and prior parameters.
-
-    Operates on unbatched NormalizedGaussianStatistics. If batched, call this 
-    function with vmap over the batch dimension(s).
-    
-    Arguments
-        normd_stats (NormalizedGaussianStatistics)
-        prior_params (PriorParameters)
-
-    Returns
-        modal_covariance[d,d]
-        modal_mean[d]
-    """
-    
-    # Convert prior parameters to natural parameterization
-    emission_dim = stats.normalized_x.shape[-1]
-    natural_prior_params = niw_convert_mean_to_natural(
-        prior_params.emission_loc, prior_params.emission_conc,
-        emission_dim + prior_params.emission_extra_df, prior_params.emission_scale)
-
-    # Normalize prior natural parameters by the normalizer of the sufficient statistics
-    normd_natural_prior_params = natural_prior_params / stats.normalizer
-
-    # Compute posterior by adding normalized natural parameters of prior and likelihood    
-    natural_posterior_params = tree_map(
-        jnp.add, normd_natural_prior_params, (1., stats.normalized_xxT, stats.normalized_x, 1.)
-    )
-
-    # Convert natural posterior parameters to mean parameterization
-    posterior_loc, _, _, posterior_scale \
-        = niw_convert_natural_to_mean(*natural_posterior_params)
-
-    # Compute mode
-    modal_covariance = posterior_scale / normd_natural_prior_params[0]
-    modal_mean = posterior_loc
-
-    return modal_covariance, modal_mean
-
 # =============================================================================
 #
 # GAUSSIAN HIDDEN MARKOV MODEL
@@ -178,23 +139,24 @@ def log_prior(params, prior_params):
         log_likelihood_under_prior (float)
     """
     
-    K, D = params.initial_probs.shape[-1], params.emission_means.shape[-1]
-
     lp = 0.
     
     # Add log probability over prior initial distribution
-    prior_initial_distr = Dirichlet(jnp.ones(K) * prior_params.initial_prob_conc)
+    prior_initial_distr = Dirichlet(prior_params.initial_prob_conc)
     lp += prior_initial_distr.log_prob(params.initial_probs)
 
     # Add log probability over prior transition distribution, for each state
-    prior_transition_distr = Dirichlet(jnp.ones(K) * prior_params.transition_matrix_conc)
+    prior_transition_distr = Dirichlet(prior_params.transition_matrix_conc)
     lp += prior_transition_distr.log_prob(params.transition_matrix_probs).sum()
 
     # Add log probability over prior emission distribution, for each state
-    prior_emission_distr = NormalInverseWishart(
-        prior_params.emission_loc, prior_params.emission_conc,
-        prior_params.emission_extra_df + D, prior_params.emission_scale)  
-    lp += prior_emission_distr.log_prob(params.emission_covariances, params.emission_means).sum()
+    def _niw_log_prob(cov, mean, prior_loc, prior_conc, prior_df, prior_scale,):
+        distr = NormalInverseWishart(prior_loc, prior_conc, prior_df, prior_scale)
+        return distr.log_prob(cov, mean)
+
+    lp += vmap(_niw_log_prob)(params.emission_covariances, params.emission_means,
+                              prior_params.emission_loc, prior_params.emission_conc,
+                              prior_params.emission_df, prior_params.emission_scale,).sum()
 
     return lp
 
@@ -359,17 +321,44 @@ def m_step(prior_params, initial_stats, transition_stats, emission_stats):
     """
 
     # Calculate mode of posterior initial distribution
-    postr_initial_conc = initial_stats + prior_params.initial_prob_conc
-    postr_initial_distr = Dirichlet(postr_initial_conc)
-    initial_probs = postr_initial_distr.mode()
+    posterior_initial_conc = initial_stats + prior_params.initial_prob_conc
+    initial_probs = Dirichlet(posterior_initial_conc).mode()
 
     # Calculate mode of posterior transition distribution 
-    postr_transition_conc = transition_stats + prior_params.transition_matrix_conc
-    postr_transition_distr = Dirichlet(postr_transition_conc)
-    transition_matrix_probs = postr_transition_distr.mode()
+    posterior_transition_conc = transition_stats + prior_params.transition_matrix_conc
+    transition_matrix_probs = Dirichlet(posterior_transition_conc).mode()
+
+    # Calculate mode of posterior emission distribution
+    def _single_emission_m_step(normd_stats, prior_loc, prior_conc, prior_df, prior_scale):
+        # Convert prior NIW parameters to natural parameterization
+        natural_prior_params \
+            = niw_convert_mean_to_natural(prior_loc, prior_conc, prior_df, prior_scale)
+        
+        # Normalize prior parameters by emission stats normalizer
+        normd_natural_prior_params = \
+            tree_map(lambda eta: eta / normd_stats.normalizer, natural_prior_params)
+
+        # Compute posterior parameters
+        normd_natural_posterior_params = tree_map(jnp.add,
+            normd_natural_prior_params,
+            (1, normd_stats.normalized_xxT, normd_stats.normalized_x, 1)
+        )
+        
+        # Convert natural posterior parameters to mean parameterization
+        posterior_loc, _, _, posterior_scale \
+            = niw_convert_natural_to_mean(*normd_natural_posterior_params)
+
+        # Return modal values of posterior distribution
+        modal_cov = posterior_scale / normd_natural_posterior_params[0]
+        modal_mean = posterior_loc
+        return modal_cov, modal_mean
 
     # Map the emissions M-step calculation over the state dimension
-    covs, means = vmap(niw_posterior_mode, in_axes=(0, None))(emission_stats, prior_params)
+    covs, means = vmap(_single_emission_m_step)(emission_stats,
+                                                prior_params.emission_loc,
+                                                prior_params.emission_conc,
+                                                prior_params.emission_df,
+                                                prior_params.emission_scale,)
 
     return Parameters(
         initial_probs=initial_probs,

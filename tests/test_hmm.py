@@ -8,9 +8,7 @@ from torch import Generator as torch_rng
 from functools import partial
 
 from dynamax.hmm.models import GaussianHMM as StandardGaussianHMM
-from kf.gaussian_hmm.model import (Parameters, PriorParameters,
-                                   NormalizedGaussianStatistics, reduce_gaussian_statistics)
-from kf.gaussian_hmm import fit_em
+from kf import gaussian_hmm
 
 def random_initialization(seed, nstates, ndim):
     seed_1, seed_2, seed_3 = jr.split(seed, 3)
@@ -30,14 +28,14 @@ def test_suffstats_reduce_batch():
     seed_1, seed_2 = jr.split(jr.PRNGKey(1283))
 
     initial_probs, trans_probs, normd_x, normd_xxT = \
-                                random_initialization(seed_1, num_states, emission_dim)
+                        random_initialization(seed_1, num_states, emission_dim)
     weights = jr.uniform(seed_2, (num_states,), minval=0., maxval=1.,)
-    ss = NormalizedGaussianStatistics(
+    ss = gaussian_hmm.NormalizedGaussianStatistics(
         normalized_x=normd_x, normalized_xxT=normd_xxT, normalizer=weights,
     )
 
     ss_batch = tree_map(lambda x: jnp.expand_dims(x, axis=0), ss)
-    ss_batch_reduced = reduce_gaussian_statistics(ss_batch)
+    ss_batch_reduced = gaussian_hmm.reduce_gaussian_statistics(ss_batch)
 
     assert all(tree_map(lambda a,b: jnp.all(jnp.equal(a,b)), ss, ss_batch_reduced))
 
@@ -51,54 +49,46 @@ def make_rnd_hmm_params(num_states=5, emission_dim=2):
     ])
     emission_covs = jnp.tile(0.1**2 * jnp.eye(emission_dim), (num_states, 1, 1))
 
-    return initial_probs, transition_matrix, emission_means, emission_covs
+    return gaussian_hmm.Parameters(
+        initial_probs=initial_probs,
+        transition_matrix_probs=transition_matrix,
+        emission_means=emission_means,
+        emission_covariances=emission_covs
+    )
 
-def test_em(n_states=5, n_dim=2, n_steps=1000, n_batches=20, batch_size=4, n_epochs=5):
+def test_em(num_states=3, emission_dim=2, num_timesteps=1000, num_batches=20, num_epochs=5):
     """Test equivalence of the full-batch EM algorithm results between this
     GaussianHMM using normalized sufficient stats with the StanfardGaussianHMM."""
 
-    # TODO Remove dependency / comparison to Standard Gaussian HMM
     seed_sample, seed_init = jr.split(jr.PRNGKey(9238))
     
     # Make true HMM and generate emissions
-    true_initial_probs, true_transition_matrix, true_emission_means, true_emission_covs \
-                                        = make_rnd_hmm_params(n_states, n_dim)
-    
-    true_hmm_params = {
-        'initial': {'probs': true_initial_probs},
-        'transitions': {'transition_matrix': true_transition_matrix},
-        'emissions': {'means': true_emission_means, 'covs': true_emission_covs},
-    }
-    true_hmm = StandardGaussianHMM(n_states, n_dim)
+    true_params = make_rnd_hmm_params(num_states, emission_dim)
+    _, batch_emissions = vmap(gaussian_hmm.sample, in_axes=(None, None, 0))(
+        true_params, num_timesteps, jr.split(seed_sample, num_batches))
 
-    _, batch_emissions = vmap(true_hmm.sample, in_axes=(None, 0, None))(
-                    true_hmm_params, jr.split(seed_sample, n_batches), n_steps)
+    # Randomly initialize Gaussian HMM and fit
+    init_params = gaussian_hmm.initialize_gaussian_hmm('random', seed_init, num_states, emission_dim)
+    prior_params = gaussian_hmm.initialize_prior_from_scalar_values(num_states, emission_dim)
+    fitted_params, lps = gaussian_hmm.fit_em(init_params, prior_params, batch_emissions, num_epochs)
 
+    # Evaluate
+    target_emission_means = jnp.array([[-0.500,  0.865],
+                                       [ 0.239, -0.438],
+                                       [ 0.203, -0.465]])
+    target_emission_covs_k = jnp.array([[[ 5.67e-01, 3.23e-01],
+                                         [ 3.23e-01, 1.94e-01]]])
+    target_initial_probs = jnp.array([0.300, 0.036, 0.663])
+    target_transition_matrix_probs = jnp.array([[0.954, 0.008, 0.038],
+                                                [0.047, 0.073, 0.881 ],
+                                                [0.002, 0.859, 0.139 ]])
+    target_lps = jnp.array([-56742.3, -40231.3, -27970.1, -6047.1, 4192.1])
 
-    # Randomly initialize and fit reference GaussianHMM
-    refr_hmm = StandardGaussianHMM(n_states, n_dim)
-    refr_hmm_params, refr_hmm_param_props = refr_hmm.random_initialization(seed_init)
-    refr_hmm_fitted_params, refr_lps = refr_hmm.fit_em(
-                refr_hmm_params, refr_hmm_param_props, batch_emissions, num_iters=n_epochs)
-
-    # Initialize test Gaussian HMM with same parameters, and fit
-    test_hmm_params = Parameters(
-        initial_probs=refr_hmm_params['initial']['probs'],
-        transition_matrix_probs=refr_hmm_params['transitions']['transition_matrix'],
-        emission_means=refr_hmm_params['emissions']['means'],
-        emission_covariances=refr_hmm_params['emissions']['covs'],
-    )
-    test_hmm_prior_params = PriorParameters()
-    test_hmm_fitted_params, test_lps = fit_em(test_hmm_params, test_hmm_prior_params, batch_emissions, n_epochs)
-    
-
-    # Evaluate emission parameters, trasition parameters, lps
-    assert jnp.allclose(refr_hmm.emission_means.value, test_hmm.emission_means.value, atol=1e-3)
-    assert jnp.allclose(refr_hmm.emission_covariance_matrices.value, test_hmm.emission_covariance_matrices.value, atol=1e-3)
-    assert jnp.allclose(refr_hmm.initial_probs.value, test_hmm.initial_probs.value, atol=1e-3)
-    assert jnp.allclose(refr_hmm.transition_matrix.value, test_hmm.transition_matrix.value, atol=1e-3)
-    assert jnp.allclose(refr_lps, test_lps, atol=1e1)
-
+    assert jnp.allclose(target_emission_means, fitted_params.emission_means, atol=1e-3)
+    assert jnp.allclose(target_emission_covs_k, fitted_params.emission_covariances[-1], atol=1e-2)
+    assert jnp.allclose(target_initial_probs, fitted_params.initial_probs, atol=1e-3)
+    assert jnp.allclose(target_transition_matrix_probs, fitted_params.transition_matrix_probs, atol=1e-3)
+    assert jnp.allclose(target_lps, lps, atol=1e1)
 
 def _collate(batch):
         """Merges a list of samples to form a batch of tensors."""
