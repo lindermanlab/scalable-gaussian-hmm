@@ -3,6 +3,7 @@ from .model import (
     PriorParameters,
     NormalizedGaussianStatistics,
     reduce_gaussian_statistics,
+    initialize_statistics,
     log_prob,
     log_prior,
     conditional_log_likelihood,
@@ -16,4 +17,5 @@ from .algorithms import (
     initialize_gaussian_hmm,
     initialize_prior_from_scalar_values,
     fit_em,
+    fit_stochastic_em,
 )

@@ -9,7 +9,8 @@ from jax.tree_util import tree_map
 from sklearn.cluster import KMeans
 import optax
 
-from kf.gaussian_hmm.model import (Parameters, PriorParameters, reduce_gaussian_statistics,
+from kf.gaussian_hmm.model import (Parameters, PriorParameters,
+                                   NormalizedGaussianStatistics, reduce_gaussian_statistics, initialize_statistics,
                                    e_step, m_step, log_prior)
 
 __all__ = [
@@ -215,7 +216,7 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
         verbose (bool): If true, print progress bar.
     
     Returns
-        fitted_params (Parameters)
+        fitted_params (gaussian_hmm.Parameters)
         log_probs [num_epochs, num_batches]
     """
     
@@ -238,37 +239,55 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
 
     @jit
     def minibatch_em_step(params, rolling_stats, minibatch_emissions, learning_rate):
-        
+        # minibatch_emissions[m,t,d]
+        rolling_latent_stats, rolling_emission_stats = rolling_stats
+
+        # TODO remove the batched_latent_stats and breakout into initial and transiton stats
         # Compute the sufficient stats given a minibatch of emissions
-        this_e_step = partial(e_step, params)
         batched_latent_stats, batched_emission_stats, batched_lls \
-                                        = vmap(this_e_step)(minibatch_emissions)
+                                        = e_step(params, minibatch_emissions)
 
         # Reduce the minibatch statistics along batch dimension, fields have leading shape (K,...)
-        minibatch_latent_stats = tree_map(partial(jax.sum, axis=0), batched_latent_stats)
+        minibatch_latent_stats = tree_map(partial(jnp.sum, axis=0), batched_latent_stats)
         minibatch_emission_stats = reduce_gaussian_statistics(batched_emission_stats, axis=0)
 
-        # Incoporate minibatch statistics into rolling statistics
-        updated_rolling_stats = ...
+        # Convexly combine rolling statistics with minibatch statistics
+        updated_latent_stats = tree_map(
+            lambda s0, s1: (1-learning_rate) * s0 + learning_rate * num_batches * s1,
+            rolling_latent_stats, minibatch_latent_stats
+        )
+
+        # TODO Move into a standalone function
+        rolling_normalizer = (1-learning_rate) * rolling_emission_stats.normalizer
+        minibatch_normalizer = learning_rate * num_batches * minibatch_emission_stats.normalizer
+        updated_normalizer = rolling_normalizer + minibatch_normalizer
+        _weighted_update = (lambda s0, s1:
+            jnp.einsum('k,k...->k...', rolling_normalizer/updated_normalizer, s0)
+            + jnp.einsum('k,k...->k...', minibatch_normalizer/updated_normalizer, s1)
+        )
+        
+        updated_emission_stats = NormalizedGaussianStatistics(
+            normalized_x=_weighted_update(rolling_emission_stats.normalized_x, minibatch_emission_stats.normalized_x),
+            normalized_xxT=_weighted_update(rolling_emission_stats.normalized_xxT, minibatch_emission_stats.normalized_xxT),
+            normalizer=updated_normalizer,
+        )
 
         # Call M-step
-        map_params = m_step(prior_params, *updated_rolling_stats)
+        map_params = m_step(prior_params, updated_latent_stats[0], updated_latent_stats[1], updated_emission_stats)
 
         # Calculate expected marginal log likeliood of scaled minibatch
-        expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls.sum()
+        expected_lp = log_prior(params, prior_params) + num_batches * batched_lls.sum()
         
+        updated_rolling_stats = (updated_latent_stats, updated_emission_stats)
         return map_params, updated_rolling_stats, expected_lp
 
     # Initialize
     params = initial_params
-    rolling_stats = (
-        initialize_markov_chain_statistics(num_states),
-        initialize_gaussian_statistics(num_states, emission_dim)
-    )
+    rolling_stats = initialize_statistics(num_states, emission_dim)
     expected_log_probs = jnp.empty((0, len(emissions_generator)))
 
     # Train
-    for epoch in trange(nepochs):
+    for epoch in trange(num_epochs):
         epoch_expected_lps = []
         for minibatch, minibatch_emissions in enumerate(emissions_generator):
             params, rolling_stats, minibatch_expected_lp = minibatch_em_step(

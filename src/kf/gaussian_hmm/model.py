@@ -7,6 +7,7 @@ structure to ensure compatibility with jax and lax parallelization functions.
 """
 
 from collections import namedtuple
+from typing import NamedTuple
 import jax.numpy as jnp
 import jax.random as jr
 from jax import vmap, lax
@@ -52,6 +53,7 @@ HiddenMarkovChainStatistics = namedtuple(
     ['initial_probs', 'transition_probs']
 )
 
+# TODO Remove
 def initialize_markov_chain_statistics(num_states, batch_shape=()):
     """Return HiddenMarkovChainStatistics initialized with shaped zero arrays."""
 
@@ -60,10 +62,37 @@ def initialize_markov_chain_statistics(num_states, batch_shape=()):
         transition_probs=jnp.zeros((*batch_shape, K, K,)),
     )
 
-NormalizedGaussianStatistics = namedtuple(
-    'NormalizedGaussianStatistics',
-    ['normalized_x', 'normalized_xxT', 'normalizer'])
+# NormalizedGaussianStatistics = namedtuple(
+#     'NormalizedGaussianStatistics',
+#     ['normalized_x', 'normalized_xxT', 'normalizer'])
+class NormalizedGaussianStatistics(NamedTuple):
+    normalized_x: jnp.ndarray
+    normalized_xxT: jnp.ndarray
+    normalizer: jnp.ndarray
 
+def initialize_statistics(num_states, emission_dim, batch_shape=()):
+    """Initial GaussianHMM statistics with zero arrays of appropraite shape.
+    
+    Returns
+        initial_stats (jnp.ndarray)
+        transition_stats (jnp.ndarray)
+        emission_stats (NormalizedEmissionStatistics)
+    """
+
+    latent_stats = HiddenMarkovChainStatistics(
+        initial_probs=jnp.zeros((*batch_shape, num_states)),
+        transition_probs=jnp.zeros((*batch_shape, num_states, num_states,)),
+    )
+
+    emission_stats = NormalizedGaussianStatistics(
+        normalized_x=jnp.zeros((*batch_shape, num_states, emission_dim)),
+        normalized_xxT=jnp.zeros((*batch_shape, num_states, emission_dim, emission_dim)),
+        normalizer=jnp.zeros((*batch_shape, num_states)),
+    )
+
+    return latent_stats, emission_stats
+
+# TODO remove
 def initialize_gaussian_statistics(num_states, emissions_dim, batch_shape=()):
     """Return NormalizedGaussianStatistics initialized with shaped zero arrays."""
     
@@ -73,6 +102,7 @@ def initialize_gaussian_statistics(num_states, emissions_dim, batch_shape=()):
         normalizer=jnp.zeros((*batch_shape, num_states)),
     )
 
+# TODO rename `reduce_emission_statistics`
 def reduce_gaussian_statistics(stats, axis=0):
     """Reduce NormalizedGaussianSufficientStatistics along specified axis."""
     total_weights = stats.normalizer.sum(axis=axis, keepdims=True)
