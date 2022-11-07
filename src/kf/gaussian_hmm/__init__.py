@@ -1,21 +1,38 @@
-from .model import (
+"""Gaussian Hidden Markov Model using normalized gaussian statistics and 
+under a normal inverse Wishart (NIW) prior. This codebase is optimized for
+performing inference over millions of emissions.
+
+This implementation inherits heavily from the Dynamax codebase, albeit indirectly.
+This version removes the object-oriented structure used in the Dynamx codebase
+and uses purely functional programming to faciliate improved parallelization
+performance during inference. Additional models and generalizations implemented
+in the Dynmax codebase are also stripped away for clarity and simplicity.
+"""
+
+from ._model import(
     Parameters,
     PriorParameters,
-    NormalizedGaussianStatistics,
-    reduce_gaussian_statistics,
-    initialize_statistics,
-    log_prob,
+    HiddenMarkovChainStatistics,
+    NormalizedEmissionStatistics,
+    initial_distribution,
+    transition_distribution,
+    emission_distribution,
     log_prior,
-    conditional_log_likelihood,
-    most_likely_states,
+    log_prob,
+    log_likelihood,
     sample,
-    e_step,
-    m_step,
 )
 
-from .algorithms import (
-    initialize_gaussian_hmm,
-    initialize_prior_from_scalar_values,
+from ._algorithms import (
+    e_step,
+    m_step,
     fit_em,
     fit_stochastic_em,
+    most_likely_states,
+)
+
+from ._initialization import(
+    initialize_model,
+    initialize_prior_from_scalar_values,
+    initialize_statistics,
 )
