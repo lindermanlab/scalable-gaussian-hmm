@@ -1,5 +1,6 @@
 import pytest
 
+import jax
 from jax import vmap, tree_map
 import jax.numpy as jnp
 import jax.random as jr
@@ -143,6 +144,45 @@ def test_stochastic_em(num_states=3, emission_dim=2, num_timesteps=1000, num_bat
     # Instantiate an emissions generator function for stochastic EM algorithm
     emissions_generator = ArrayLoader(batch_emissions, batch_size, seed=int(seed_shuffle[0]))
     fitted_params, lps = gaussian_hmm.fit_stochastic_em(
+        init_params, prior_params, emissions_generator, num_epochs=2*num_epochs)
+    
+    # Reference: Fit parameters using full-batch EM
+    refr_fitted_params, refr_lps = gaussian_hmm.fit_em(init_params, prior_params, batch_emissions, num_epochs)
+
+    # Evaluate emission parameters, trasition parameters, lps
+    # Don't compare initial probs, since minibatch will throw that off
+    assert jnp.allclose(refr_fitted_params.emission_means, fitted_params.emission_means, atol=1e-2)
+    assert jnp.allclose(refr_fitted_params.emission_covariances, fitted_params.emission_covariances, atol=1e-2)
+    assert jnp.allclose(refr_fitted_params.transition_probs, fitted_params.transition_probs, atol=1e-2)
+
+    refr_avg_final_lp = refr_lps[-1] / (num_batches * num_timesteps)
+    avg_final_lp = lps.ravel()[-1] / (num_batches * num_timesteps)
+    assert jnp.allclose(refr_avg_final_lp, avg_final_lp, atol=1e-1)
+
+# -----------------------------------------------------------------------------
+def test_parallel_stochastic_em(num_devices=4, num_states=3, emission_dim=2, num_timesteps=500, num_batches=20, batch_size=2, num_epochs=10):
+    """Test equivalence of the StEM algorithm results with the full-batch EM results."""
+
+    # Check that the correct number of devices are visible to JAX
+    assert jax.local_device_count() == num_devices
+
+    seed_sample, seed_shuffle, seed_init = jr.split(jr.PRNGKey(9238), 3)
+    
+    # Make true HMM and generate emissions
+    true_params = make_rnd_hmm_params(num_states, emission_dim)
+    _, batch_emissions = vmap(gaussian_hmm.sample, in_axes=(None, None, 0))(
+        true_params, num_timesteps, jr.split(seed_sample, num_batches*num_devices))
+
+    # Randomly initialize Gaussian HMM
+    init_params = gaussian_hmm.initialize_model('random', seed_init, num_states, emission_dim)
+    prior_params = gaussian_hmm.initialize_prior_from_scalar_values(num_states, emission_dim)
+
+    # Test: Fit parameters using stochastic EM. Train on 2x num_epochs
+    # Instantiate an emissions generator function for stochastic EM algorithm
+    emissions_generator = ArrayLoader(
+        batch_emissions.reshape(num_devices, num_batches, num_timesteps, emission_dim),
+        batch_size, seed=int(seed_shuffle[0]))
+    fitted_params, lps = gaussian_hmm.fit_parallel_stochastic_em(
         init_params, prior_params, emissions_generator, num_epochs=2*num_epochs)
     
     # Reference: Fit parameters using full-batch EM

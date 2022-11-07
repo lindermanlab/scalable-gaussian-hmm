@@ -1,5 +1,5 @@
 import jax.numpy as jnp
-from jax import jit, vmap, lax
+from jax import jit, vmap, lax, pmap
 from jax.tree_util import tree_map
 from functools import partial
 import optax
@@ -328,6 +328,119 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
         for minibatch, minibatch_emissions in enumerate(emissions_generator):
             params, rolling_stats, minibatch_expected_lp = minibatch_em_step(
                 params, rolling_stats, minibatch_emissions, learning_rates[epoch][minibatch],
+                )
+            epoch_expected_lps.append(minibatch_expected_lp)
+
+        # Save epoch mean of expected log probs
+        expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
+
+    return params, jnp.asarray(expected_log_probs)
+
+# ==============================================================================
+#
+# PARALLELIZED STOCHASTIC EM
+#
+# ==============================================================================    
+
+def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator,
+                               schedule=None, num_epochs=5, verbose=True):
+    """Estimate model parameterss from emissions using stochastic
+    Expectation-Maximization (StEM) with parallelized E-step.
+
+    Let the original dataset consists of N independent sequences of length T.
+    The StEM algorithm then performs EM on each random subset of M sequences
+    (not timesteps) during each epoch. Specifically, it will perform N//M
+    iterations of EM per epoch. The algorithm uses a learning rate schedule
+    to anneal the minibatch sufficient statistics at each stage of training.
+    If a schedule is not specified, an exponentially decaying model is used
+    such that the learning rate which decreases by 5% at each epoch.
+
+    NB: This algorithm assumes that the `emissions_generator` object automatically
+    shuffles minibatch sequences before each epoch. It is up to the user to
+    correctly instantiate this object to exhibit this property. For example,
+    `torch.utils.data.DataLoader` objects implement such a functionality.
+    
+    Arguments
+        initial_params (Parameters)
+        prior_params (PriorParams)
+        emissions_generator: An iterable that produces emission minibatches
+            of shape [m,t,d]. Automatically shuffles after each epoch.
+        schedule (optax schedule, Callable: int -> [0, 1]): Learning rate
+            schedule; defaults to exponential schedule.
+        num_epochs (int): Number of StEM iterations to run over full dataset
+        verbose (bool): If true, print progress bar.
+    
+    Returns
+        fitted_params (gaussian_hmm.Parameters)
+        log_probs [num_epochs, num_batches]
+    """
+    
+    num_batches = len(emissions_generator)
+    num_states = initial_params.initial_probs.shape[-1]
+    emission_dim = initial_params.emission_means.shape[-1]
+
+    # Set global training learning rates: shape (num_epochs, num_batches)
+    if schedule is None:
+        schedule = optax.exponential_decay(
+            init_value=1.,
+            end_value=0.,
+            transition_steps=num_batches,
+            decay_rate=.95,
+        )
+
+    learning_rates = schedule(jnp.arange(num_epochs * num_batches))
+    assert learning_rates[0] == 1.0, "Learning rate must start at 1."
+    learning_rates = learning_rates.reshape(num_epochs, num_batches)
+
+    def _parallel_e_step(prev_params, minibatch_emissions):
+        # Compute the sufficient stats given a [p,m,t,d] minibatch of emissions
+        batched_markov_chain_stats, batched_emission_stats, batched_lls \
+                        = pmap(partial(e_step, prev_params))(minibatch_emissions)
+
+        # Calculate expected marginal log likeliood of scaled minibatch
+        expected_lp = log_prior(prev_params, prior_params) + num_batches * batched_lls.sum()
+        return (batched_markov_chain_stats, batched_emission_stats), expected_lp
+
+    @jit
+    def _minibatch_m_step(rolling_stats, batched_stats, learning_rate):
+        rolling_markov_chain_stats, rolling_emission_stats = rolling_stats
+        batched_markov_chain_stats, batched_emission_stats = batched_stats
+
+        # Reduce the minibatch statistics along device AND batch dimension, fields have leading shape (K,...)
+        minibatch_markov_chain_stats = tree_map(partial(jnp.sum, axis=(0,1)), batched_markov_chain_stats)
+        minibatch_emission_stats = _reduce_emission_statistics(batched_emission_stats, axis=(0,1))
+
+        # Convexly combine rolling statistics with minibatch statistics
+        updated_markov_chain_stats = tree_map(
+            lambda s0, s1: (1-learning_rate) * s0 + learning_rate * num_batches * s1,
+            rolling_markov_chain_stats, minibatch_markov_chain_stats
+        )
+
+        updated_emission_stats = _update_rolling_emission_statistics(
+            rolling_emission_stats, minibatch_emission_stats, learning_rate, num_batches,
+        )
+
+        # Call M-step
+        map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
+
+        return map_params, (updated_markov_chain_stats, updated_emission_stats)    
+
+    # Initialize
+    params = initial_params
+    rolling_stats = initialize_statistics(num_states, emission_dim)
+    expected_log_probs = jnp.empty((0, len(emissions_generator)))
+
+    # Train
+    for epoch in trange(num_epochs):
+        epoch_expected_lps = []
+        for minibatch, minibatch_emissions in enumerate(emissions_generator):
+
+            # PARALLEL E-STEP
+            batched_stats, minibatch_expected_lp = _parallel_e_step(params, minibatch_emissions)
+            
+            # JITTED M-STEP
+            params, rolling_stats = _minibatch_m_step(
+                rolling_stats, batched_stats, learning_rates[epoch][minibatch],
                 )
             epoch_expected_lps.append(minibatch_expected_lp)
 
