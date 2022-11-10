@@ -16,6 +16,7 @@ __all__ = [
     'm_step',
     'fit_em',
     'fit_stochastic_em',
+    'fit_parallel_stochastic_em',
     'most_likely_states',
 ]
 
@@ -286,7 +287,7 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     learning_rates = learning_rates.reshape(num_epochs, num_batches)
 
     @jit
-    def minibatch_em_step(params, rolling_stats, minibatch_emissions, learning_rate):
+    def _minibatch_em_step(params, rolling_stats, minibatch_emissions, learning_rate):
         # minibatch_emissions[m,t,d]
         rolling_markov_chain_stats, rolling_emission_stats = rolling_stats
 
@@ -326,7 +327,7 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     for epoch in trange(num_epochs):
         epoch_expected_lps = []
         for minibatch, minibatch_emissions in enumerate(emissions_generator):
-            params, rolling_stats, minibatch_expected_lp = minibatch_em_step(
+            params, rolling_stats, minibatch_expected_lp = _minibatch_em_step(
                 params, rolling_stats, minibatch_emissions, learning_rates[epoch][minibatch],
                 )
             epoch_expected_lps.append(minibatch_expected_lp)
