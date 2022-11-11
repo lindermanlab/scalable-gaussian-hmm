@@ -393,34 +393,67 @@ def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator
     assert learning_rates[0] == 1.0, "Learning rate must start at 1."
     learning_rates = learning_rates.reshape(num_epochs, num_batches)
 
-    _pmapped_e_step = pmap(e_step, in_axes=(None, 0))
 
-    def _parallel_e_step(prev_params, minibatch_emissions):
-        # Compute the sufficient stats given a [p,m,t,d] minibatch of emissions
+    def _reduce_emission_statistics(stats, axis=0):
+        """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
+        stats.normalizer (m,k)
+        stats.normalized_x (m,k,d)
+        """
+        total_weights = stats.normalizer.sum(axis=axis, keepdims=True) # (1,k)
+        normd_weights = stats.normalizer/total_weights # (m,k)
+
+        return NormalizedEmissionStatistics(
+            normalizer=total_weights.squeeze(), # -> (k,)
+            normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis), # (k,d)
+            normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis), # (k,d,d)
+        )
+
+    def _preduce_emission_statistics(stats):
+        """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
+        IN stats have (k,...) with leading named axis 'p'
+        OUT stats have (k,...) with no leading axis
+        """
+        total_weights = lax.psum(stats.normalizer, axis_name='p') # (k,)
+        normd_weights = stats.normalizer/total_weights # (k,) with leading axis 'p' 
+
+        return NormalizedEmissionStatistics(
+            normalizer=total_weights, # -> (k,)
+            normalized_x=lax.psum(normd_weights[...,None] * stats.normalized_x, axis_name='p'), # (k,d)
+            normalized_xxT=lax.psum(normd_weights[...,None,None] * stats.normalized_xxT, axis_name='p'), # (k,d,d)
+        )
+
+    @partial(pmap, in_axes=(None, None, None, None, None, 0), axis_name='p')
+    def em_step(prior_params, params, rolling_stats, learning_rate, num_batches, local_batch_emissions):
+        # INPUT: local_batch_emissions[m,t,d] varying across outer axis 'p'
+        # OUTPUT: NamedTuples with leading axis [m,k,...], varying across outer axis 'p'
         batched_markov_chain_stats, batched_emission_stats, batched_lls \
-                        = _pmapped_e_step(prev_params, minibatch_emissions)
+                                                    = e_step(params, local_batch_emissions)
+        
+        # Reduce batch statistics across local batch axis 'm'
+        # OUTPUT: NamedTuples have leading axis [k,...], varying across outer axis 'p'
+        local_markov_chain_stats, local_lls = tree_map(
+            partial(jnp.sum, axis=0), (batched_markov_chain_stats, batched_lls)
+        )
+        local_emission_stats = _reduce_emission_statistics(batched_emission_stats)
+        
+        # Reduce batch statistics across outer batch axis 'p'
+        # OUTPUT: NamedTuples have leading axis [k,...], identical across outer axis 'p'
+        collective_markov_chain_stats, collective_lls = tree_map(
+            partial(lax.psum, axis_name='p'), (local_markov_chain_stats, local_lls)
+        )
+        collective_emission_stats = _preduce_emission_statistics(local_emission_stats)
 
-        # Calculate expected marginal log likeliood of scaled minibatch
-        expected_lp = log_prior(prev_params, prior_params) + num_batches * batched_lls.sum()
-        return (batched_markov_chain_stats, batched_emission_stats), expected_lp
-
-    @jit
-    def _minibatch_m_step(rolling_stats, batched_stats, learning_rate):
+        # Convexly combine rolling statistics with collective statistics
+        # All stats and lls are now identical across devices (across outer axis 'p')
         rolling_markov_chain_stats, rolling_emission_stats = rolling_stats
-        batched_markov_chain_stats, batched_emission_stats = batched_stats
-
-        # Reduce the minibatch statistics along device AND batch dimension, fields have leading shape (K,...)
-        minibatch_markov_chain_stats = tree_map(partial(jnp.sum, axis=(0,1)), batched_markov_chain_stats)
-        minibatch_emission_stats = _reduce_emission_statistics(batched_emission_stats, axis=(0,1))
-
-        # Convexly combine rolling statistics with minibatch statistics
+        
         updated_markov_chain_stats = tree_map(
             lambda s0, s1: (1-learning_rate) * s0 + learning_rate * num_batches * s1,
-            rolling_markov_chain_stats, minibatch_markov_chain_stats
+            rolling_markov_chain_stats, collective_markov_chain_stats
         )
 
         updated_emission_stats = _update_rolling_emission_statistics(
-            rolling_emission_stats, minibatch_emission_stats, learning_rate, num_batches,
+            rolling_emission_stats, collective_emission_stats, learning_rate, num_batches,
         )
 
         # Call M-step
@@ -428,30 +461,38 @@ def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator
 
         return map_params, (updated_markov_chain_stats, updated_emission_stats)    
 
+
     # Initialize
     params = initial_params
     rolling_stats = initialize_statistics(num_states, emission_dim)
     expected_log_probs = jnp.empty((0, len(emissions_generator)))
 
     # Train
-    
     for epoch in trange(num_epochs):
         epoch_expected_lps = []
-        for minibatch, minibatch_emissions in enumerate(emissions_generator):
 
-            # PARALLEL E-STEP
-            batched_stats, minibatch_expected_lp = _parallel_e_step(params, minibatch_emissions)
+        for minibatch, minibatch_emissions in enumerate(trange(emissions_generator)):
+            # PMAPPED INPUT into em_step: minibatch_emissions[p,m,t,d]
+            # OUTPUTS: NamedTuples whose leaves have leading axis [p,...],
+            #          values are identical across this dimension
+            pbatch_params, pbatch_stats = em_step(prior_params,
+                                                  params,
+                                                  rolling_stats,
+                                                  learning_rates[epoch][minibatch],
+                                                  num_batches,
+                                                  minibatch_emissions)
+
+            # Select one of these (redundant) values
+            params, rolling_stats = tree_map(lambda arr: arr[0], (pbatch_params, pbatch_stats))
             
-            # JITTED M-STEP
-            params, rolling_stats = _minibatch_m_step(
-                rolling_stats, batched_stats, learning_rates[epoch][minibatch],
-                )
-            epoch_expected_lps.append(minibatch_expected_lp)
+            # TODO return expected lp from pmap function
+            # epoch_expected_lps.append(minibatch_expected_lp)
 
         # Save epoch mean of expected log probs
-        expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
+        # expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
 
-    return params, jnp.asarray(expected_log_probs)
+    # return params, jnp.asarray(expected_log_probs)
+    return params, None
 
 # ==============================================================================
 #
