@@ -20,16 +20,19 @@ __all__ = [
     'most_likely_states',
 ]
 
-
 def _reduce_emission_statistics(stats, axis=0):
-    """Compute weighted sum of NormalizedEmissionStatistics along specified axis."""
-    total_weights = stats.normalizer.sum(axis=axis, keepdims=True)
-    normd_weights = stats.normalizer/total_weights
+    """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
+    
+    TODO Does this work? Different than how we do it in E-step but feels like
+    it'd be better this way here...
+    """
+    num_batches = len(stats.normalizer)
+    total_weights = stats.normalizer.sum(axis=0)
 
     return NormalizedEmissionStatistics(
-        normalizer=total_weights.squeeze(),
-        normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis),
-        normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis),
+        normalizer=total_weights,
+        normalized_x=stats.normalized_x.sum(axis=0) / num_batches,
+        normalized_xxT=stats.normalized_xxT.sum(axis=0) / num_batches,
     )
 
 # -----------------------------------------------------------------------------
@@ -61,13 +64,15 @@ def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
 def e_step(params, batched_emissions):
     """Compute expected sufficient statistics under the posterior.
     
+    TODO Why don't we just reduce over batch dimension of statistics here?
+    We never actually make use of the batches.
     Arguments
-        params (Paramters)
-        batched_emissions[b,t,d]
+        params (Parameters([k,...]))
+        batched_emissions ([b,t,d])
 
     Returns
-        batched_marko_chain_stats: HiddenMarkovChainStatistics with leading (B,K,...) dimensions
-        batched_emission_stats: NormalizedGaussianStatistics with leading (B,K,...) dimensions
+        batched_markov_chain_stats (HiddenMarkovChainStatistics([b,k,...]))
+        batched_emission_stats (NormalizedGaussianStatistics([b,k,...]))
         posterior_marginal_loglik[b,]
     """
 
@@ -83,18 +88,15 @@ def e_step(params, batched_emissions):
             transition_pseudocounts = compute_transition_probs(params.transition_probs, posterior),
         )
 
-        # Compute normalized weights and emission statistics
-        total_weights = jnp.einsum("tk->k", posterior.smoothed_probs)           # shape (K,)
-        normd_weights = jnp.where(                                              # shape (T,K)
-            total_weights[None,:] > 0., 
-            posterior.smoothed_probs / total_weights, 
-            0.)
-        
-        normd_x = jnp.einsum("tk,ti->ki", normd_weights, emissions)
-        normd_xxT = jnp.einsum("tk,ti,tj->kij", normd_weights, emissions, emissions)
+        # Compute normalized emission statistics. Since we typically work in
+        # the regime of # len(emissions) >> 1 > posterior.smooth_probs,
+        # perform the normalization after summation.
+        weights = posterior.smoothed_probs       
+        normd_x = jnp.einsum("tk,ti->ki", weights, emissions) / len(emissions)
+        normd_xxT = jnp.einsum("tk,ti,tj->kij", weights, emissions, emissions) / len(emissions)
 
         emission_stats = NormalizedEmissionStatistics(
-            normalizer=total_weights,
+            normalizer=len(emissions)*jnp.ones(weights.shape[-1]),
             normalized_x=normd_x,
             normalized_xxT=normd_xxT,
         )
@@ -109,14 +111,12 @@ def m_step(prior_params, markov_chain_stats, emission_stats):
     Implicitly assumes that num_states > 1.
 
     Arguments
-        initial_stats[k,]
-        transition_stats[k,k]
-        emission_stats (NormalizedGaussianStatistics): Normalized
-            Gaussian statistics, with leading (K,...) dimensions
-        prior_params (PriorParameters): Parameter values of prior distributions
+        prior_params(PriorParameters([k,...]))
+        _markov_chain_stats (HiddenMarkovChainStatistics([k,...]))
+        emission_stats (NormalizedGaussianStatistics([k,...]))
     
     Returns
-        Parameters: Maximum a posterior (MAP) parameters of Gaussian HMM
+        map_params (Parameters([k,...]))
     """
 
     # Calculate mode of posterior initial distribution
@@ -178,18 +178,18 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
     """Estimate model parameters from emissions using Expectation-Maximization (EM).
     
     Arguments
-        initial_params (Parameters)
-        prior_params (PriorParams)
-        batch_emissions[b,t,d]
+        initial_params (Parameters([k,...]))
+        prior_params (PriorParams([k,...]))
+        batch_emissions ([b,t,d])
         num_epochs (int): Number of EM iterations to run over full dataset
         verbose (bool): If true, print progress bar.
     
     Returns
-        fitted_params (Parameters)
-        lps[num_epochs,]
+        fitted_params (Parameters([k,...]))
+        lps (ndarray[num_epochs,])
     """
 
-    @jit
+    # @jit
     def em_step(params):
         # Compute expected sufficient statistics
         batched_markov_chain_stats, batched_emission_stats, batched_lls \
@@ -198,7 +198,7 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
         # Reduce expected statistics along batch dimension
         markov_chain_stats = tree_map(partial(jnp.sum, axis=0), batched_markov_chain_stats)
         emission_stats = _reduce_emission_statistics(batched_emission_stats, axis=0)
-
+        import pdb; pdb.set_trace()
         # Compute MAP estimate
         map_params = m_step(prior_params, markov_chain_stats, emission_stats)
         
