@@ -21,6 +21,10 @@ __all__ = [
 ]
 
 
+# ==============================================================================
+# EXPECTATION FUNCTIONS
+# ==============================================================================
+
 def _reduce_emission_statistics(stats, axis=0):
     """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
 
@@ -38,51 +42,6 @@ def _reduce_emission_statistics(stats, axis=0):
         normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis), # (k,d)
         normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis), # (k,d,d)
     )
-
-def _preduce_emission_statistics(stats):
-    """Compute an all-reduce weighted sum of NormalizedEmissionStatistics over
-    the pmapped axis. Used in parallelized algorithms.
-
-    Arguments
-        stats with element shapes [...,k], [...,k,d], [...,k,d,d] with leading axis 'p'
-    
-    Returns
-        reduced_stats with same shape as stats
-    """
-    total_weights = lax.psum(stats.normalizer, axis_name='p') # (k,)
-    normd_weights = stats.normalizer/total_weights # (k,) with leading axis 'p' 
-
-    return NormalizedEmissionStatistics(
-        normalizer=total_weights, # -> (k,)
-        normalized_x=lax.psum(normd_weights[...,None] * stats.normalized_x, axis_name='p'), # (k,d)
-        normalized_xxT=lax.psum(normd_weights[...,None,None] * stats.normalized_xxT, axis_name='p'), # (k,d,d)
-    )
-
-# -----------------------------------------------------------------------------
-
-def niw_convert_mean_to_natural(loc, conc, df, scale):
-    """Convert NIW mean parameters to natural parameters."""
-    dim = loc.shape[-1]
-    eta_1 = df + dim + 2
-    eta_2 = scale + conc * jnp.outer(loc, loc)
-    eta_3 = conc * loc
-    eta_4 = conc
-    return eta_1, eta_2, eta_3, eta_4
-
-def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
-    """Convert NIW natural parameters to mean parameters."""
-    dim = eta_3.shape[-1]
-    loc = eta_3 / eta_4
-    conc = eta_4            
-    scale = eta_2 - jnp.outer(eta_3, eta_3) / eta_4
-    df = eta_1 - dim - 2
-    return loc, conc, df, scale
-
-# ==============================================================================
-#
-# EXPECTATION AND MAXIMIZATION FUNCTIONS
-#
-# ==============================================================================
 
 def e_step(params, batched_emissions):
     """Compute expected sufficient statistics under the posterior, across all batches.
@@ -136,6 +95,28 @@ def e_step(params, batched_emissions):
     reduced_marginal_logliks = batched_marginal_logliks.sum()
 
     return reduced_chain_stats, reduced_emission_stats, reduced_marginal_logliks
+
+# ==============================================================================
+# MAXIMIZATION FUNCTIONS
+# ==============================================================================
+
+def niw_convert_mean_to_natural(loc, conc, df, scale):
+    """Convert NIW mean parameters to natural parameters."""
+    dim = loc.shape[-1]
+    eta_1 = df + dim + 2
+    eta_2 = scale + conc * jnp.outer(loc, loc)
+    eta_3 = conc * loc
+    eta_4 = conc
+    return eta_1, eta_2, eta_3, eta_4
+
+def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
+    """Convert NIW natural parameters to mean parameters."""
+    dim = eta_3.shape[-1]
+    loc = eta_3 / eta_4
+    conc = eta_4            
+    scale = eta_2 - jnp.outer(eta_3, eta_3) / eta_4
+    df = eta_1 - dim - 2
+    return loc, conc, df, scale
 
 def m_step(prior_params, markov_chain_stats, emission_stats):
     """Compute MAP estimate of Gaussian HMM parameters.
@@ -381,6 +362,25 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
 # PARALLELIZED STOCHASTIC EM
 #
 # ==============================================================================    
+
+def _preduce_emission_statistics(stats):
+    """Compute an all-reduce weighted sum of NormalizedEmissionStatistics over
+    the pmapped axis. Used in parallelized algorithms.
+
+    Arguments
+        stats with element shapes [...,k], [...,k,d], [...,k,d,d] with leading axis 'p'
+    
+    Returns
+        reduced_stats with same shape as stats
+    """
+    total_weights = lax.psum(stats.normalizer, axis_name='p') # (k,)
+    normd_weights = stats.normalizer/total_weights # (k,) with leading axis 'p' 
+
+    return NormalizedEmissionStatistics(
+        normalizer=total_weights, # -> (k,)
+        normalized_x=lax.psum(normd_weights[...,None] * stats.normalized_x, axis_name='p'), # (k,d)
+        normalized_xxT=lax.psum(normd_weights[...,None,None] * stats.normalized_xxT, axis_name='p'), # (k,d,d)
+    )
 
 def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator,
                                schedule=None, num_epochs=5, verbose=True):
