@@ -85,16 +85,16 @@ def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
 # ==============================================================================
 
 def e_step(params, batched_emissions):
-    """Compute expected sufficient statistics under the posterior.
+    """Compute expected sufficient statistics under the posterior, across all batches.
     
     Arguments
         params (Parameters)
         batched_emissions[b,t,d]
 
     Returns
-        batched_marko_chain_stats (HiddenMarkovChainStatistics([b,k,...]))
-        batched_emission_stats (NormalizedGaussianStatistics([b,k,...]))
-        posterior_marginal_loglik[b,]
+        markov_chain_stats (HiddenMarkovChainStatistics([k,...]))
+        emission_stats (NormalizedGaussianStatistics([k,...]))
+        marginal_loglik (float)
     """
 
     def _single_e_step(emissions):
@@ -127,7 +127,15 @@ def e_step(params, batched_emissions):
         return chain_stats, emission_stats, posterior.marginal_loglik
 
     # Map the E-step calculations over the batch dimension
-    return vmap(_single_e_step)(batched_emissions)
+    batched_chain_stats, batched_emission_stats, batched_marginal_logliks \
+                                        = vmap(_single_e_step)(batched_emissions)
+
+    # Reduce batched outputs along batch dimension
+    reduced_chain_stats = tree_map(partial(jnp.sum, axis=0), batched_chain_stats)
+    reduced_emission_stats = _reduce_emission_statistics(batched_emission_stats)
+    reduced_marginal_logliks = batched_marginal_logliks.sum()
+
+    return reduced_chain_stats, reduced_emission_stats, reduced_marginal_logliks
 
 def m_step(prior_params, markov_chain_stats, emission_stats):
     """Compute MAP estimate of Gaussian HMM parameters.
@@ -216,18 +224,13 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
     @jit
     def em_step(params):
         # Compute expected sufficient statistics
-        batched_markov_chain_stats, batched_emission_stats, batched_lls \
-                                    = e_step(params, batched_emissions)
-
-        # Reduce expected statistics along batch dimension
-        markov_chain_stats = tree_map(partial(jnp.sum, axis=0), batched_markov_chain_stats)
-        emission_stats = _reduce_emission_statistics(batched_emission_stats, axis=0)
+        markov_chain_stats, emission_stats, lls = e_step(params, batched_emissions)
 
         # Compute MAP estimate
         map_params = m_step(prior_params, markov_chain_stats, emission_stats)
         
         # calculate log likelihood
-        lp = log_prior(params, prior_params) + batched_lls.sum()
+        lp = log_prior(params, prior_params) + lls
         return map_params, lp
 
     log_probs = []
@@ -332,14 +335,9 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
         # minibatch_emissions[m,t,d]
         rolling_markov_chain_stats, rolling_emission_stats = rolling_stats
 
-        # TODO remove the batched_markov_chain_stats and breakout into initial and transiton stats
         # Compute the sufficient stats given a minibatch of emissions
-        batched_markov_chain_stats, batched_emission_stats, batched_lls \
+        minibatch_markov_chain_stats, minibatch_emission_stats, minibatch_lls \
                                         = e_step(params, minibatch_emissions)
-
-        # Reduce the minibatch statistics along batch dimension, fields have leading shape (K,...)
-        minibatch_markov_chain_stats = tree_map(partial(jnp.sum, axis=0), batched_markov_chain_stats)
-        minibatch_emission_stats = _reduce_emission_statistics(batched_emission_stats, axis=0)
 
         # Convexly combine rolling statistics with minibatch statistics
         updated_markov_chain_stats = tree_map(
@@ -355,7 +353,7 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
         map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
 
         # Calculate expected marginal log likeliood of scaled minibatch
-        expected_lp = log_prior(params, prior_params) + num_batches * batched_lls.sum()
+        expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
         
         return map_params, (updated_markov_chain_stats, updated_emission_stats), expected_lp
 
@@ -436,16 +434,9 @@ def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator
     @partial(pmap, in_axes=(None, None, None, None, None, 0), axis_name='p')
     def em_step(prior_params, params, rolling_stats, learning_rate, num_batches, local_batch_emissions):
         # INPUT: local_batch_emissions[m,t,d] varying across outer axis 'p'
-        # OUTPUT: NamedTuples with leading axis [m,k,...], varying across outer axis 'p'
-        batched_markov_chain_stats, batched_emission_stats, batched_lls \
-                                                    = e_step(params, local_batch_emissions)
-        
-        # Reduce batch statistics across local batch axis 'm'
-        # OUTPUT: NamedTuples have leading axis [k,...], varying across outer axis 'p'
-        local_markov_chain_stats, local_lls = tree_map(
-            partial(jnp.sum, axis=0), (batched_markov_chain_stats, batched_lls)
-        )
-        local_emission_stats = _reduce_emission_statistics(batched_emission_stats)
+        # OUTPUT: NamedTuples with leading axis [k,...], varying across outer axis 'p'
+        local_markov_chain_stats, local_emission_stats, local_lls \
+                                        = e_step(params, local_batch_emissions)
         
         # Reduce batch statistics across outer batch axis 'p'
         # OUTPUT: NamedTuples have leading axis [k,...], identical across outer axis 'p'
@@ -471,7 +462,7 @@ def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator
         map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
 
         # Calculate expected marginal log likeliood of scaled minibatch
-        expected_lp = log_prior(params, prior_params) + num_batches * lax.psum(batched_lls.sum(), axis_name='p')
+        expected_lp = log_prior(params, prior_params) + num_batches * collective_lls
 
         return map_params, (updated_markov_chain_stats, updated_emission_stats), expected_lp
 
