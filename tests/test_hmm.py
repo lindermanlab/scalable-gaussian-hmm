@@ -55,7 +55,7 @@ def make_rnd_hmm_params(num_states=5, emission_dim=2):
         emission_covariances=emission_covs
     )
 
-def test_em(num_states=3, emission_dim=2, num_timesteps=1000, num_batches=20, num_epochs=5):
+def test_em(num_states=3, emission_dim=2, num_timesteps=1000, num_batches=1, num_epochs=5):
     """Test equivalence of the full-batch EM algorithm results between this
     GaussianHMM using normalized sufficient stats with the StanfardGaussianHMM."""
 

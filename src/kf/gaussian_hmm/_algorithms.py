@@ -92,11 +92,13 @@ def e_step(params, batched_emissions):
         # the regime of # len(emissions) >> 1 > posterior.smooth_probs,
         # perform the normalization after summation.
         weights = posterior.smoothed_probs       
-        normd_x = jnp.einsum("tk,ti->ki", weights, emissions) / len(emissions)
-        normd_xxT = jnp.einsum("tk,ti,tj->kij", weights, emissions, emissions) / len(emissions)
+        normalizer = 1. * len(emissions)
+        normd_x = jnp.einsum("tk,ti->ki", weights, emissions) / normalizer
+        normd_xxT = jnp.einsum("tk,ti,tj->kij", weights, emissions, emissions) / normalizer
 
+        num_states = weights.shape[-1]
         emission_stats = NormalizedEmissionStatistics(
-            normalizer=len(emissions)*jnp.ones(weights.shape[-1]),
+            normalizer=normalizer * jnp.ones(num_states),
             normalized_x=normd_x,
             normalized_xxT=normd_xxT,
         )
@@ -135,15 +137,25 @@ def m_step(prior_params, markov_chain_stats, emission_stats):
         natural_prior_params = niw_convert_mean_to_natural(*prior_niw_mean_params)
         
         # Normalize prior parameters by emission stats normalizer
-        normd_natural_prior_params = tree_map(
-            lambda eta: eta / normd_stats.normalizer, natural_prior_params
-        )
+        # normd_natural_prior_params = tree_map(
+        #     lambda eta: eta / normd_stats.normalizer, natural_prior_params
+        # )
+
+        #unnormalized
+        normd_natural_prior_params = natural_prior_params 
 
         # Compute posterior parameters
         normd_natural_posterior_params = tree_map(
             jnp.add,
             normd_natural_prior_params,
             (1, normd_stats.normalized_xxT, normd_stats.normalized_x, 1)
+        )
+
+        # unnormalize
+        normd_natural_posterior_params =  tree_map(
+            jnp.add,
+            normd_natural_prior_params,
+            (normd_stats.normalizer, normd_stats.normalizer * normd_stats.normalized_xxT, normd_stats.normalizer * normd_stats.normalized_x, normd_stats.normalizer)
         )
         
         # Convert natural posterior parameters to mean parameterization
@@ -198,7 +210,7 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
         # Reduce expected statistics along batch dimension
         markov_chain_stats = tree_map(partial(jnp.sum, axis=0), batched_markov_chain_stats)
         emission_stats = _reduce_emission_statistics(batched_emission_stats, axis=0)
-        import pdb; pdb.set_trace()
+        
         # Compute MAP estimate
         map_params = m_step(prior_params, markov_chain_stats, emission_stats)
         
