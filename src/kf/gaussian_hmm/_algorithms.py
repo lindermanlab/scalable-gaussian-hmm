@@ -3,7 +3,7 @@ from jax import jit, vmap, lax, pmap
 from jax.tree_util import tree_map
 from functools import partial
 import optax
-from tqdm.auto import trange
+from tqdm.auto import trange, tqdm
 
 from tensorflow_probability.substrates.jax.distributions import Dirichlet
 from dynamax.hmm.inference import hmm_smoother, hmm_posterior_mode, compute_transition_probs
@@ -22,14 +22,40 @@ __all__ = [
 
 
 def _reduce_emission_statistics(stats, axis=0):
-    """Compute weighted sum of NormalizedEmissionStatistics along specified axis."""
-    total_weights = stats.normalizer.sum(axis=axis, keepdims=True)
-    normd_weights = stats.normalizer/total_weights
+    """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
+
+    Args:
+        stats with element shapes [b,k], [b,k,d], [b,k,d,d]
+    
+    Returns
+        reduced_stats with element shapes [k,], [k,d], [k,d,d]
+    """
+    total_weights = stats.normalizer.sum(axis=axis, keepdims=True) # (1,k)
+    normd_weights = stats.normalizer/total_weights # (b,k)
 
     return NormalizedEmissionStatistics(
-        normalizer=total_weights.squeeze(),
-        normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis),
-        normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis),
+        normalizer=total_weights.squeeze(), # -> (k,)
+        normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis), # (k,d)
+        normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis), # (k,d,d)
+    )
+
+def _preduce_emission_statistics(stats):
+    """Compute an all-reduce weighted sum of NormalizedEmissionStatistics over
+    the pmapped axis. Used in parallelized algorithms.
+
+    Arguments
+        stats with element shapes [...,k], [...,k,d], [...,k,d,d] with leading axis 'p'
+    
+    Returns
+        reduced_stats with same shape as stats
+    """
+    total_weights = lax.psum(stats.normalizer, axis_name='p') # (k,)
+    normd_weights = stats.normalizer/total_weights # (k,) with leading axis 'p' 
+
+    return NormalizedEmissionStatistics(
+        normalizer=total_weights, # -> (k,)
+        normalized_x=lax.psum(normd_weights[...,None] * stats.normalized_x, axis_name='p'), # (k,d)
+        normalized_xxT=lax.psum(normd_weights[...,None,None] * stats.normalized_xxT, axis_name='p'), # (k,d,d)
     )
 
 # -----------------------------------------------------------------------------
@@ -62,12 +88,12 @@ def e_step(params, batched_emissions):
     """Compute expected sufficient statistics under the posterior.
     
     Arguments
-        params (Paramters)
+        params (Parameters)
         batched_emissions[b,t,d]
 
     Returns
-        batched_marko_chain_stats: HiddenMarkovChainStatistics with leading (B,K,...) dimensions
-        batched_emission_stats: NormalizedGaussianStatistics with leading (B,K,...) dimensions
+        batched_marko_chain_stats (HiddenMarkovChainStatistics([b,k,...]))
+        batched_emission_stats (NormalizedGaussianStatistics([b,k,...]))
         posterior_marginal_loglik[b,]
     """
 
@@ -109,14 +135,12 @@ def m_step(prior_params, markov_chain_stats, emission_stats):
     Implicitly assumes that num_states > 1.
 
     Arguments
-        initial_stats[k,]
-        transition_stats[k,k]
-        emission_stats (NormalizedGaussianStatistics): Normalized
-            Gaussian statistics, with leading (K,...) dimensions
         prior_params (PriorParameters): Parameter values of prior distributions
+        markov_chain_stats (HiddenMarkovChainStatistics([k,...]))
+        emission_stats (NormalizedGaussianStatistics([k,...]))
     
     Returns
-        Parameters: Maximum a posterior (MAP) parameters of Gaussian HMM
+        map_params (Parameters)
     """
 
     # Calculate mode of posterior initial distribution
@@ -221,14 +245,31 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
 # ==============================================================================
 
 def _update_rolling_emission_statistics(rolling_stats, minibatch_stats, alpha, scale):
-    """Update rolling weighted sum of NormalizedEmissionStatistics."""
+    """Update rolling set of emission stats with stats from minibatch.
+    
+    Used in stochastic EM algorithm.
+
+    Arguments
+        rolling_stats (NormalizedEmissionStats([k,...])):
+            Emission stats representing accumulation of previously-seen emissions
+        minibatch_stats (NormalizedEmissionStats([k,...])): 
+            Emission stats calculated from this minibatch of emissions
+        alpha (float): Learning rate
+        scale (float): Factor to scale minibatch_stats up by.
+            TODO When using normalization by len(batch_emissions), we should
+            then be able to omit this term.
+
+    Returns
+       updated_rolling_stats (NormalizedEmissionStats([k,...])):
+    """
+
     rolling_normalizer = (1-alpha) * rolling_stats.normalizer
     minibatch_normalizer = alpha * scale * minibatch_stats.normalizer
     updated_normalizer = rolling_normalizer + minibatch_normalizer
 
-    _weighted_update = (lambda s0, s1:
-        jnp.einsum('k,k...->k...', rolling_normalizer/updated_normalizer, s0)
-        + jnp.einsum('k,k...->k...', minibatch_normalizer/updated_normalizer, s1)
+    _weighted_update = (lambda rolling_stat, minibatch_stat:
+        jnp.einsum('k,k...->k...', rolling_normalizer/updated_normalizer, rolling_stat)
+        + jnp.einsum('k,k...->k...', minibatch_normalizer/updated_normalizer, minibatch_stat)
     )
     
     return NormalizedEmissionStatistics(
@@ -257,15 +298,15 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     Arguments
         initial_params (Parameters)
         prior_params (PriorParams)
-        emissions_generator: An iterable that produces emission minibatches
-            of shape [m,t,d]. Automatically shuffles after each epoch.
+        emissions_generator (Generator->[m,t,d]): Produces minibatches of
+            emissions. Automatically shuffles after each epoch.
         schedule (optax schedule, Callable: int -> [0, 1]): Learning rate
             schedule; defaults to exponential schedule.
         num_epochs (int): Number of StEM iterations to run over full dataset
         verbose (bool): If true, print progress bar.
     
     Returns
-        fitted_params (gaussian_hmm.Parameters)
+        fitted_params (Parameters)
         log_probs [num_epochs, num_batches]
     """
     
@@ -346,34 +387,33 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
 def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator,
                                schedule=None, num_epochs=5, verbose=True):
     """Estimate model parameterss from emissions using stochastic
-    Expectation-Maximization (StEM) with parallelized E-step.
+    Expectation-Maximization (StEM) parallelized across multiple devices.
 
-    Let the original dataset consists of N independent sequences of length T.
-    The StEM algorithm then performs EM on each random subset of M sequences
-    (not timesteps) during each epoch. Specifically, it will perform N//M
-    iterations of EM per epoch. The algorithm uses a learning rate schedule
-    to anneal the minibatch sufficient statistics at each stage of training.
-    If a schedule is not specified, an exponentially decaying model is used
-    such that the learning rate which decreases by 5% at each epoch.
+    This algorithm makes use of JAX's pmap and collective all-reduce operations
+    to perform the expensive E-steps in parallel. It assumes that there are 'p'
+    devices, which must EXACTLY match the 'p' in the minibatch shape returned
+    by the emissions_generator iterable. All other arguments are the same.
 
-    NB: This algorithm assumes that the `emissions_generator` object automatically
-    shuffles minibatch sequences before each epoch. It is up to the user to
-    correctly instantiate this object to exhibit this property. For example,
-    `torch.utils.data.DataLoader` objects implement such a functionality.
+    Currently, this code assumes parallelization over multiple CPU cores on the
+    same devices. This requires the user to set the environment flags
+        XLA_FLAGS=--xla_force_host_platform_device_count=[p]
+
+    For details regarding the stochastic EM algorithm, see documentation for
+    `fit_stochastic_em` code above.
     
     Arguments
         initial_params (Parameters)
         prior_params (PriorParams)
-        emissions_generator: An iterable that produces emission minibatches
-            of shape [m,t,d]. Automatically shuffles after each epoch.
+        emissions_generator(Generator->[p,m,t,d]): Produces minibatches of
+            emissions. Automatically shuffles after each epoch.
         schedule (optax schedule, Callable: int -> [0, 1]): Learning rate
             schedule; defaults to exponential schedule.
         num_epochs (int): Number of StEM iterations to run over full dataset
-        verbose (bool): If true, print progress bar.
+        verbose (bool): If true, print progress bar. TODO
     
     Returns
-        fitted_params (gaussian_hmm.Parameters)
-        log_probs [num_epochs, num_batches]
+        fitted_params (Parameters)
+        log_probs[num_epochs, num_batches]
     """
     
     num_batches = len(emissions_generator)
@@ -392,35 +432,6 @@ def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator
     learning_rates = schedule(jnp.arange(num_epochs * num_batches))
     assert learning_rates[0] == 1.0, "Learning rate must start at 1."
     learning_rates = learning_rates.reshape(num_epochs, num_batches)
-
-
-    def _reduce_emission_statistics(stats, axis=0):
-        """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
-        stats.normalizer (m,k)
-        stats.normalized_x (m,k,d)
-        """
-        total_weights = stats.normalizer.sum(axis=axis, keepdims=True) # (1,k)
-        normd_weights = stats.normalizer/total_weights # (m,k)
-
-        return NormalizedEmissionStatistics(
-            normalizer=total_weights.squeeze(), # -> (k,)
-            normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis), # (k,d)
-            normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis), # (k,d,d)
-        )
-
-    def _preduce_emission_statistics(stats):
-        """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
-        IN stats have (k,...) with leading named axis 'p'
-        OUT stats have (k,...) with no leading axis
-        """
-        total_weights = lax.psum(stats.normalizer, axis_name='p') # (k,)
-        normd_weights = stats.normalizer/total_weights # (k,) with leading axis 'p' 
-
-        return NormalizedEmissionStatistics(
-            normalizer=total_weights, # -> (k,)
-            normalized_x=lax.psum(normd_weights[...,None] * stats.normalized_x, axis_name='p'), # (k,d)
-            normalized_xxT=lax.psum(normd_weights[...,None,None] * stats.normalized_xxT, axis_name='p'), # (k,d,d)
-        )
 
     @partial(pmap, in_axes=(None, None, None, None, None, 0), axis_name='p')
     def em_step(prior_params, params, rolling_stats, learning_rate, num_batches, local_batch_emissions):
@@ -459,40 +470,47 @@ def fit_parallel_stochastic_em(initial_params, prior_params, emissions_generator
         # Call M-step
         map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
 
-        return map_params, (updated_markov_chain_stats, updated_emission_stats)    
+        # Calculate expected marginal log likeliood of scaled minibatch
+        expected_lp = log_prior(params, prior_params) + num_batches * lax.psum(batched_lls.sum(), axis_name='p')
+
+        return map_params, (updated_markov_chain_stats, updated_emission_stats), expected_lp
 
 
-    # Initialize
+    # Initialize and train
     params = initial_params
     rolling_stats = initialize_statistics(num_states, emission_dim)
     expected_log_probs = jnp.empty((0, len(emissions_generator)))
 
-    # Train
-    for epoch in trange(num_epochs):
+    for epoch in range(num_epochs):
         epoch_expected_lps = []
 
-        for minibatch, minibatch_emissions in enumerate(trange(emissions_generator)):
+        pbar = (
+            enumerate(tqdm(emissions_generator, desc=f'epoch {epoch}'))
+            if verbose else enumerate(emissions_generator)
+        )
+        for minibatch, minibatch_emissions in pbar:
             # PMAPPED INPUT into em_step: minibatch_emissions[p,m,t,d]
             # OUTPUTS: NamedTuples whose leaves have leading axis [p,...],
             #          values are identical across this dimension
-            pbatch_params, pbatch_stats = em_step(prior_params,
-                                                  params,
-                                                  rolling_stats,
-                                                  learning_rates[epoch][minibatch],
-                                                  num_batches,
-                                                  minibatch_emissions)
+            pbatch_params, pbatch_stats, pbatch_expected_lps \
+                                                = em_step(prior_params,
+                                                          params,
+                                                          rolling_stats,
+                                                          learning_rates[epoch][minibatch],
+                                                          num_batches,
+                                                          minibatch_emissions)
 
             # Select one of these (redundant) values
-            params, rolling_stats = tree_map(lambda arr: arr[0], (pbatch_params, pbatch_stats))
+            params, rolling_stats, minibatch_expected_lp = tree_map(
+                lambda arr: arr[0], (pbatch_params, pbatch_stats, pbatch_expected_lps)
+            )
             
-            # TODO return expected lp from pmap function
-            # epoch_expected_lps.append(minibatch_expected_lp)
+            epoch_expected_lps.append(minibatch_expected_lp)
 
         # Save epoch mean of expected log probs
-        # expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
+        expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
 
-    # return params, jnp.asarray(expected_log_probs)
-    return params, None
+    return params, jnp.asarray(expected_log_probs)
 
 # ==============================================================================
 #
