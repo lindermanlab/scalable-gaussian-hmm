@@ -28,7 +28,6 @@ from ._algorithms import (
     m_step,
     fit_em,
     fit_stochastic_em,
-    fit_parallel_stochastic_em,
     most_likely_states,
 )
 
