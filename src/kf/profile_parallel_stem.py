@@ -1,16 +1,4 @@
-"""Script for fitting HMM to killifish data via stochastic EM
-
-There exists the option to profile the train_and_checkpoint function. A note on
-how the code is written:
-    In order to record memory usage when calling `memory_usage` on a
-    python function, MUST specify stream=False (otherwise, returns None)
-    and then manually write results to file
-    NB: `memory_usage` only automatically writes to file if called by an
-        external process, i.e. with the mprof command in the command line.
-        When `mprof` called via a job, psutil has trouble finding the
-        correct process id and throws a NoProcessFound error. It still seems
-        to be able record it when submitted as non-interactive job, but
-        program fails when submitted interactively
+"""Script for profiling CPU memory usage during stochastic EM fit of HMM to kf data.
 
 Flags to set in environment
 ---------------------------
@@ -20,7 +8,7 @@ REQUIRED
 
 OPTIONAL
     JAX_ENABLE_X64 - True or False. If True, all computations performed in x64.
-    XLA_FLAGS=--xla_force_host_platform_device_count=
+    XLA_FLAGS=--xla_force_host_platform_device_count=[num_devices]
         - Number of CPUs to make visible to JAX. Set if pmap-ing
 """
 
@@ -61,8 +49,8 @@ parser.add_argument(
     '--seed', type=int, required=True,
     help='Initial RNG seed, for splitting data and intializing HMM.')
 parser.add_argument(
-    '--algorithm', type=str, default=['parallel'], choices=['regular', 'parallel'],
-    help='StEM algorithm to use.')
+    '--parallelize', action='store_true',
+    help='If specified, run parallel stochastic EM algorithm over multiple cores.')
 parser.add_argument(
     '--hmm_init_method', type=str, default='random',
     choices=['random', 'kmeans'],
@@ -88,7 +76,6 @@ parser.add_argument(
     help='FOR DEBUGGING: Maximum number of files (~days of recording) in directory to expose. Default: -1, expose all.')
 
 # ------------------------------------------------------------------------------
-@profile
 def setup_dataset(seed, seq_length, train_size, debug_max_files):
     """Setup dataset object, get sequence slices"""
 
@@ -139,6 +126,8 @@ def main():
 
     algorithm = args.algorithm
     num_epochs = args.epochs
+
+    parallelize = args.parallelize
     
     # ==========================================================================
     
@@ -150,18 +139,16 @@ def main():
 
     # Algorithm specific settings
     num_devices = jax.local_device_count()
-    if algorithm == 'parallel':
+    if parallelize:
         assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
-        eff_batch_size = batch_size // num_devices
+        local_batch_size = batch_size // num_devices
         
         def collate(sequences):
-            return onp.stack(sequences, axis=0).reshape(num_devices, eff_batch_size, seq_length, -1)
+            return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, seq_length, -1)
 
         dataloader = FishPCLoader(train_ds, train_slices, batch_size,
                                   collate_fn=collate, drop_last=True,
                                   shuffle=True, seed=int(seed_dl[-1]))
-        
-        stem_fn = GaussianHMM.fit_parallel_stochastic_em
         
     else:
         assert num_devices == 1, f'Expected 1 device, only seeing {num_devices}. Reset XLA_FLAGS setting.'
@@ -171,8 +158,6 @@ def main():
         dataloader = FishPCLoader(train_ds, train_slices, batch_size,
                                   collate_fn=collate, drop_last=True,
                                   shuffle=True, seed=int(seed_dl[-1]))
-
-        stem_fn = GaussianHMM.fit_stochastic_em
         
     print("Initialized training dataset with "
             + f"{len(train_slices):3d} sets of {seq_length/72000:.1f} hr sequences; "
@@ -182,9 +167,10 @@ def main():
     # Run 
     init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(num_states, emission_dim)
-    print(f"Initialized GaussianHMM using {init_method} init with {num_states} states")
     
-    fitted_params, lps = stem_fn(init_params, prior_params, dataloader, num_epochs=num_epochs)
+    fitted_params, lps = GaussianHMM.fit_stochastic_em(
+        init_params, prior_params, dataloader, num_epochs=num_epochs, parallelize=parallelize,
+        )
     jax.block_until_ready(lps)
 
     return

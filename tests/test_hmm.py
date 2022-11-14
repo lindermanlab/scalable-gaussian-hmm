@@ -182,8 +182,8 @@ def test_parallel_stochastic_em(num_devices=4, num_states=3, emission_dim=2, num
     emissions_generator = ArrayLoader(
         batch_emissions.reshape(num_devices, num_batches, num_timesteps, emission_dim),
         batch_size, seed=int(seed_shuffle[0]))
-    fitted_params, lps = gaussian_hmm.fit_parallel_stochastic_em(
-        init_params, prior_params, emissions_generator, num_epochs=2*num_epochs)
+    fitted_params, lps = gaussian_hmm.fit_stochastic_em(
+        init_params, prior_params, emissions_generator, num_epochs=2*num_epochs, parallelize=True)
     
     # Reference: Fit parameters using full-batch EM
     refr_fitted_params, refr_lps = gaussian_hmm.fit_em(init_params, prior_params, batch_emissions, num_epochs)
