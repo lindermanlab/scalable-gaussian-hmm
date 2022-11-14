@@ -49,8 +49,8 @@ parser.add_argument(
     '--seed', type=int, required=True,
     help='Initial RNG seed, for splitting data and intializing HMM.')
 parser.add_argument(
-    '--algorithm', type=str, default=['parallel'], choices=['regular', 'parallel'],
-    help='StEM algorithm to use.')
+    '--parallelize', action='store_true',
+    help='If specified, run parallel stochastic EM algorithm over multiple cores.')
 parser.add_argument(
     '--hmm_init_method', type=str, default='random',
     choices=['random', 'kmeans'],
@@ -126,6 +126,8 @@ def main():
 
     algorithm = args.algorithm
     num_epochs = args.epochs
+
+    parallelize = args.parallelize
     
     # ==========================================================================
     
@@ -137,18 +139,16 @@ def main():
 
     # Algorithm specific settings
     num_devices = jax.local_device_count()
-    if algorithm == 'parallel':
+    if parallelize:
         assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
-        eff_batch_size = batch_size // num_devices
+        local_batch_size = batch_size // num_devices
         
         def collate(sequences):
-            return onp.stack(sequences, axis=0).reshape(num_devices, eff_batch_size, seq_length, -1)
+            return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, seq_length, -1)
 
         dataloader = FishPCLoader(train_ds, train_slices, batch_size,
                                   collate_fn=collate, drop_last=True,
                                   shuffle=True, seed=int(seed_dl[-1]))
-        
-        stem_fn = GaussianHMM.fit_parallel_stochastic_em
         
     else:
         assert num_devices == 1, f'Expected 1 device, only seeing {num_devices}. Reset XLA_FLAGS setting.'
@@ -158,8 +158,6 @@ def main():
         dataloader = FishPCLoader(train_ds, train_slices, batch_size,
                                   collate_fn=collate, drop_last=True,
                                   shuffle=True, seed=int(seed_dl[-1]))
-
-        stem_fn = GaussianHMM.fit_stochastic_em
         
     print("Initialized training dataset with "
             + f"{len(train_slices):3d} sets of {seq_length/72000:.1f} hr sequences; "
@@ -170,7 +168,9 @@ def main():
     init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(num_states, emission_dim)
     
-    fitted_params, lps = stem_fn(init_params, prior_params, dataloader, num_epochs=num_epochs)
+    fitted_params, lps = GaussianHMM.fit_stochastic_em(
+        init_params, prior_params, dataloader, num_epochs=num_epochs, parallelize=parallelize,
+        )
     jax.block_until_ready(lps)
 
     return
