@@ -428,13 +428,13 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     expected_log_probs = jnp.empty((0, len(emissions_generator)))
 
     # Train
-    for epoch in trange(num_epochs):
+    for epoch in range(num_epochs):
         epoch_expected_lps = []
 
-        # TODO Does this work outside of pytest environment?
-        pbar = (enumerate(tqdm(emissions_generator, desc=f'epoch {epoch}'))
+        # Does this work outside of pytest environment?
+        pbar = (enumerate(tqdm(emissions_generator, desc=f'epoch {epoch}/{num_epochs}'))
                 if verbose else enumerate(emissions_generator))
-        for minibatch, minibatch_emissions in enumerate(emissions_generator):
+        for minibatch, minibatch_emissions in pbar:
             
             params, rolling_stats, expected_lp = step_fn(
                 params, rolling_stats, learning_rates[epoch][minibatch], minibatch_emissions
