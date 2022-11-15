@@ -229,6 +229,8 @@ def _update_rolling_emission_statistics(rolling_stats, minibatch_stats, alpha, s
     """Update rolling set of emission stats with stats from minibatch.
     
     Used in stochastic EM algorithm.
+    
+    !! TODO REMOVE !!
 
     Arguments
         rolling_stats (NormalizedEmissionStats([k,...])):
@@ -245,7 +247,7 @@ def _update_rolling_emission_statistics(rolling_stats, minibatch_stats, alpha, s
     """
 
     rolling_normalizer = (1-alpha) * rolling_stats.normalizer
-    minibatch_normalizer = alpha * scale * minibatch_stats.normalizer
+    minibatch_normalizer = alpha * minibatch_stats.normalizer
     updated_normalizer = rolling_normalizer + minibatch_normalizer
 
     _weighted_update = (lambda rolling_stat, minibatch_stat:
@@ -271,12 +273,14 @@ def _stochastic_em_step(prior_params, params, rolling_stats,
                                     = e_step(params, minibatch_emissions)
 
     # Convexly combine minibatch statistics into rolling statistics
+    # TODO Anyway to scale these as well?
     updated_markov_chain_stats = tree_map(
         lambda s0, s1: (1-learning_rate) * s0 + learning_rate * num_batches * s1,
         rolling_markov_chain_stats, minibatch_markov_chain_stats)
 
-    updated_emission_stats = _update_rolling_emission_statistics(
-        rolling_emission_stats, minibatch_emission_stats, learning_rate, num_batches,)
+    updated_emission_stats = tree_map(
+        lambda s0, s1: (1-learning_rate) * s0 + learning_rate * s1,
+        rolling_emission_stats, minibatch_emission_stats)
 
     # Call M-step
     map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
@@ -286,23 +290,19 @@ def _stochastic_em_step(prior_params, params, rolling_stats,
     
     return map_params, (updated_markov_chain_stats, updated_emission_stats), expected_lp
 
-def _preduce_emission_statistics(stats):
+def preduce_emission_statistics(stats):
     """Compute an all-reduce weighted sum of NormalizedEmissionStatistics over
-    the pmapped axis. Used in parallelized algorithms.
+    the pmapped axis. Parallelized version of `reduce_emission_statsitics.`
 
-    Arguments
-        stats with element shapes [...,k], [...,k,d], [...,k,d,d] with leading axis 'p'
-    
-    Returns
-        reduced_stats with same shape as stats
+    Resulting stats have same shape as input stats, i.e. elements have shape
+    ([...,k,...],) with leading axis 'p'. However, resulting stats contain
+    (redundant) resultant values.
     """
-    total_weights = lax.psum(stats.normalizer, axis_name='p') # (k,)
-    normd_weights = stats.normalizer/total_weights # (k,) with leading axis 'p' 
-
     return NormalizedEmissionStatistics(
-        normalizer=total_weights, # -> (k,)
-        normalized_x=lax.psum(normd_weights[...,None] * stats.normalized_x, axis_name='p'), # (k,d)
-        normalized_xxT=lax.psum(normd_weights[...,None,None] * stats.normalized_xxT, axis_name='p'), # (k,d,d)
+        normalizer=lax.psum(stats.normalizer, axis_name='p'),
+        weights=lax.pmean(stats.weights, axis_name='p'),
+        xxT=lax.pmean(stats.xxT, axis_name='p'),
+        x=lax.pmean(stats.x, axis_name='p'),
     )
 
 @partial(pmap, in_axes=(None, None, None, None, None, 0), axis_name='p')
@@ -319,7 +319,7 @@ def _parallel_stochastic_em_step(prior_params, params, rolling_stats,
     collective_markov_chain_stats, collective_lls = tree_map(
         partial(lax.psum, axis_name='p'), (local_markov_chain_stats, local_lls))
 
-    collective_emission_stats = _preduce_emission_statistics(local_emission_stats)
+    collective_emission_stats = preduce_emission_statistics(local_emission_stats)
 
     # Convexly combine rolling statistics with collective statistics
     # All stats and lls are now identical across devices (across outer axis 'p')
@@ -329,9 +329,10 @@ def _parallel_stochastic_em_step(prior_params, params, rolling_stats,
         lambda s0, s1: (1-learning_rate) * s0 + learning_rate * num_batches * s1,
         rolling_markov_chain_stats, collective_markov_chain_stats)
 
-    updated_emission_stats = _update_rolling_emission_statistics(
-        rolling_emission_stats, collective_emission_stats, learning_rate, num_batches,)
-
+    updated_emission_stats = tree_map(
+        lambda s0, s1: (1-learning_rate) * s0 + learning_rate * num_batches * s1,
+        rolling_emission_stats, collective_emission_stats)
+    
     # Call M-step
     map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
 
@@ -390,7 +391,7 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     # Set global training learning rates: shape (num_epochs, num_batches)
     if schedule is None:
         schedule = optax.exponential_decay(
-            init_value=1.,
+            init_value=1., 
             end_value=0.,
             transition_steps=num_batches,
             decay_rate=.95,
