@@ -55,7 +55,7 @@ def make_rnd_hmm_params(num_states=5, emission_dim=2):
         emission_covariances=emission_covs
     )
 
-def test_em(num_states=3, emission_dim=2, num_timesteps=1000, num_batches=1, num_epochs=5):
+def test_em(num_states=3, emission_dim=2, num_timesteps=1000, num_batches=20, num_epochs=400):
     """Test equivalence of the full-batch EM algorithm results between this
     GaussianHMM using normalized sufficient stats with the StanfardGaussianHMM."""
 
@@ -71,23 +71,13 @@ def test_em(num_states=3, emission_dim=2, num_timesteps=1000, num_batches=1, num
     prior_params = gaussian_hmm.initialize_prior_from_scalar_values(num_states, emission_dim)
     fitted_params, lps = gaussian_hmm.fit_em(init_params, prior_params, batch_emissions, num_epochs)
 
-    # Evaluate
-    target_emission_means = jnp.array([[-0.500,  0.865],
-                                       [ 0.239, -0.438],
-                                       [ 0.203, -0.465]])
-    target_emission_covs_k = jnp.array([[[ 5.67e-01, 3.23e-01],
-                                         [ 3.23e-01, 1.94e-01]]])
-    target_initial_probs = jnp.array([0.300, 0.036, 0.663])
-    target_transition_probs = jnp.array([[0.954, 0.008, 0.038],
-                                                [0.047, 0.073, 0.881 ],
-                                                [0.002, 0.859, 0.139 ]])
-    target_lps = jnp.array([-56742.3, -40231.3, -27970.1, -6047.1, 4192.1])
-
-    assert jnp.allclose(target_emission_means, fitted_params.emission_means, atol=1e-3)
-    assert jnp.allclose(target_emission_covs_k, fitted_params.emission_covariances[-1], atol=1e-2)
-    assert jnp.allclose(target_initial_probs, fitted_params.initial_probs, atol=1e-3)
-    assert jnp.allclose(target_transition_probs, fitted_params.transition_probs, atol=1e-3)
-    assert jnp.allclose(target_lps, lps, atol=1e1)
+    # Evaluate (don't evaluate initial probs, since we only get num_batches observations of it)
+    # TODO Write find_optimal_permutation function
+    i_perm = jnp.array([1,0,2])
+    assert jnp.allclose(true_params.emission_means[i_perm], fitted_params.emission_means, atol=1e-2)
+    assert jnp.allclose(true_params.emission_covariances[i_perm][0], fitted_params.emission_covariances[-1], atol=1e-2)
+    assert jnp.allclose(true_params.transition_probs.T, fitted_params.transition_probs, atol=1e-2)
+    assert jnp.all(jnp.diff(lps) >= 0.) # log probability should be steadily increasingas
 
 # ------------------------------------------------------------------------------
 
