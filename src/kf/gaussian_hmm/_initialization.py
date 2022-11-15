@@ -144,8 +144,9 @@ def initialize_statistics(num_states, emission_dim, batch_shape=()):
 
     emission_stats = NormalizedEmissionStatistics(
         normalizer=jnp.zeros((*batch_shape, num_states)),
-        normalized_x=jnp.zeros((*batch_shape, num_states, emission_dim)),
-        normalized_xxT=jnp.zeros((*batch_shape, num_states, emission_dim, emission_dim)),
+        weights=jnp.zeros((*batch_shape, num_states)),
+        xxT=jnp.zeros((*batch_shape, num_states, emission_dim, emission_dim)),
+        x=jnp.zeros((*batch_shape, num_states, emission_dim)),
     )
 
     return chain_stats, emission_stats

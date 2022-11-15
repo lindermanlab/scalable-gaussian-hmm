@@ -24,22 +24,19 @@ __all__ = [
 # EXPECTATION FUNCTIONS
 # ==============================================================================
 
-def _reduce_emission_statistics(stats, axis=0):
-    """Compute weighted sum of NormalizedEmissionStatistics along specified axis.
+def reduce_emission_statistics(stats):
+    """Compute weighted sum of NormalizedEmissionStatistics along specified axis,
+    i.e. reducing elements ([b,k,...],) -> ([k,...]).
 
-    Args:
-        stats with element shapes [b,k], [b,k,d], [b,k,d,d]
-    
-    Returns
-        reduced_stats with element shapes [k,], [k,d], [k,d,d]
+    Since normalizer is constant across all batches, then the sufficient
+    statistics are simply an average across batch dimensions.
     """
-    total_weights = stats.normalizer.sum(axis=axis, keepdims=True) # (1,k)
-    normd_weights = stats.normalizer/total_weights # (b,k)
 
     return NormalizedEmissionStatistics(
-        normalizer=total_weights.squeeze(), # -> (k,)
-        normalized_x=(normd_weights[...,None]*stats.normalized_x).sum(axis=axis), # (k,d)
-        normalized_xxT=(normd_weights[...,None, None] * stats.normalized_xxT).sum(axis=axis), # (k,d,d)
+        normalizer=stats.normalizer.sum(axis=0),
+        weights=stats.weights.mean(axis=0),
+        xxT=stats.xxT.mean(axis=0),
+        x=stats.x.mean(axis=0),
     )
 
 def e_step(params, batched_emissions):
@@ -70,19 +67,21 @@ def e_step(params, batched_emissions):
         )
 
         # Compute normalized emission statistics. Since we typically work in
-        # the regime of # len(emissions) >> 1 > posterior.smooth_probs,
-        # perform the normalization after summation.
-        weights = posterior.smoothed_probs       
-        normalizer = 1. * len(emissions)
-        normd_x = jnp.einsum("tk,ti->ki", weights, emissions) / normalizer
-        normd_xxT = jnp.einsum("tk,ti,tj->kij", weights, emissions, emissions) / normalizer
+        # the regime of (len(emissions) >> 1 > posterior.smooth_probs),
+        # let's perform the normalization after summation.
+        weights = posterior.smoothed_probs
+        normalized_weights = jnp.sum(weights, axis=0) / len(emissions)
+        normalized_x = jnp.einsum("tk,ti->ki", weights, emissions) / len(emissions)
+        normalized_xxT = jnp.einsum("tk,ti,tj->kij", weights, emissions, emissions) / len(emissions)
 
         num_states = weights.shape[-1]
         emission_stats = NormalizedEmissionStatistics(
-            normalizer=normalizer * jnp.ones(num_states),
-            normalized_x=normd_x,
-            normalized_xxT=normd_xxT,
+            normalizer=len(emissions)*jnp.ones(num_states),
+            weights=normalized_weights,
+            xxT=normalized_xxT,
+            x=normalized_x,
         )
+
         return chain_stats, emission_stats, posterior.marginal_loglik
 
     # Map the E-step calculations over the batch dimension
@@ -91,7 +90,7 @@ def e_step(params, batched_emissions):
 
     # Reduce batched outputs along batch dimension
     reduced_chain_stats = tree_map(partial(jnp.sum, axis=0), batched_chain_stats)
-    reduced_emission_stats = _reduce_emission_statistics(batched_emission_stats)
+    reduced_emission_stats = reduce_emission_statistics(batched_emission_stats)
     reduced_marginal_logliks = batched_marginal_logliks.sum()
 
     return reduced_chain_stats, reduced_emission_stats, reduced_marginal_logliks
@@ -146,28 +145,15 @@ def m_step(prior_params, markov_chain_stats, emission_stats):
     def _single_emission_m_step(normd_stats, prior_niw_mean_params):
         # Convert prior NIW parameters to natural parameterization
         natural_prior_params = niw_convert_mean_to_natural(*prior_niw_mean_params)
-        
-        # Normalize prior parameters by emission stats normalizer
-        # normd_natural_prior_params = tree_map(
-        #     lambda eta: eta / normd_stats.normalizer, natural_prior_params
-        # )
 
-        #unnormalized
-        normd_natural_prior_params = natural_prior_params 
+        # Normalize prior parameters by emission stats normalizer
+        normd_natural_prior_params \
+            = tree_map(lambda eta: eta / normd_stats.normalizer, natural_prior_params)
 
         # Compute posterior parameters
-        normd_natural_posterior_params = tree_map(
-            jnp.add,
-            normd_natural_prior_params,
-            (1, normd_stats.normalized_xxT, normd_stats.normalized_x, 1)
-        )
-
-        # unnormalize
-        normd_natural_posterior_params =  tree_map(
-            jnp.add,
-            normd_natural_prior_params,
-            (normd_stats.normalizer, normd_stats.normalizer * normd_stats.normalized_xxT, normd_stats.normalizer * normd_stats.normalized_x, normd_stats.normalizer)
-        )
+        normd_emission_suff_stats = (normd_stats.weights, normd_stats.xxT, normd_stats.x, normd_stats.weights)
+        normd_natural_posterior_params \
+            = tree_map(jnp.add, normd_natural_prior_params, normd_emission_suff_stats)
         
         # Convert natural posterior parameters to mean parameterization
         posterior_loc, _, _, posterior_scale \
@@ -212,7 +198,7 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
         lps (ndarray[num_epochs,])
     """
 
-    # @jit
+    @jit
     def em_step(params):
         # Compute expected sufficient statistics
         markov_chain_stats, emission_stats, lls = e_step(params, batched_emissions)
@@ -222,6 +208,7 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
         
         # calculate log likelihood
         lp = log_prior(params, prior_params) + lls
+
         return map_params, lp
 
     log_probs = []

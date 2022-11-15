@@ -44,8 +44,9 @@ class HiddenMarkovChainStatistics(NamedTuple):
 
 class NormalizedEmissionStatistics(NamedTuple):
     normalizer: jnp.ndarray
-    normalized_x: jnp.ndarray
-    normalized_xxT: jnp.ndarray
+    weights: jnp.ndarray
+    xxT: jnp.ndarray
+    x: jnp.ndarray
 
 # -----------------------------------------------------------------------------
 
