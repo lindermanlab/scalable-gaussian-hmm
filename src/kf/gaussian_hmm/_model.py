@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from chex import dataclass
 import jax.numpy as jnp
 import jax.random as jr
 from jax import vmap, lax
@@ -23,13 +23,15 @@ __all__ = [
 # Parameters and statistics for a Gaussian HMM with a Dirichlet prior
 # on the hidden Markov Chain and normal inverse wishart prior on emissions
 
-class Parameters(NamedTuple):
+@dataclass
+class Parameters():
     initial_probs: jnp.ndarray
     transition_probs: jnp.ndarray
     emission_means: jnp.ndarray
     emission_covariances: jnp.ndarray
 
-class PriorParameters(NamedTuple):
+@dataclass
+class PriorParameters():
     initial_probs_conc: jnp.ndarray
     transition_probs_conc: jnp.ndarray
     emission_loc: jnp.ndarray
@@ -37,7 +39,8 @@ class PriorParameters(NamedTuple):
     emission_scale: jnp.ndarray
     emission_df: jnp.ndarray
 
-class NormalizedGaussianHMMStatistics(NamedTuple):
+@dataclass
+class NormalizedGaussianHMMStatistics():
     initial_pseudocounts: jnp.ndarray
     transition_pseudocounts: jnp.ndarray
     emission_weights: jnp.ndarray
