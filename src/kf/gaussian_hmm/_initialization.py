@@ -6,8 +6,7 @@ from sklearn.cluster import KMeans
 
 from kf.gaussian_hmm._model import (Parameters,
                                    PriorParameters,
-                                   HiddenMarkovChainStatistics,
-                                   NormalizedEmissionStatistics,) 
+                                   NormalizedGaussianHMMStatistics) 
 
 
 def _random_init(seed, num_states, emission_dim):
@@ -138,15 +137,14 @@ def initialize_statistics(num_states, emission_dim, batch_shape=()):
         normalizer (ndarray)
     """
 
-    chain_stats = HiddenMarkovChainStatistics(
+    stats = NormalizedGaussianHMMStatistics(
         initial_pseudocounts=jnp.zeros((*batch_shape, num_states)),
         transition_pseudocounts=jnp.zeros((*batch_shape, num_states, num_states,)),
+        emission_weights=jnp.zeros((*batch_shape, num_states)),
+        emission_xxT=jnp.zeros((*batch_shape, num_states, emission_dim, emission_dim)),
+        emission_x=jnp.zeros((*batch_shape, num_states, emission_dim)),
     )
 
-    emission_stats = NormalizedEmissionStatistics(
-        weights=jnp.zeros((*batch_shape, num_states)),
-        xxT=jnp.zeros((*batch_shape, num_states, emission_dim, emission_dim)),
-        x=jnp.zeros((*batch_shape, num_states, emission_dim)),
-    )
+    normalizer = jnp.zeros((*batch_shape, num_states))
 
-    return chain_stats, emission_stats, jnp.zeros((*batch_shape, num_states))
+    return stats, normalizer
