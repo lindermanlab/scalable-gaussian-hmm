@@ -40,15 +40,19 @@ def reduce_emission_statistics(stats):
     )
 
 def e_step(params, batched_emissions):
-    """Compute expected sufficient statistics under the posterior, across all batches.
+    """Compute normalized expected sufficient statistics under the posterior,
+    across all batches.
     
-    TODO Why don't we just reduce over batch dimension of statistics here?
-    We never actually make use of the batches.
+    Since we typically work in the regime of
+        len(emissions) >> 1 > posterior.smooth_probs,
+    normalization by len(emissions) is performed after summation.
+
     Arguments
         params (Parameters)
         batched_emissions[b,t,d]
 
     Returns
+        normalizer (ndarray[k,]
         markov_chain_stats (HiddenMarkovChainStatistics([k,...]))
         emission_stats (NormalizedGaussianStatistics([k,...]))
         marginal_loglik (float)
@@ -60,40 +64,39 @@ def e_step(params, batched_emissions):
                                  params.transition_probs,
                                  log_likelihood(params, emissions))
 
-        # Compute statistics of Hidden Markov Chain
-        chain_stats = HiddenMarkovChainStatistics(
-            initial_pseudocounts = posterior.initial_probs / len(emissions),
-            transition_pseudocounts = compute_transition_probs(params.transition_probs, posterior) / len(emissions),
+        # Normalized hidden Markov Chain statistics
+        summed_chain_stats = HiddenMarkovChainStatistics(
+            initial_pseudocounts = posterior.initial_probs,
+            transition_pseudocounts = compute_transition_probs(params.transition_probs, posterior),
+        )
+        chain_stats = tree_map(lambda stat: stat / len(emissions), summed_chain_stats)
+
+        # Normalized Gaussian emission statistics
+        weights = posterior.smoothed_probs
+        summed_emission_stats = NormalizedEmissionStatistics(
+            weights=jnp.sum(weights, axis=0),
+            xxT=jnp.einsum("tk,ti,tj->kij", weights, emissions, emissions),
+            x=jnp.einsum("tk,ti->ki", weights, emissions),
         )
 
-        # Compute normalized emission statistics. Since we typically work in
-        # the regime of (len(emissions) >> 1 > posterior.smooth_probs),
-        # let's perform the normalization after summation.
-        weights = posterior.smoothed_probs
-        normalized_weights = jnp.sum(weights, axis=0) / len(emissions)
-        normalized_x = jnp.einsum("tk,ti->ki", weights, emissions) / len(emissions)
-        normalized_xxT = jnp.einsum("tk,ti,tj->kij", weights, emissions, emissions) / len(emissions)
+        emission_stats = tree_map(lambda stat: stat / len(emissions), summed_emission_stats)
 
         num_states = weights.shape[-1]
-        emission_stats = NormalizedEmissionStatistics(
-            normalizer=len(emissions)*jnp.ones(num_states),
-            weights=normalized_weights,
-            xxT=normalized_xxT,
-            x=normalized_x,
-        )
+        normalizer = len(emissions) * jnp.ones(num_states)
 
-        return chain_stats, emission_stats, posterior.marginal_loglik
+        return chain_stats, emission_stats, normalizer, posterior.marginal_loglik
 
     # Map the E-step calculations over the batch dimension
-    batched_chain_stats, batched_emission_stats, batched_marginal_logliks \
+    batched_chain_stats, batched_emission_stats, batched_normalizer, batched_marginal_logliks \
                                         = vmap(_single_e_step)(batched_emissions)
 
     # Reduce batched outputs along batch dimension
-    reduced_chain_stats = tree_map(partial(jnp.mean, axis=0), batched_chain_stats)
-    reduced_emission_stats = reduce_emission_statistics(batched_emission_stats)
+    reduced_chain_stats, reduced_emission_stats = tree_map(
+        partial(jnp.mean, axis=0), (batched_chain_stats, batched_emission_stats))
+    reduced_normalizer = jnp.sum(batched_normalizer, axis=0)
     reduced_marginal_logliks = batched_marginal_logliks.sum()
 
-    return reduced_chain_stats, reduced_emission_stats, reduced_marginal_logliks
+    return reduced_chain_stats, reduced_emission_stats, reduced_normalizer, reduced_marginal_logliks
 
 # ==============================================================================
 # MAXIMIZATION FUNCTIONS
@@ -117,7 +120,7 @@ def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
     df = eta_1 - dim - 2
     return loc, conc, df, scale
 
-def m_step(prior_params, markov_chain_stats, emission_stats):
+def m_step(prior_params, markov_chain_stats, emission_stats, normalizer):
     """Compute MAP estimate of Gaussian HMM parameters.
 
     Implicitly assumes that num_states > 1.
@@ -130,12 +133,12 @@ def m_step(prior_params, markov_chain_stats, emission_stats):
     Returns
         map_params (Parameters)
     """
-    normalizer = emission_stats.normalizer # using the same one
 
     normd_one = jnp.nan_to_num(1./normalizer, nan=0.0)
     dirichlet_mode = (lambda normd_alpha: 
         (normd_alpha - normd_one) / jnp.sum(normd_alpha - normd_one, axis=-1, keepdims=True)
     )
+
     # Calculate mode of posterior initial distribution (Dirichlet)
     posterior_initial_conc = (
         markov_chain_stats.initial_pseudocounts
@@ -152,13 +155,13 @@ def m_step(prior_params, markov_chain_stats, emission_stats):
     transition_probs = dirichlet_mode(posterior_transition_conc)
 
     # Calculate mode of posterior emission distribution (NIW)
-    def _single_emission_m_step(normd_stats, prior_niw_mean_params):
+    def _single_emission_m_step(prior_niw_mean_params, normd_stats, norm):
         # Convert prior NIW parameters to natural parameterization
         natural_prior_params = niw_convert_mean_to_natural(*prior_niw_mean_params)
 
-        # Normalize prior parameters by emission stats normalizer
+        # Normalize prior parameters
         normd_natural_prior_params \
-            = tree_map(lambda eta: eta / normd_stats.normalizer, natural_prior_params)
+            = tree_map(lambda eta: eta / norm, natural_prior_params)
 
         # Compute posterior parameters
         normd_emission_suff_stats = (normd_stats.weights, normd_stats.xxT, normd_stats.x, normd_stats.weights)
@@ -176,8 +179,9 @@ def m_step(prior_params, markov_chain_stats, emission_stats):
 
     # Map the emissions M-step calculation over the state dimension
     covs, means = vmap(_single_emission_m_step)(
-        emission_stats,
         (prior_params.emission_loc, prior_params.emission_conc, prior_params.emission_df, prior_params.emission_scale),
+        emission_stats,
+        normalizer
     )
 
     return Parameters(
@@ -211,10 +215,10 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
     @jit
     def em_step(params):
         # Compute expected sufficient statistics
-        markov_chain_stats, emission_stats, lls = e_step(params, batched_emissions)
+        markov_chain_stats, emission_stats, normalizer, lls = e_step(params, batched_emissions)
 
         # Compute MAP estimate
-        map_params = m_step(prior_params, markov_chain_stats, emission_stats)
+        map_params = m_step(prior_params, markov_chain_stats, emission_stats, normalizer)
         
         # calculate log likelihood
         lp = log_prior(params, prior_params) + lls
@@ -240,29 +244,28 @@ def _stochastic_em_step(prior_params, params, rolling_stats,
                         learning_rate, num_batches,
                         minibatch_emissions):
     # minibatch_emissions[m,t,d]
-    rolling_markov_chain_stats, rolling_emission_stats = rolling_stats
+    rolling_markov_chain_stats, rolling_emission_stats, rolling_normalizer = rolling_stats
 
     # Compute the sufficient stats given a minibatch of emissions
-    minibatch_markov_chain_stats, minibatch_emission_stats, minibatch_lls \
+    minibatch_markov_chain_stats, minibatch_emission_stats, minibatch_normalizer, minibatch_lls \
                                     = e_step(params, minibatch_emissions)
 
     # Convexly combine minibatch statistics into rolling statistics
-    # TODO Anyway to scale these as well?
+    _convex_update = lambda rolling_stat, minibatch_stat: \
+        (1-learning_rate) * rolling_stat + learning_rate * minibatch_stat
+    
     updated_markov_chain_stats = tree_map(
-        lambda s0, s1: (1-learning_rate) * s0 + learning_rate * s1,
-        rolling_markov_chain_stats, minibatch_markov_chain_stats)
+        _convex_update, rolling_markov_chain_stats, minibatch_markov_chain_stats)
 
     updated_emission_stats = tree_map(
-        lambda s0, s1: (1-learning_rate) * s0 + learning_rate * s1,
-        rolling_emission_stats, minibatch_emission_stats)
+        _convex_update, rolling_emission_stats, minibatch_emission_stats)
+
+    updated_normalizer = _convex_update(rolling_normalizer, minibatch_normalizer)
 
     # Call M-step
-    map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
-
-    # Calculate expected marginal log likeliood of scaled minibatch
-    expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
+    map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats, updated_normalizer)
     
-    return map_params, (updated_markov_chain_stats, updated_emission_stats), expected_lp
+    return map_params, (updated_markov_chain_stats, updated_emission_stats, updated_normalizer), minibatch_lls
 
 def preduce_emission_statistics(stats):
     """Compute an all-reduce weighted sum of NormalizedEmissionStatistics over
@@ -283,39 +286,42 @@ def preduce_emission_statistics(stats):
 def _parallel_stochastic_em_step(prior_params, params, rolling_stats,
                                  learning_rate, num_batches,
                                  local_minibatch_emissions):
+    rolling_markov_chain_stats, rolling_emission_stats, rolling_normalizer = rolling_stats
+
     # INPUT: local_minibatch_emissions[m,t,d] varying across outer axis 'p'
     # OUTPUT: NamedTuples with leading axis [k,...], varying across outer axis 'p'
-    local_markov_chain_stats, local_emission_stats, local_lls \
+    local_markov_chain_stats, local_emission_stats, local_normalizer, local_lls \
                                     = e_step(params, local_minibatch_emissions)
     
     # Reduce batch statistics across outer batch axis 'p'
     # OUTPUT: NamedTuples have leading axis [k,...], identical across outer axis 'p'
+    collective_lls = lax.psum(local_lls, axis_name='p')
+
     collective_markov_chain_stats = tree_map(
         partial(lax.pmean, axis_name='p'), local_markov_chain_stats)
 
-    collective_lls = lax.psum(local_lls, axis_name='p')
-
-    collective_emission_stats = preduce_emission_statistics(local_emission_stats)
+    collective_emission_stats = tree_map(
+        partial(lax.pmean, axis_name='p'), local_emission_stats)
+    
+    collective_normalizer = lax.psum(local_normalizer, axis_name='p')
 
     # Convexly combine rolling statistics with collective statistics
     # All stats and lls are now identical across devices (across outer axis 'p')
-    rolling_markov_chain_stats, rolling_emission_stats = rolling_stats
+    convex_update = lambda rolling_stat, minibatch_stat: \
+        (1-learning_rate) * rolling_stat + learning_rate * minibatch_stat
     
     updated_markov_chain_stats = tree_map(
-        lambda s0, s1: (1-learning_rate) * s0 + learning_rate * s1,
-        rolling_markov_chain_stats, collective_markov_chain_stats)
+        convex_update, rolling_markov_chain_stats, collective_markov_chain_stats)
 
     updated_emission_stats = tree_map(
-        lambda s0, s1: (1-learning_rate) * s0 + learning_rate * s1,
-        rolling_emission_stats, collective_emission_stats)
+        convex_update, rolling_emission_stats, collective_emission_stats)
+
+    updated_normalizer = convex_update(rolling_normalizer, collective_normalizer)
     
     # Call M-step
-    map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats)
+    map_params = m_step(prior_params, updated_markov_chain_stats, updated_emission_stats, updated_normalizer)
 
-    # Calculate expected marginal log likeliood of scaled minibatch
-    expected_lp = log_prior(params, prior_params) + num_batches * collective_lls
-
-    return map_params, (updated_markov_chain_stats, updated_emission_stats), expected_lp
+    return map_params, (updated_markov_chain_stats, updated_emission_stats, updated_normalizer), collective_lls
 
 
 def fit_stochastic_em(initial_params, prior_params, emissions_generator,
@@ -380,20 +386,21 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     def _step_fn(params, rolling_stats, learning_rate, minibatch_emissions):
         """Perform single stochastic EM step on minibatch of [m,t,d] emissions."""
         # Returns: Parameters([k,...]), *Stats([k,...]), float
-        params, rolling_stats, minibatch_expected_lp = _stochastic_em_step(
+        params, rolling_stats, minibatch_lls = _stochastic_em_step(
             prior_params, params, rolling_stats, learning_rate, num_batches, minibatch_emissions)
-        return params, rolling_stats, minibatch_expected_lp
+
+        return params, rolling_stats, minibatch_lls
     
     def _parallel_step_fn(params, rolling_stats, learning_rate, minibatch_emissions):
         """Perform single parallelized stochastic EM step on minibatch of [p,m,t,d] emissions."""
         # Returns: Parameters([p,k,...]), NormalizedEmissionStats([p,k,...]), ndarray[p,]
-        pbatch_params, pbatch_stats, pbatch_expected_lps = _parallel_stochastic_em_step(
+        pbatch_params, pbatch_stats, pbatch_lls = _parallel_stochastic_em_step(
             prior_params, params, rolling_stats, learning_rate, num_batches, minibatch_emissions)
 
-        params, rolling_stats, minibatch_expected_lp = tree_map(
-            lambda arr: arr[0], (pbatch_params, pbatch_stats, pbatch_expected_lps))
+        params, rolling_stats, minibatch_lls = tree_map(
+            lambda arr: arr[0], (pbatch_params, pbatch_stats, pbatch_lls))
         
-        return params, rolling_stats, minibatch_expected_lp
+        return params, rolling_stats, minibatch_lls
 
 
     step_fn = _parallel_step_fn if parallelize else _step_fn
@@ -412,10 +419,11 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                 if verbose else enumerate(emissions_generator))
         for minibatch, minibatch_emissions in pbar:
             
-            params, rolling_stats, expected_lp = step_fn(
+            params, rolling_stats, minibatch_lls = step_fn(
                 params, rolling_stats, learning_rates[epoch][minibatch], minibatch_emissions
             )
-                    
+                
+            expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
             epoch_expected_lps.append(expected_lp)
 
         # Save epoch mean of expected log probs

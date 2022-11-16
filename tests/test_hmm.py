@@ -18,25 +18,25 @@ def random_initialization(seed, nstates, ndim):
     
     return initial_probs, transition_matrix, emission_means, emission_covs
 
-def test_suffstats_reduce_batch():
-    """Reduction of a NormalizedGaussianStatistics tuple with leading batch
-    dimension (1,) should return itself."""
+# def test_suffstats_reduce_batch():
+#     """Reduction of a NormalizedGaussianStatistics tuple with leading batch
+#     dimension (1,) should return itself."""
 
-    num_states, emission_dim = 4, 3
+#     num_states, emission_dim = 4, 3
 
-    seed_1, seed_2 = jr.split(jr.PRNGKey(1283))
+#     seed_1, seed_2 = jr.split(jr.PRNGKey(1283))
 
-    initial_probs, trans_probs, normd_x, normd_xxT = \
-                        random_initialization(seed_1, num_states, emission_dim)
-    weights = jr.uniform(seed_2, (num_states,), minval=0., maxval=1.,)
-    ss = gaussian_hmm.NormalizedEmissionStatistics(
-        normalizer=weights, normalized_x=normd_x, normalized_xxT=normd_xxT,
-    )
+#     initial_probs, trans_probs, normd_x, normd_xxT = \
+#                         random_initialization(seed_1, num_states, emission_dim)
+#     weights = jr.uniform(seed_2, (num_states,), minval=0., maxval=1.,)
+#     ss = gaussian_hmm.NormalizedEmissionStatistics(
+#         normalizer=weights, normalized_x=normd_x, normalized_xxT=normd_xxT,
+#     )
 
-    ss_batch = tree_map(lambda x: jnp.expand_dims(x, axis=0), ss)
-    ss_batch_reduced = gaussian_hmm._algorithms._reduce_emission_statistics(ss_batch)
+#     ss_batch = tree_map(lambda x: jnp.expand_dims(x, axis=0), ss)
+#     ss_batch_reduced = gaussian_hmm._algorithms._reduce_emission_statistics(ss_batch)
 
-    assert all(tree_map(lambda a,b: jnp.all(jnp.equal(a,b)), ss, ss_batch_reduced))
+#     assert all(tree_map(lambda a,b: jnp.all(jnp.equal(a,b)), ss, ss_batch_reduced))
 
 def make_rnd_hmm_params(num_states=5, emission_dim=2):
     # Specify parameters of the HMM

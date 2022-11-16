@@ -135,6 +135,7 @@ def initialize_statistics(num_states, emission_dim, batch_shape=()):
     Returns
         chain_stats (HiddenMarkovChainStatistics)
         emission_stats (NormalizedEmissionStatistics)
+        normalizer (ndarray)
     """
 
     chain_stats = HiddenMarkovChainStatistics(
@@ -143,10 +144,9 @@ def initialize_statistics(num_states, emission_dim, batch_shape=()):
     )
 
     emission_stats = NormalizedEmissionStatistics(
-        normalizer=jnp.zeros((*batch_shape, num_states)),
         weights=jnp.zeros((*batch_shape, num_states)),
         xxT=jnp.zeros((*batch_shape, num_states, emission_dim, emission_dim)),
         x=jnp.zeros((*batch_shape, num_states, emission_dim)),
     )
 
-    return chain_stats, emission_stats
+    return chain_stats, emission_stats, jnp.zeros((*batch_shape, num_states))

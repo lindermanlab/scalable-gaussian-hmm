@@ -43,7 +43,6 @@ class HiddenMarkovChainStatistics(NamedTuple):
     transition_pseudocounts: jnp.ndarray
 
 class NormalizedEmissionStatistics(NamedTuple):
-    normalizer: jnp.ndarray
     weights: jnp.ndarray
     xxT: jnp.ndarray
     x: jnp.ndarray
