@@ -5,7 +5,7 @@ from jax import vmap, lax
 
 from tensorflow_probability.substrates.jax.distributions import (
     Dirichlet, Categorical, MultivariateNormalFullCovariance as MVNFull)
-from dynamax.distributions import NormalInverseWishart
+from dynamax.utils.distributions import NormalInverseWishart
 
 __all__ = [
     'Parameters',

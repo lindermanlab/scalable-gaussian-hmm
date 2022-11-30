@@ -5,7 +5,9 @@ from functools import partial
 import optax
 from tqdm.auto import trange, tqdm
 
-from dynamax.hmm.inference import hmm_smoother, hmm_posterior_mode, compute_transition_probs
+from dynamax.hidden_markov_model.inference import (
+    hmm_smoother, hmm_posterior_mode, compute_transition_probs
+)
 
 from kf.gaussian_hmm._initialization import initialize_statistics
 from kf.gaussian_hmm._model import *
