@@ -15,7 +15,7 @@ OPTIONAL
 import os
 import argparse
 from datetime import datetime
-# from memory_profiler import memory_usage
+from memory_profiler import memory_usage
 
 import jax
 import numpy as onp
@@ -76,6 +76,13 @@ parser.add_argument(
     help='FOR DEBUGGING: Maximum number of files (~days of recording) in directory to expose. Default: -1, expose all.')
 
 # ------------------------------------------------------------------------------
+def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
+    """Writes time-based memory profiler results to file."""
+    with open(path, mode) as f:
+        for res in mem_usage:
+            f.writelines('MEM {} {}\n'.format(res[0], res[1]))
+    return
+
 def setup_dataset(seed, seq_length, train_size, debug_max_files):
     """Setup dataset object, get sequence slices"""
 
@@ -124,7 +131,6 @@ def main():
     num_states = args.states
     init_method = args.hmm_init_method
 
-    algorithm = args.algorithm
     num_epochs = args.epochs
 
     parallelize = args.parallelize
@@ -164,15 +170,31 @@ def main():
             + f"{len(dataloader):3d} batches of {batch_size} sequences per batch")
     print()
 
-    # Run 
     init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(num_states, emission_dim)
     
-    fitted_params, lps = GaussianHMM.fit_stochastic_em(
-        init_params, prior_params, dataloader, num_epochs=num_epochs, parallelize=parallelize,
+    # PROFILE
+    fn = GaussianHMM.fit_stochastic_em
+    fn_args = (init_params, prior_params, dataloader)
+    fn_kwargs = {
+        'num_epochs': num_epochs,
+        'parallelize': parallelize,
+    }
+        
+    mem_usage, (fitted_params, lps) = memory_usage(
+                proc=(fn, fn_args, fn_kwargs), retval=True,
+                backend='psutil_pss',
+                stream=False, timestamps=True, max_usage=False,
+                include_children=True, multiprocess=True,
         )
-    jax.block_until_ready(lps)
 
+    print(lps / dataloader.total_emissions)
+
+    # Save memory profiler results
+    _method = 'parallel' if parallelize else 'vmap'
+    f_mprof = os.path.join(log_dir, f'{session_name}-{_method}.mprof')
+    write_mprof(f_mprof, mem_usage)
+    print("Wrote memory profile to ", f_mprof)
     return
 
 if __name__ == '__main__':
