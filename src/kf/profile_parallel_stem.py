@@ -113,15 +113,6 @@ def setup_dataset(seed, seq_length, train_size, debug_max_files):
 def main():
     args = parser.parse_args()
 
-    # Set timestamp based default args if none specified
-    timestamp = datetime.now().strftime("%y%m%d%H%M")
-    
-    session_name = timestamp if args.session_name is None else args.session_name
-    log_dir = os.path.join(TEMPDIR, session_name)
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    print(f"Output files will be logged to: {log_dir}\n")
-
     # Set user-specified seed
     seed = jr.PRNGKey(args.seed)
     seed_data, seed_dl, seed_init = jr.split(seed, 3)
@@ -140,7 +131,7 @@ def main():
     profile = args.profile
 
     # Set timestamp based default args if none specified
-    timestamp = datetime.now().strftime("%y%m%d%H%M")
+    timestamp = datetime.now().strftime("%y%m%d_%H%M")
     
     if args.session_name is None:
         session_name = f'{timestamp}-{num_states}states'
@@ -196,6 +187,9 @@ def main():
     fn_kwargs = {
         'num_epochs': num_epochs,
         'parallelize': parallelize,
+        'checkpoint_every': 1,
+        'checkpoint_dir': log_dir,
+        'num_checkpoints_to_keep': 10
     }
     
     if profile:

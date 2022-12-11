@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 from jax import jit, vmap, lax, pmap
-from jax.tree_util import tree_map
+from jax.tree_util import tree_map, tree_flatten, tree_leaves
 from functools import partial
 import optax
 from tqdm.auto import trange, tqdm
@@ -8,6 +8,7 @@ from tqdm.auto import trange, tqdm
 from dynamax.hidden_markov_model.inference import (
     hmm_smoother, hmm_posterior_mode, compute_transition_probs
 )
+import snax.checkpoint as chk
 
 from kf.gaussian_hmm._initialization import initialize_statistics
 from kf.gaussian_hmm._model import *
@@ -313,6 +314,7 @@ def parallel_stochastic_em_step(prior_params, params, rolling_stats,
 
 def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                       schedule=None, num_epochs=5, parallelize=False,
+                      checkpoint_every=None, checkpoint_dir=None, num_checkpoints_to_keep=-1):
     """Estimate model parameters from emissions using stochastic Expectation-Maximization (StEM).
 
     Let the original dataset consists of N independent sequences of length T.
@@ -346,7 +348,12 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
             schedule; defaults to exponential schedule.
         num_epochs (int): Number of StEM iterations to run over full dataset
         parallelize (bool): If True, parallelize across p devices.
-        verbose (bool): If true, print progress bar.
+        checkpoint_every (int): Number of epochs between checkpoints. Must be
+            specified to enable checkpointing.
+        checkpoint_dir (str): Directory to story checkpoints. Must be specified
+            to enable checkpointing.
+        checkpoints_to_keep (int): Number of recent checkpoints to keep.
+            Default: -1, keep all checkpoints.
     
     Returns
         fitted_params (Parameters)
@@ -396,8 +403,23 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     rolling_stats = initialize_statistics(num_states, emission_dim)
     expected_log_probs = jnp.empty((0, len(emissions_generator)))
 
+    # Load model from latest checkpoint, if checkpointing
+    global_start_epoch = 0
+    do_checkpoint = (checkpoint_every is not None) and (checkpoint_dir is not None)
+    if do_checkpoint:
+        _, treedef = tree_flatten((params, rolling_stats, expected_log_probs))
+        out = chk.load_latest_checkpoint_with_treedef(treedef, checkpoint_dir)
+        if out[0] is not None:
+            (params, rolling_stats, expected_log_probs), global_start_epoch = out
+            print(f"Loaded checkpoint at step {global_start_epoch} from {checkpoint_dir}.")
+        else:
+            print("Cold-starting from passed-in parameters.")
+
+    # =========================================================================
     # Train
-    for epoch in range(num_epochs):
+    # =========================================================================
+    epoch = global_start_epoch
+    while epoch < num_epochs:
         epoch_expected_lps = []
 
         pbar = tqdm(emissions_generator,
@@ -420,8 +442,16 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
 
             pbar.set_postfix({'lp': expected_lp})
 
-        # Save epoch mean of expected log probs
-        expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
+            # Save results, if checkpointing
+            # TODO Fix discrepancy between inner (minibatch) and outer (epoch) step
+            if do_checkpoint and (epoch % checkpoint_every == 0):
+                tqdm.write(f"Saving checkpoint for epoch {epoch}, minibatch {minibatch} at {checkpoint_dir}, number {epoch*num_batches+minibatch}...", end="")
+                chk.save_checkpoint((params, rolling_stats, minibatch_lls),
+                    epoch*num_batches+minibatch, checkpoint_dir, num_checkpoints_to_keep)
+                tqdm.write("Done.")
+
+
+        epoch += 1
 
     return params, jnp.asarray(expected_log_probs)
 
