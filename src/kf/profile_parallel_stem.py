@@ -179,7 +179,10 @@ def main():
     print()
 
     init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim)
-    prior_params = GaussianHMM.initialize_prior_from_scalar_values(num_states, emission_dim)
+    
+    # Increase NIW priors on emission covariance to minimize NaNs in MAP estimate...
+    prior_params = GaussianHMM.initialize_prior_from_scalar_values(
+        num_states, emission_dim, emission_scale=1e-1, emission_extra_df=1.0,)
     
     # PROFILE
     fn = GaussianHMM.fit_stochastic_em
