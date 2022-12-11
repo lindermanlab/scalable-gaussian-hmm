@@ -220,8 +220,24 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
 # ==============================================================================
 
 @jit
-def _stochastic_em_step(prior_params, params, rolling_stats,
-                        learning_rate, minibatch_emissions):
+def nonparallel_stochastic_em_step(prior_params, params, rolling_stats,
+                                   learning_rate, minibatch_emissions):
+
+    """Perform single stochastic EM step using a single core.
+    
+    Arguments:
+        prior_params (PriorParameters)
+        params (Parameters)
+        rolling_stats (NormalizedGaussianHMMStatistics)
+        learning_rate (float)
+        minibatch_emissions (jnp.ndarray): shape [m,t,d]
+    
+    Returns:
+        map_params (Parameters):
+        rolling_stats (NormalizedGaussianHMMStatistics)
+        minibatch_lls (float): Expected log-likelihood of minibatch
+    """
+    # Returns: Parameters([k,...]), *Stats([k,...]), float
 
     rolling_normalized_stats, rolling_normalizer = rolling_stats
 
@@ -241,42 +257,59 @@ def _stochastic_em_step(prior_params, params, rolling_stats,
     # Call M-step
     map_params = m_step(prior_params, updated_normalized_stats, updated_normalizer)
     
-    return map_params, (updated_normalized_stats, updated_normalizer), minibatch_lls
+    rolling_stats = (updated_normalized_stats, updated_normalizer)
+    return map_params, rolling_stats, minibatch_lls, (_debug_e_vals, _debug_m_vals)
 
-@partial(pmap, in_axes=(None, None, None, None, 0), axis_name='p')
-def _parallel_stochastic_em_step(prior_params, params, rolling_stats,
-                                 learning_rate, local_minibatch_emissions):
+def parallel_stochastic_em_step(prior_params, params, rolling_stats,
+                                learning_rate, minibatch_emissions):
+    """Perform single step of stochastic EM using multiple cores.
     
-    rolling_normalized_stats, rolling_normalizer = rolling_stats
+    Inputs and outputs are the same as nonparallel_stochastic_em_step,
+    except that minibatch_emissions has shape [p,m,t,d].
+    """
 
-    # INPUT: local_minibatch_emissions[m,t,d] varying across outer axis 'p'
-    # OUTPUT: NamedTuples with leading axis [k,...], varying across outer axis 'p'
-    local_normalized_stats, local_normalizer, local_lls \
-                                    = e_step(params, local_minibatch_emissions)
-    
-    # Reduce batch statistics across outer batch axis 'p'
-    # OUTPUT: NamedTuples have leading axis [k,...], identical across outer axis 'p'
-    collective_normalized_stats = tree_map(
-        partial(lax.pmean, axis_name='p'), local_normalized_stats)
 
-    collective_normalizer = lax.psum(local_normalizer, axis_name='p')
-    collective_lls = lax.psum(local_lls, axis_name='p')
+    @partial(pmap, in_axes=(None, None, None, None, 0), axis_name='p')
+    def _parallel_stochastic_em_step(prior_params, params, rolling_stats,
+                                     learning_rate, local_minibatch_emissions):
+        
+        rolling_normalized_stats, rolling_normalizer = rolling_stats
 
-    # Convexly combine rolling statistics with collective statistics
-    # All stats and lls are now identical across devices (across outer axis 'p')
-    convex_update = lambda rolling_stat, minibatch_stat: \
-        (1-learning_rate) * rolling_stat + learning_rate * minibatch_stat
-    
-    updated_normalized_stats = tree_map(
-        convex_update, rolling_normalized_stats, collective_normalized_stats)
+        # INPUT: local_minibatch_emissions[m,t,d] varying across outer axis 'p'
+        # OUTPUT: NamedTuples with leading axis [k,...], varying across outer axis 'p'
+        local_normalized_stats, local_normalizer, local_lls \
+                                        = e_step(params, local_minibatch_emissions)
+        
+        # Reduce batch statistics across outer batch axis 'p'
+        # OUTPUT: NamedTuples have leading axis [k,...], identical across outer axis 'p'
+        collective_normalized_stats = tree_map(
+            partial(lax.pmean, axis_name='p'), local_normalized_stats)
 
-    updated_normalizer = convex_update(rolling_normalizer, collective_normalizer)
-    
-    # Call M-step
-    map_params = m_step(prior_params, updated_normalized_stats, updated_normalizer)
+        collective_normalizer = lax.psum(local_normalizer, axis_name='p')
+        collective_lls = lax.psum(local_lls, axis_name='p')
 
-    return map_params, (updated_normalized_stats, updated_normalizer), collective_lls
+        # Convexly combine rolling statistics with collective statistics
+        # All stats and lls are now identical across devices (across outer axis 'p')
+        convex_update = lambda rolling_stat, minibatch_stat: \
+            (1-learning_rate) * rolling_stat + learning_rate * minibatch_stat
+        
+        updated_normalized_stats = tree_map(
+            convex_update, rolling_normalized_stats, collective_normalized_stats)
 
+        updated_normalizer = convex_update(rolling_normalizer, collective_normalizer)
+        
+        # Call M-step
+        map_params = m_step(prior_params, updated_normalized_stats, updated_normalizer)
+
+        return map_params, (updated_normalized_stats, updated_normalizer), collective_lls
+
+    pbatch_map_params, pbatch_stats, pbatch_lls = _parallel_stochastic_em_step(
+            prior_params, params, rolling_stats, learning_rate, minibatch_emissions)
+
+    map_params, rolling_stats, minibatch_lls = tree_map(
+        lambda arr: arr[0], (pbatch_map_params, pbatch_stats, pbatch_lls))
+
+    return map_params, rolling_stats, minibatch_lls
 
 def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                       schedule=None, num_epochs=5, parallelize=False, verbose=True):
@@ -337,11 +370,10 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     assert learning_rates[0] == 1.0, "Learning rate must start at 1."
     learning_rates = learning_rates.reshape(num_epochs, num_batches)
 
-    def _step_fn(params, rolling_stats, learning_rate, minibatch_emissions):
-        """Perform single stochastic EM step on minibatch of [m,t,d] emissions."""
-        # Returns: Parameters([k,...]), *Stats([k,...]), float
-        params, rolling_stats, minibatch_lls = _stochastic_em_step(
-            prior_params, params, rolling_stats, learning_rate, minibatch_emissions)
+    # =========================================================================
+    # Define which method (parallel vs. non-parallel) to use
+    # =========================================================================
+    step_fn = parallel_stochastic_em_step if parallelize else nonparallel_stochastic_em_step
 
         return params, rolling_stats, minibatch_lls
     
@@ -373,8 +405,9 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                 if verbose else enumerate(emissions_generator))
         for minibatch, minibatch_emissions in pbar:
             
-            params, rolling_stats, minibatch_lls = step_fn(
-                params, rolling_stats, learning_rates[epoch][minibatch], minibatch_emissions
+            params, rolling_stats, minibatch_lls, _debug_vals = step_fn(
+                prior_params, params, rolling_stats, learning_rates[epoch][minibatch],
+                minibatch_emissions
             )
                 
             expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
