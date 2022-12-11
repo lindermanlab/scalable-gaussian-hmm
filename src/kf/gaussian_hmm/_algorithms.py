@@ -450,6 +450,15 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                     epoch*num_batches+minibatch, checkpoint_dir, num_checkpoints_to_keep)
                 tqdm.write("Done.")
 
+            # Check that M-step emission covariance is PSD
+            _eigvals = jnp.linalg.eigvals(params.emission_covariances)
+            if jnp.any(_eigvals < 0.):
+                print('!! `params.emission_covariances` is not PSD. !!')
+                for _i, _v in zip(jnp.atleast_2d(jnp.hstack(jnp.nonzero(_eigvals<0))),
+                                  _eigvals[_eigvals<0]):
+                    print(f'Eigenvalue {_v:.2e} at index {_i}')
+                raise ValueError('`params.emission_covariances` is not PSD. Considering increasing emission_scale and emission_extra_df prior parameters')
+
 
         epoch += 1
 
