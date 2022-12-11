@@ -70,6 +70,9 @@ parser.add_argument(
 parser.add_argument(
     '--states', type=int, default=20,
     help='Number of HMM states to fit')
+parser.add_argument(
+    '--profile', action='store_true',
+    help='If specified, record and store memory profile.')
 
 parser.add_argument(
     '--debug_max_files', type=int, default=-1,
@@ -134,6 +137,20 @@ def main():
     num_epochs = args.epochs
 
     parallelize = args.parallelize
+    profile = args.profile
+
+    # Set timestamp based default args if none specified
+    timestamp = datetime.now().strftime("%y%m%d%H%M")
+    
+    if args.session_name is None:
+        session_name = f'{timestamp}-{num_states}states'
+    else:
+        session_name = args.session_name
+
+    log_dir = os.path.join(TEMPDIR, session_name)
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    print(f"Output files will be logged to: {log_dir}\n")
     
     # ==========================================================================
     
@@ -180,22 +197,28 @@ def main():
         'num_epochs': num_epochs,
         'parallelize': parallelize,
     }
+    
+    if profile:
+        mem_usage, (fitted_params, lps) = memory_usage(
+                    proc=(fn, fn_args, fn_kwargs), retval=True,
+                    backend='psutil_pss',
+                    stream=False, timestamps=True, max_usage=False,
+                    include_children=True, multiprocess=True,
+            )
         
-    mem_usage, (fitted_params, lps) = memory_usage(
-                proc=(fn, fn_args, fn_kwargs), retval=True,
-                backend='psutil_pss',
-                stream=False, timestamps=True, max_usage=False,
-                include_children=True, multiprocess=True,
-        )
+        # Save memory profiler results
+        _method = 'parallel' if parallelize else 'vmap'
+        f_mprof = os.path.join(log_dir, f'{session_name}-{_method}.mprof')
+        print(f"Writing memory profile to {f_mprof}...", end="")
+        write_mprof(f_mprof, mem_usage)
+        print("Done.")
+    
+    else:
+        fitted_params, lps = fn(*fn_args, **fn_kwargs)
 
     print(lps / dataloader.total_emissions)
 
-    # Save memory profiler results
-    _method = 'parallel' if parallelize else 'vmap'
-    f_mprof = os.path.join(log_dir, f'{session_name}-{_method}.mprof')
-    write_mprof(f_mprof, mem_usage)
-    print("Wrote memory profile to ", f_mprof)
-    return
+    return 
 
 if __name__ == '__main__':
     main()
