@@ -125,10 +125,9 @@ def m_step(prior_params, normalized_stats, normalizer):
 
     # Calculate mode of posterior transition distribution (Dirichlet)
     posterior_transition_conc = (
-        normalized_stats.transition_pseudocounts * normalizer\
+        normalized_stats.transition_pseudocounts \
         + jnp.nan_to_num(prior_params.transition_probs_conc / normalizer, nan=0.0)
     )
-    # transition_probs = Dirichlet(posterior_transition_conc).mode()
     transition_probs = dirichlet_mode(posterior_transition_conc)
 
     # Calculate mode of posterior emission distribution (NIW)
