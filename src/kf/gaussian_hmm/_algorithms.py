@@ -405,13 +405,17 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                     postfix={'lp': -jnp.inf})
 
         for minibatch, minibatch_emissions in enumerate(pbar):
+            total_num_emissions_per_batch = float(jnp.prod(jnp.asarray(minibatch_emissions.shape[:-1])))
             
             params, rolling_stats, minibatch_lls, _debug_vals = step_fn(
                 prior_params, params, rolling_stats, learning_rates[epoch][minibatch],
                 minibatch_emissions
             )
-                
-            expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
+
+            # Save average expected log probability for each emission
+            # expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
+            expected_lp = log_prior(params, prior_params) / num_batches + minibatch_lls
+            expected_lp /= total_num_emissions_per_batch
             epoch_expected_lps.append(expected_lp)
 
             pbar.set_postfix({'lp': expected_lp})
