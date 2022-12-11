@@ -312,7 +312,7 @@ def parallel_stochastic_em_step(prior_params, params, rolling_stats,
     return map_params, rolling_stats, minibatch_lls
 
 def fit_stochastic_em(initial_params, prior_params, emissions_generator,
-                      schedule=None, num_epochs=5, parallelize=False, verbose=True):
+                      schedule=None, num_epochs=5, parallelize=False,
     """Estimate model parameters from emissions using stochastic Expectation-Maximization (StEM).
 
     Let the original dataset consists of N independent sequences of length T.
@@ -400,10 +400,11 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     for epoch in range(num_epochs):
         epoch_expected_lps = []
 
-        # Does this work outside of pytest environment?
-        pbar = (enumerate(tqdm(emissions_generator, desc=f'epoch {epoch}/{num_epochs}'))
-                if verbose else enumerate(emissions_generator))
-        for minibatch, minibatch_emissions in pbar:
+        pbar = tqdm(emissions_generator,
+                    desc=f'epoch {epoch}/{num_epochs}',
+                    postfix={'lp': -jnp.inf})
+
+        for minibatch, minibatch_emissions in enumerate(pbar):
             
             params, rolling_stats, minibatch_lls, _debug_vals = step_fn(
                 prior_params, params, rolling_stats, learning_rates[epoch][minibatch],
@@ -412,6 +413,8 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                 
             expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
             epoch_expected_lps.append(expected_lp)
+
+            pbar.set_postfix({'lp': expected_lp})
 
         # Save epoch mean of expected log probs
         expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
