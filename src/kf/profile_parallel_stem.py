@@ -151,40 +151,44 @@ def main():
     train_ds, train_slices = setup_dataset(seed_data, seq_length, args.train, args.debug_max_files)
     emission_dim = train_ds.dim
 
-    # Algorithm specific settings
+    # Define how a batch of emissions gets reshaped, depending on if using parallelization
     num_devices = jax.local_device_count()
     if parallelize:
         assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
         local_batch_size = batch_size // num_devices
-        
         def collate(sequences):
             return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, seq_length, -1)
-
-        dataloader = FishPCLoader(train_ds, train_slices, batch_size,
-                                  collate_fn=collate, drop_last=True,
-                                  shuffle=True, seed=int(seed_dl[-1]))
         
     else:
-        assert num_devices == 1, f'Expected 1 device, only seeing {num_devices}. Reset XLA_FLAGS setting.'
-
+        assert num_devices == 1, f'Expected 1 device, but seeing {num_devices}. Reset XLA_FLAGS setting.'
         def collate(sequences):
             return onp.stack(sequences, axis=0)
-        dataloader = FishPCLoader(train_ds, train_slices, batch_size,
-                                  collate_fn=collate, drop_last=True,
-                                  shuffle=True, seed=int(seed_dl[-1]))
-        
+
+    # Construct dataloader
+    dataloader = FishPCLoader(train_ds, train_slices, batch_size,
+                              collate_fn=collate, drop_last=True,
+                              shuffle=True, seed=int(seed_dl[-1]))
+
     print("Initialized training dataset with "
             + f"{len(train_slices):3d} sets of {seq_length/72000:.1f} hr sequences; "
             + f"{len(dataloader):3d} batches of {batch_size} sequences per batch")
     print()
 
+    # Initialize GaussianHMM model parameters based on specified method
     init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim)
     
-    # Increase NIW priors on emission covariance to minimize NaNs in MAP estimate...
+    # Set GaussianHMM prior parameters to non-informative values, except
+    # boost the prior parameters associated with emission covariance matrices
+    # (i.e. emission_scale and emission_extra_df) to scale of minibatch size
+    # to regularize covariance matrix to be PSD
+    total_num_emissions_per_batch = dataloader.total_emissions / len(dataloader)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(
-        num_states, emission_dim, emission_scale=1e-1, emission_extra_df=1.0,)
+        num_states,
+        emission_dim,
+        emission_scale=(1e-4)*total_num_emissions_per_batch,
+        emission_extra_df=(1e-1)*total_num_emissions_per_batch,)
     
-    # PROFILE
+    # Setup function
     fn = GaussianHMM.fit_stochastic_em
     fn_args = (init_params, prior_params, dataloader)
     fn_kwargs = {
@@ -213,7 +217,7 @@ def main():
     else:
         fitted_params, lps = fn(*fn_args, **fn_kwargs)
 
-    print(lps / dataloader.total_emissions)
+    print(lps)
 
     return 
 
