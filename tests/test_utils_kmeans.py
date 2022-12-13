@@ -1,7 +1,5 @@
 """Test kmeans initialization of GaussianHMM."""
 
-import pytest
-
 import os
 import jax.random as jr
 

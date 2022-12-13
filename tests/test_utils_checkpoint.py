@@ -1,5 +1,3 @@
-import pytest
-
 import os
 import tempfile
 import random

@@ -1,7 +1,5 @@
 """Test FishPCDataset and FishPCLoader classes"""
 
-import pytest 
-
 import os
 import random
 import numpy as onp
