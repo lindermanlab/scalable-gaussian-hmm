@@ -320,7 +320,8 @@ def parallel_stochastic_em_step(prior_params, params, rolling_stats,
 
 def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                       schedule=None, num_epochs=5, parallelize=False,
-                      checkpoint_every=None, checkpoint_dir=None, num_checkpoints_to_keep=-1):
+                      checkpoint_every=None, checkpoint_dir=None, num_checkpoints_to_keep=10,
+                      starting_epoch=0):
     """Estimate model parameters from emissions using stochastic Expectation-Maximization (StEM).
 
     Let the original dataset consists of N independent sequences of length T.
@@ -344,6 +345,13 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     Currently, this code assumes parallelization over multiple CPU cores on the
     same devices. This requires the user to set the environment flags
         XLA_FLAGS=--xla_force_host_platform_device_count=[p]
+
+    If checkpointing the training, must specify `checkpoint_every` and
+    `checkpoint_dir` parameters.
+    
+    In order to warm-start the training, user should pass in the warm-started
+    `initial_params`, `emissions_generator`, and `starting_epoch` at which the
+    training is being warm-started from. All other parameters remain static.
     
     Arguments
         initial_params (Parameters)
@@ -354,12 +362,13 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
             schedule; defaults to exponential schedule.
         num_epochs (int): Number of StEM iterations to run over full dataset
         parallelize (bool): If True, parallelize across p devices.
-        checkpoint_every (int): Number of epochs between checkpoints. Must be
-            specified to enable checkpointing.
-        checkpoint_dir (str): Directory to story checkpoints. Must be specified
-            to enable checkpointing.
+        checkpoint_every (int): Number of epochs between checkpoints.
+        checkpoint_dir (str): Directory to store checkpoints.
         checkpoints_to_keep (int): Number of recent checkpoints to keep.
             Default: -1, keep all checkpoints.
+        starting_epoch (int): Epoch that the fitting algorithm is starting at.
+            Value will be non-zero (and must be explicitly specified) if user
+            is warm-starting the training. Default: 0.
     
     Returns
         fitted_params (Parameters)
@@ -391,28 +400,30 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     step_fn = parallel_stochastic_em_step if parallelize else nonparallel_stochastic_em_step
 
     # =========================================================================
+    # Organize metadata
+    # =========================================================================
+    metadata = dict(
+        prior_params = prior_params,
+        schedule     = schedule,
+        num_epochs   = num_epochs,
+        parallelize  = parallelize,
+        num_batches  = num_batches,
+        num_states   = num_states,
+        emission_dim = emission_dim,
+    )
+
+    # =========================================================================
     # Initialize
     # =========================================================================
     params = initial_params
     rolling_stats = initialize_statistics(num_states, emission_dim)
     expected_log_probs = jnp.empty((0, len(emissions_generator)))
-    
-    # Load model from latest checkpoint, if checkpointing
-    global_start_epoch = 0
-    do_checkpoint = (checkpoint_every is not None) and (checkpoint_dir is not None)
-    if do_checkpoint:
-        _, treedef = tree_flatten((params, rolling_stats, expected_log_probs))
-        out = chk.load_latest_checkpoint_with_treedef(treedef, checkpoint_dir)
-        if out[0] is not None:
-            (params, rolling_stats, expected_log_probs), global_start_epoch = out
-            print(f"Loaded checkpoint at step {global_start_epoch} from {checkpoint_dir}.")
-        else:
-            print("Cold-starting from passed-in parameters.")
 
     # =========================================================================
     # Train
     # =========================================================================
-    epoch = global_start_epoch
+    epoch = starting_epoch
+    
     while epoch < num_epochs:
         epoch_expected_lps = []
 
@@ -421,8 +432,10 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
                     postfix={'lp': -jnp.inf})
 
         for minibatch, minibatch_emissions in enumerate(pbar):
-            params, rolling_stats, minibatch_lls, _debug_vals = step_fn(
-                prior_params, params, rolling_stats, learning_rates[epoch][minibatch],
+            params, rolling_stats, minibatch_lls = step_fn(
+                prior_params, params,
+                rolling_stats,
+                learning_rates[epoch][minibatch],
                 minibatch_emissions
             )
 
@@ -431,33 +444,34 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
             expected_lp /= emissions_generator.total_emissions
             epoch_expected_lps.append(expected_lp)
 
-            # Updated progress bar
+            # Update progress bar
             pbar.set_postfix({'lp': expected_lp})
-
-            # Save results, if checkpointing
-            # TODO Fix discrepancy between inner (minibatch) and outer (epoch) step
-            if do_checkpoint and (epoch % checkpoint_every == 0):
-                tqdm.write(f"Saving checkpoint for epoch {epoch}, minibatch {minibatch} at {checkpoint_dir}, number {epoch*num_batches+minibatch}...", end="")
-                chk.save_checkpoint((params, rolling_stats, minibatch_lls,),
-                    epoch*num_batches+minibatch, checkpoint_dir, num_checkpoints_to_keep)
-                tqdm.write("Done.")
 
             # Check that M-step emission covariance is PSD
             _eigvals = jnp.linalg.eigvals(params.emission_covariances)
             if jnp.any(_eigvals < 0.):
                 print('!! `params.emission_covariances` is not PSD. !!')
-                for _i, _v in zip(jnp.atleast_2d(jnp.hstack(jnp.nonzero(_eigvals<0))),
-                                  _eigvals[_eigvals<0]):
+                for _i, _v in zip(jnp.atleast_2d(jnp.hstack(jnp.nonzero(_eigvals<0))), _eigvals[_eigvals<0]):
                     print(f'Eigenvalue {_v:.2e} at index {_i}')
                 raise ValueError('`params.emission_covariances` is not PSD. Considering increasing emission_scale and emission_extra_df prior parameters')
 
             # Check no NaNs in parameters
-            if any(tree_leaves(tree_map(lambda arr: jnp.any(jnp.isnan(arr)), (params, rolling_stats, minibatch_lls, _debug_vals)))):
-                raise ValueError(f'Epoch {epoch}, minibatch {minibatch}: NaN detected in parameters.')
+            if any(tree_leaves(tree_map(lambda arr: jnp.any(jnp.isnan(arr)), (params, rolling_stats, minibatch_lls)))):
+                raise ValueError(f'Epoch {epoch}, minibatch {minibatch}: NaN detected.')
 
         # Save epoch mean of expected log probs
         expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
-
+        
+        # Save results, if checkpointing
+        if (checkpoint_every is not None) and (checkpoint_dir is not None):
+            if (epoch % checkpoint_every == 0):    
+                tqdm.write(f"Saving checkpoint for epoch {epoch} at {checkpoint_dir}...", end="")
+                chk.save_checkpoint(
+                    ((params, rolling_stats, minibatch_lls), metadata), epoch,
+                    checkpoint_dir,
+                    num_checkpoints_to_keep)
+                tqdm.write("Done.")
+            
         epoch += 1
 
     return params, jnp.asarray(expected_log_probs)
