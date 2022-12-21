@@ -52,7 +52,7 @@ class Dataset():
         raise NotImplementedError
 
     def __getitems__(self, indices) -> List[E]:
-        return [self.__get_item(idx) for idx in indices]
+        return [self.__getitem__(idx) for idx in indices]
 
     def __add__(self, other: 'Dataset') -> 'ConcatDataset':
         return ConcatDataset([self, other])
@@ -132,6 +132,76 @@ def random_split(key: PRNGKey,
     
     """
     raise NotImplementedError
+
+# =============================================================================
+# Project-specific dataclasses
+# =============================================================================
+
+@dataclass
+class IteratorState():
+    key: PRNGKey            # Key uniquely defining an epoch
+    index: Scalar           # Index within current epoch
+
+def default_collate_fn(data: Sequence) -> Array:
+    """Pass back the data as is."""
+    return jnp.asarray(data)
+
+def default_sampler_fn(key: PRNGKey, dataset: Dataset) -> List[int]:
+    """Sequentially iterate through the dataset."""
+    return range(len(dataset))
+
+class RandomBatchDataloader(Iterable):
+    dataset: Dataset
+    batch_size: int
+    sample_fn: Callable[[PRNGKey, Dataset], List[int]]
+    collate_fn: Callable[[Sequence], Array]
+    iterator_state: IteratorState
+
+    def __init__(self,
+                 dataset: Dataset,
+                 batch_size: int,
+                 iterator_state: IteratorState,
+                 sample_fn: Optional[Callable[[PRNGKey, Dataset], List[int]]]=None,
+                 collate_fn: Optional[Callable[[Sequence], Array]]=None,
+                 ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.sample_fn = default_sampler_fn if sample_fn is None else sample_fn
+        self.collate_fn = default_collate_fn if collate_fn is None else collate_fn
+
+        self.iterator_state = iterator_state
+
+    def __len__(self):
+        # number of batches that this iterator will produce
+        return len(self.dataset) // self.batch_size
+
+    def _next_epoch(self, state: IteratorState) -> IteratorState:
+        _, new_key = jr.split(state.key)
+
+        return IteratorState(key=new_key, index=jnp.array(0))
+    
+    def _next_state(self, state: IteratorState) -> IteratorState:
+        state.index += 1
+        return state
+
+    def __iter__(self):
+        if self.iterator_state.index >= len(self):
+            self.iterator_state = self._next_epoch(self.iterator_state)
+
+        # Generate shuffled indices
+        sample_indices = self.sample_fn(self.iterator_state.key, self.dataset)
+        sample_indices = sample_indices[:len(self)*self.batch_size].reshape(len(self), self.batch_size)
+    
+        while self.iterator_state.index < len(self):
+            idx = self.iterator_state.index
+
+            # Update iterator state
+            self.iterator_state = self._next_state(self.iterator_state)
+
+            # Yield data batch
+            yield self.collate_fn(
+                self.dataset.__getitems__(sample_indices[idx])
+            )
 
 # =============================================================================
 # Project-specific dataclasses
