@@ -47,8 +47,8 @@ def test_multi_session(key=jr.PRNGKey(0), seq_length=72_000, seq_step_size=1, nu
     assert jnp.all(~jnp.isnan(data))
     assert data.shape == concat_dataset.sequence_shape # this might break...
 
-def test_random_batch_dataloader(key=jr.PRNGKey(2205), batch_size=8, seq_length=72_000, seq_step_size=1, num_sessions=10):
-    """"""
+def test_dataloader(key=jr.PRNGKey(2205), batch_size=8, seq_length=72_000, seq_step_size=1, num_sessions=10):
+    """Test auto-shuffle with each epoch"""
     seq_key, itr_key = jr.split(key)
 
     filepaths = FILEPATHS[:num_sessions]
@@ -57,8 +57,7 @@ def test_random_batch_dataloader(key=jr.PRNGKey(2205), batch_size=8, seq_length=
 
     sample_fn = lambda key, ds: jr.permutation(key, len(ds))
     collate_fn = lambda arr_seq: jnp.stack(arr_seq, axis=0)
-    iterator_state = IteratorState(key=itr_key, index=jnp.array(0))
-    dataloader = RandomBatchDataloader(dataset, batch_size, iterator_state, sample_fn, collate_fn)
+    dataloader = RandomBatchDataloader(dataset, batch_size, itr_key, sample_fn, collate_fn)
 
     for minibatch, data in enumerate(dataloader):
         if minibatch == 0:
@@ -70,7 +69,7 @@ def test_random_batch_dataloader(key=jr.PRNGKey(2205), batch_size=8, seq_length=
     assert minibatch == len(dataloader)-1
 
     # Check that internal iterator state is being updated
-    assert dataloader.iterator_state.index == len(dataloader)
+    assert dataloader.index == len(dataloader)
 
     # Check that on the next iteration, data is shuffled
     for minibatch, data in enumerate(dataloader):
@@ -78,7 +77,37 @@ def test_random_batch_dataloader(key=jr.PRNGKey(2205), batch_size=8, seq_length=
         break
 
     assert jnp.all(~jnp.equal(data_epoch0_iter0, data_epoch1_iter0))
-    assert dataloader.iterator_state.index == 1
+    assert dataloader.index == 1
+
+def test_dataloader_warm(key=jr.PRNGKey(2205), batch_size=8, seq_length=72_000, num_sessions=10):
+    """Test warm-start capability"""
+    i_warm = 4
+
+    seq_key, itr_key = jr.split(key)
+
+    filepaths = FILEPATHS[:num_sessions]
+    dataset = \
+        SessionDataset.create_multisession(filepaths, seq_key, seq_length, sequence_step_size=1)
+
+    sample_fn = lambda key, ds: jr.permutation(key, len(ds))
+    collate_fn = lambda arr_seq: jnp.stack(arr_seq, axis=0)
+    dataloader_cold = RandomBatchDataloader(dataset, batch_size, itr_key, sample_fn, collate_fn)
+
+    dataloader_warm = RandomBatchDataloader(dataset, batch_size, itr_key, sample_fn, collate_fn)
+    dataloader_warm.state = IteratorState(key=itr_key, index=i_warm)
+
+    for minibatch, data in enumerate(dataloader_cold):
+        if minibatch == i_warm:
+            data_cold = data.copy()
+        assert jnp.all(~jnp.isnan(data))
+        assert data.shape == (batch_size, *dataset.datasets[0].sequence_shape)
+
+    # Check that the first loaded data batch is indeed the warm-started one
+    for data in dataloader_warm:
+        data_warm = data.copy()
+        break
+
+    assert jnp.all(jnp.equal(data_cold, data_warm))
 
 def test_split_full(key=jr.PRNGKey(0), seq_length=3600, num_sessions=3):
     """Split dataset into three sets."""

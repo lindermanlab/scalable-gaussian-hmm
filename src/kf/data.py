@@ -173,12 +173,13 @@ class RandomBatchDataloader(Iterable):
     batch_size: int
     sample_fn: Callable[[PRNGKey, Dataset], List[int]]
     collate_fn: Callable[[Sequence], Array]
-    iterator_state: IteratorState
+    key: PRNGKey
+    index: int
 
     def __init__(self,
                  dataset: Dataset,
                  batch_size: int,
-                 iterator_state: IteratorState,
+                 key: Optional[PRNGKey]=None,
                  sample_fn: Optional[Callable[[PRNGKey, Dataset], List[int]]]=None,
                  collate_fn: Optional[Callable[[Sequence], Array]]=None,
                  ):
@@ -187,38 +188,37 @@ class RandomBatchDataloader(Iterable):
         self.sample_fn = default_sampler_fn if sample_fn is None else sample_fn
         self.collate_fn = default_collate_fn if collate_fn is None else collate_fn
 
-        self.iterator_state = iterator_state
+        self.key = key
+        self.index = 0
 
     def __len__(self):
         # number of batches that this iterator will produce
         return len(self.dataset) // self.batch_size
 
-    def _next_epoch(self, state: IteratorState) -> IteratorState:
-        _, new_key = jr.split(state.key)
+    @property
+    def state(self):
+        return IteratorState(key=self.key, index=self.index)
 
-        return IteratorState(key=new_key, index=jnp.array(0))
-    
-    def _next_state(self, state: IteratorState) -> IteratorState:
-        state.index += 1
-        return state
+    @state.setter
+    def state(self, iterator_state):
+        self.key = iterator_state.key
+        self.index = iterator_state.index
 
     def __iter__(self):
-        if self.iterator_state.index >= len(self):
-            self.iterator_state = self._next_epoch(self.iterator_state)
+        # New epoch
+        if self.index >= len(self):
+            self.key = jr.split(self.key)[-1]
+            self.index = 0
 
-        # Generate shuffled indices
-        sample_indices = self.sample_fn(self.iterator_state.key, self.dataset)
+        # Generate shuffled indices (automatically drops last)
+        sample_indices = self.sample_fn(self.key, self.dataset)
         sample_indices = sample_indices[:len(self)*self.batch_size].reshape(len(self), self.batch_size)
     
-        while self.iterator_state.index < len(self):
-            idx = self.iterator_state.index
+        while self.index < len(self):
+            self.index += 1
 
-            # Update iterator state
-            self.iterator_state = self._next_state(self.iterator_state)
-
-            # Yield data batch
             yield self.collate_fn(
-                self.dataset.__getitems__(sample_indices[idx])
+                self.dataset.__getitems__(sample_indices[self.index-1])
             )
 
 # =============================================================================
