@@ -7,7 +7,7 @@ import numpy as onp
 import jax.numpy as jnp
 import jax.random as jr
 
-from kf.data import SessionDataset, IteratorState, RandomBatchDataloader
+from kf.data import SessionDataset, random_split, IteratorState, RandomBatchDataloader
 
 DATADIR = Path(os.environ['DATADIR'])
 FILEPATHS = filepaths = sorted((DATADIR/'fish0_137').glob('*.h5'))
@@ -79,3 +79,49 @@ def test_random_batch_dataloader(key=jr.PRNGKey(2205), batch_size=8, seq_length=
 
     assert jnp.all(~jnp.equal(data_epoch0_iter0, data_epoch1_iter0))
     assert dataloader.iterator_state.index == 1
+
+def test_split_full(key=jr.PRNGKey(0), seq_length=3600, num_sessions=3):
+    """Split dataset into three sets."""
+
+    seq_key, split_key = jr.split(key)
+
+    filepaths = FILEPATHS[:num_sessions]
+    dataset = \
+        SessionDataset.create_multisession(filepaths, seq_key, seq_length, sequence_step_size=1)
+
+    # Split dataset
+    split_sizes = (0.5, 0.2, 0.3) # Adds to more than 1, so last split should be smaller
+    split_datasets = random_split(split_key, dataset, split_sizes)
+
+    # Split should return list of SubDatasets
+    assert len(split_sizes) == len(split_datasets)
+    
+    # Since split_sizes equals 1 exactly, then all samples in dataset should be used
+    split_ds_sizes = [len(ds) for ds in split_datasets]
+    assert sum(split_ds_sizes) == len(dataset)
+
+    # Check that we can read data from each dataset
+    assert jnp.all(~jnp.isnan(split_datasets[1][304]))
+
+def test_split_partial(key=jr.PRNGKey(0), seq_length=3600, num_sessions=3):
+    """Split dataset into two partial sets."""
+
+    seq_key, split_key = jr.split(key)
+
+    filepaths = FILEPATHS[:num_sessions]
+    dataset = \
+        SessionDataset.create_multisession(filepaths, seq_key, seq_length, sequence_step_size=1)
+
+    # Split dataset
+    split_sizes = (0.2, 0.4)
+    split_datasets = random_split(split_key, dataset, split_sizes)
+
+    # Split should return list of SubDatasets
+    assert len(split_sizes) == len(split_datasets)
+    
+    # Since split_sizes equals 1 exactly, then all samples in dataset should be used
+    split_ds_sizes = [len(ds) for ds in split_datasets]
+    assert jnp.isclose(sum(split_ds_sizes), sum(split_sizes)*len(dataset), atol=len(split_sizes)*1e0)
+
+    # Check that we can read data from each dataset
+    assert jnp.all(~jnp.isnan(split_datasets[0][230]))

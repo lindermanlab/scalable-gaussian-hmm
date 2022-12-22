@@ -128,10 +128,28 @@ class SubDataset(Dataset):
 def random_split(key: PRNGKey,
                  dataset: Dataset,
                  sizes: Sequence[Union[int, float]]) -> List[SubDataset]:
-    """Split dataset into specified sizes.
+    """Split dataset into non-overlapping new datasets of specified sizes.
     
+    If a list of fractions that sum up to 1 is given, then the lengths will be
+    computed automatically and 1 count will be distributed in round-robin fashion.
     """
-    raise NotImplementedError
+    
+    # Fractional sizes of dataset are given; convert into number of samples (integer)
+    if all([(sz <= 1 for sz in sizes)]):
+        subset_sizes = [int(frac*len(dataset)) for frac in sizes]
+
+        # Input sizes sum up to 1, so make sure to distribute all samples
+        if jnp.isclose(sum(sizes), 1) and (sum(subset_sizes) < len(dataset)):
+            remainder = len(dataset) - sum(subset_sizes)
+            for i in range(remainder):
+                subset_sizes[i % len(sizes)] += 1
+        
+        sizes = subset_sizes
+    
+    indices = jr.permutation(key, len(dataset))[:sum(sizes)]
+
+    return [SubDataset(dataset, indices[offset-size:offset])
+            for offset, size in zip(jnp.cumsum(jnp.asarray(sizes)), sizes)]
 
 # =============================================================================
 # Project-specific dataclasses
