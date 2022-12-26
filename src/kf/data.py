@@ -296,8 +296,8 @@ class SessionDataset(Dataset):
     filepath: Path
     name: str
     raw_shape: Shape
-    sequence_shape: Tuple[int, int]
-    total_num_frames: int
+    sequence_shape: Shape
+    total_samples: int
     sequence_slices: List[Slice]
 
     def __init__(self,
@@ -320,7 +320,7 @@ class SessionDataset(Dataset):
         self.sequence_slices = chunk_into_sequences(
             sequence_key, self.raw_shape[0], sequence_length, sequence_step_size)
 
-        self.total_num_frames = len(self.sequence_slices) * sequence_length
+        self.total_samples = len(self.sequence_slices) * sequence_length
 
         self.sequence_shape = (sequence_length, *self.raw_shape[1:])
 
@@ -341,16 +341,38 @@ class SessionDataset(Dataset):
 
         return data.squeeze()
 
+class MultiessionDataset(ConcatDataset):
+    """Multisession dataset as a concatenation of multiple single session datasets.
+
+    Assumes all datasets are created with the same sequence shape
+
+    Args:
+        datasets: Iterable of SessionDatasets
+    """
+
+    datasets: List[Dataset]
+    cumulative_sizes: List[int]
+    filepaths: List[Path]
+    sequence_shape: Shape
+    total_samples: int
+
+    def __init__(self, datasets: Iterable[SessionDataset]):
+        super(MultiessionDataset, self).__init__(datasets)
+
+        self.filepaths = [ds.filepath for ds in self.datasets]
+        self.total_samples = sum([ds.total_samples for ds in self.datasets])
+        self.sequence_shape = self.datasets[0].sequence_shape
+    
     @classmethod
-    def create_multisession(cls,
-                            filepaths: Sequence[Pathlike],
-                            sequence_key: PRNGKey,
-                            sequence_length: int=72_000,
-                            sequence_step_size: int=1,
-                            ) -> ConcatDataset:
+    def init_from_paths(cls,
+                        filepaths: Sequence[Pathlike],
+                        sequence_key: PRNGKey,
+                        sequence_length: int=72_000,
+                        sequence_step_size: int=1,
+                        ) -> 'MultisessionDataset':
         """Create a concatenated dataset of multiple sessions."""
 
-        datasets = [cls(fp, k, sequence_length, sequence_step_size)
+        datasets = [SessionDataset(fp, k, sequence_length, sequence_step_size)
                     for fp, k in zip(filepaths, jr.split(sequence_key, len(filepaths)))]
 
-        return ConcatDataset(datasets)
+        return cls(datasets)

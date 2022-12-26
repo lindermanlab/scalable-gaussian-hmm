@@ -13,6 +13,7 @@ OPTIONAL
 """
 
 import os
+from pathlib import Path
 import argparse
 from datetime import datetime
 from memory_profiler import memory_usage
@@ -22,11 +23,12 @@ import numpy as onp
 import jax.numpy as jnp
 import jax.random as jr
 
-from kf.data import FishPCDataset, FishPCLoader
+from kf.data import MultiessionDataset, random_split, RandomBatchDataloader, IteratorState
 import kf.gaussian_hmm as GaussianHMM
+from kf.inference import fit_stochastic_em
 
-DATADIR = os.environ['DATADIR']
-TEMPDIR = os.environ['TEMPDIR']
+DATADIR = Path(os.environ['DATADIR'])
+TEMPDIR = Path(os.environ['TEMPDIR'])
 fish_id = 'fish0_137'
 
 # -------------------------------------
@@ -89,24 +91,23 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
 def setup_dataset(seed, seq_length, train_size, debug_max_files):
     """Setup dataset object, get sequence slices"""
 
-    seed_slice, seed_debug = jr.split(seed)
+    seed_slice, seed_debug, seed_split = jr.split(seed, 3)
 
     # TODO This is hard fixed to single subject for now
-    fish_dir = os.path.join(DATADIR, fish_id)
-    filepaths = sorted([os.path.join(fish_dir, f) for f in os.listdir(fish_dir)])
+    filepaths = sorted((DATADIR/fish_id).glob('*.h5'))
 
     if debug_max_files > 0:
         print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.")
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
-    dataset = FishPCDataset(filepaths, return_labels=False)
 
-    # Split dataset into a training set and a test.
+    dataset = MultiessionDataset.init_from_paths(filepaths, seed_slice, seq_length)
+
+    # Split dataset into a training set and a test set.
     # test_dl does not need to be shuffled since we use full E-step to evaluate
-    seq_slices, _ = dataset.split_seq((train_size,0), seed_slice, seq_length,
-                                        step_size=1, drop_incomplete_seqs=True)
-
-    return dataset, seq_slices
+    train_ds = random_split(seed_split, dataset, [train_size,])[0]
+    
+    return dataset
 
 # -------------------------------------
 
@@ -145,32 +146,35 @@ def main():
     
     # ==========================================================================
     
-    # Setup dataset and split into time slices
+    # Setup dataset
     batch_size = args.batch_size
     seq_length = args.seq_length
-    train_ds, train_slices = setup_dataset(seed_data, seq_length, args.train, args.debug_max_files)
-    emission_dim = train_ds.dim
+    train_ds = setup_dataset(seed_data, seq_length, args.train, args.debug_max_files)
+    emission_dim = train_ds.datasets[0].sequence_shape[-1]
 
     # Define how a batch of emissions gets reshaped, depending on if using parallelization
     num_devices = jax.local_device_count()
     if parallelize:
         assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
         local_batch_size = batch_size // num_devices
-        def collate(sequences):
+        def collate_fn(sequences):
             return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, seq_length, -1)
         
     else:
         assert num_devices == 1, f'Expected 1 device, but seeing {num_devices}. Reset XLA_FLAGS setting.'
-        def collate(sequences):
+        def collate_fn(sequences):
             return onp.stack(sequences, axis=0)
 
     # Construct dataloader
-    dataloader = FishPCLoader(train_ds, train_slices, batch_size,
-                              collate_fn=collate, drop_last=True,
-                              shuffle=True, seed=int(seed_dl[-1]))
-
+    sample_fn = lambda key, ds: jr.permutation(key, len(ds))
+    dataloader = RandomBatchDataloader(train_ds,
+                                       batch_size,
+                                       seed_dl,
+                                       sample_fn,
+                                       collate_fn)
+    
     print("Initialized training dataset with "
-            + f"{len(train_slices):3d} sets of {seq_length/72000:.1f} hr sequences; "
+            + f"{len(train_ds):3d} sets of {seq_length/72000:.1f} hr sequences; "
             + f"{len(dataloader):3d} batches of {batch_size} sequences per batch")
     print()
 
@@ -181,20 +185,21 @@ def main():
     # boost the prior parameters associated with emission covariance matrices
     # (i.e. emission_scale and emission_extra_df) to scale of minibatch size
     # to regularize covariance matrix to be PSD
-    total_num_emissions_per_batch = dataloader.total_emissions / len(dataloader)
+    total_emissions_per_batch = dataloader.dataset.total_samples // len(dataloader)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(
         num_states,
         emission_dim,
-        emission_scale=(1e-4)*total_num_emissions_per_batch,
-        emission_extra_df=(1e-1)*total_num_emissions_per_batch,)
+        emission_scale=(1e-4)*total_emissions_per_batch,
+        emission_extra_df=(1e-1)*total_emissions_per_batch,)
     
     # Setup function
-    fn = GaussianHMM.fit_stochastic_em
+    # fn = GaussianHMM.fit_stochastic_em
+    fn = fit_stochastic_em
     fn_args = (init_params, prior_params, dataloader)
     fn_kwargs = {
         'num_epochs': num_epochs,
         'parallelize': parallelize,
-        'checkpoint_every': 1,
+        'checkpoint_every': 5,
         'checkpoint_dir': log_dir,
         'num_checkpoints_to_keep': 10
     }

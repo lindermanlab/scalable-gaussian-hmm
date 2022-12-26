@@ -7,7 +7,11 @@ import numpy as onp
 import jax.numpy as jnp
 import jax.random as jr
 
-from kf.data import SessionDataset, random_split, IteratorState, RandomBatchDataloader
+from kf.data import (SessionDataset,
+                     MultisessionDataset,
+                     random_split,
+                     IteratorState,
+                     RandomBatchDataloader)
 
 DATADIR = Path(os.environ['DATADIR'])
 FILEPATHS = filepaths = sorted((DATADIR/'fish0_137').glob('*.h5'))
@@ -35,7 +39,7 @@ def test_multi_session(key=jr.PRNGKey(0), seq_length=72_000, seq_step_size=1, nu
     individual_datasets = [SessionDataset(f, k, seq_length, seq_step_size)
                            for f, k in zip(filepaths, jr.split(seq_key, len(filepaths)))]
     concat_dataset = \
-        SessionDataset.create_multisession(filepaths, seq_key, seq_length, sequence_step_size=1)
+        MultisessionDataset.init_from_paths(filepaths, seq_key, seq_length, sequence_step_size=1)
 
     assert len(concat_dataset.datasets) == num_sessions
     assert len(individual_datasets[0]) == concat_dataset.cumulative_sizes[0]
