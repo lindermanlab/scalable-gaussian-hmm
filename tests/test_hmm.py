@@ -1,5 +1,3 @@
-import pytest
-
 import jax
 from jax import vmap, tree_map
 import jax.numpy as jnp

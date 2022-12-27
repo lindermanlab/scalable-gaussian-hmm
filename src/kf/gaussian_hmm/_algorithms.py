@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 from jax import jit, vmap, lax, pmap
-from jax.tree_util import tree_map
+from jax.tree_util import tree_map, tree_flatten, tree_leaves
 from functools import partial
 import optax
 from tqdm.auto import trange, tqdm
@@ -8,6 +8,7 @@ from tqdm.auto import trange, tqdm
 from dynamax.hidden_markov_model.inference import (
     hmm_smoother, hmm_posterior_mode, compute_transition_probs
 )
+import snax.checkpoint as chk
 
 from kf.gaussian_hmm._initialization import initialize_statistics
 from kf.gaussian_hmm._model import *
@@ -16,6 +17,8 @@ __all__ = [
     'e_step',
     'm_step',
     'fit_em',
+    'nonparallel_stochastic_em_step',
+    'parallel_stochastic_em_step',
     'fit_stochastic_em',
     'most_likely_states',
 ]
@@ -128,17 +131,17 @@ def m_step(prior_params, normalized_stats, normalizer):
         normalized_stats.transition_pseudocounts \
         + jnp.nan_to_num(prior_params.transition_probs_conc / normalizer, nan=0.0)
     )
-    # transition_probs = Dirichlet(posterior_transition_conc).mode()
     transition_probs = dirichlet_mode(posterior_transition_conc)
 
     # Calculate mode of posterior emission distribution (NIW)
     def _single_emission_m_step(prior_params, normd_stats, norm):
         # Convert prior NIW parameters to natural parameterization
+        # TODO Store natural parameterization in prior params (see note below)
         natural_prior_params = niw_convert_mean_to_natural(*prior_params)
 
         # Normalize prior parameters
         normd_natural_prior_params \
-            = tree_map(lambda eta: eta / norm, natural_prior_params)
+            = tree_map(lambda eta: jnp.nan_to_num(eta / norm, nan=0.0), natural_prior_params)
 
         # Compute posterior parameters
         normd_emission_suff_stats = (
@@ -154,9 +157,11 @@ def m_step(prior_params, normalized_stats, normalizer):
         # Return modal values of posterior distribution
         modal_cov = posterior_scale / normd_natural_posterior_params[0]
         modal_mean = posterior_loc
+
         return modal_cov, modal_mean
 
     # Map the emissions M-step calculation over the state dimension
+    # TODO Store natural parameterization in prior params (see note above)
     prior_niw_mean_params = (
         prior_params.emission_loc, prior_params.emission_conc,
         prior_params.emission_df, prior_params.emission_scale
@@ -221,8 +226,24 @@ def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbo
 # ==============================================================================
 
 @jit
-def _stochastic_em_step(prior_params, params, rolling_stats,
-                        learning_rate, minibatch_emissions):
+def nonparallel_stochastic_em_step(prior_params, params, rolling_stats,
+                                   learning_rate, minibatch_emissions):
+
+    """Perform single stochastic EM step using a single core.
+    
+    Arguments:
+        prior_params (PriorParameters)
+        params (Parameters)
+        rolling_stats (NormalizedGaussianHMMStatistics)
+        learning_rate (float)
+        minibatch_emissions (jnp.ndarray): shape [m,t,d]
+    
+    Returns:
+        updated_params (Parameters)
+        updated_rolling_stats (NormalizedGaussianHMMStatistics)
+        minibatch_lls (float): Expected log-likelihood of minibatch
+    """
+    # Returns: Parameters([k,...]), *Stats([k,...]), float
 
     rolling_normalized_stats, rolling_normalizer = rolling_stats
 
@@ -239,48 +260,70 @@ def _stochastic_em_step(prior_params, params, rolling_stats,
 
     updated_normalizer = _convex_update(rolling_normalizer, minibatch_normalizer)
 
+    updated_rolling_stats = (updated_normalized_stats, updated_normalizer)
+
     # Call M-step
-    map_params = m_step(prior_params, updated_normalized_stats, updated_normalizer)
+    updated_params = m_step(prior_params, updated_normalized_stats, updated_normalizer)
+
+    return updated_params, updated_rolling_stats, minibatch_lls
+
+def parallel_stochastic_em_step(prior_params, params, rolling_stats,
+                                learning_rate, minibatch_emissions):
+    """Perform single step of stochastic EM using multiple cores.
     
-    return map_params, (updated_normalized_stats, updated_normalizer), minibatch_lls
+    Inputs and outputs are the same as nonparallel_stochastic_em_step,
+    except that minibatch_emissions has shape [p,m,t,d].
+    """
 
-@partial(pmap, in_axes=(None, None, None, None, 0), axis_name='p')
-def _parallel_stochastic_em_step(prior_params, params, rolling_stats,
-                                 learning_rate, local_minibatch_emissions):
-    
-    rolling_normalized_stats, rolling_normalizer = rolling_stats
 
-    # INPUT: local_minibatch_emissions[m,t,d] varying across outer axis 'p'
-    # OUTPUT: NamedTuples with leading axis [k,...], varying across outer axis 'p'
-    local_normalized_stats, local_normalizer, local_lls \
-                                    = e_step(params, local_minibatch_emissions)
-    
-    # Reduce batch statistics across outer batch axis 'p'
-    # OUTPUT: NamedTuples have leading axis [k,...], identical across outer axis 'p'
-    collective_normalized_stats = tree_map(
-        partial(lax.pmean, axis_name='p'), local_normalized_stats)
+    @partial(pmap, in_axes=(None, None, None, None, 0), axis_name='p')
+    def _parallel_stochastic_em_step(prior_params, params, rolling_stats,
+                                     learning_rate, local_minibatch_emissions):
+        
+        rolling_normalized_stats, rolling_normalizer = rolling_stats
 
-    collective_normalizer = lax.psum(local_normalizer, axis_name='p')
-    collective_lls = lax.psum(local_lls, axis_name='p')
+        # INPUT: local_minibatch_emissions[m,t,d] varying across outer axis 'p'
+        # OUTPUT: NamedTuples with leading axis [k,...], varying across outer axis 'p'
+        local_normalized_stats, local_normalizer, local_lls \
+                                        = e_step(params, local_minibatch_emissions)
+        
+        # Reduce batch statistics across outer batch axis 'p'
+        # OUTPUT: NamedTuples have leading axis [k,...], identical across outer axis 'p'
+        collective_normalized_stats = tree_map(
+            partial(lax.pmean, axis_name='p'), local_normalized_stats)
 
-    # Convexly combine rolling statistics with collective statistics
-    # All stats and lls are now identical across devices (across outer axis 'p')
-    convex_update = lambda rolling_stat, minibatch_stat: \
-        (1-learning_rate) * rolling_stat + learning_rate * minibatch_stat
-    
-    updated_normalized_stats = tree_map(
-        convex_update, rolling_normalized_stats, collective_normalized_stats)
+        collective_normalizer = lax.psum(local_normalizer, axis_name='p')
+        collective_lls = lax.psum(local_lls, axis_name='p')
 
-    updated_normalizer = convex_update(rolling_normalizer, collective_normalizer)
-    
-    # Call M-step
-    map_params = m_step(prior_params, updated_normalized_stats, updated_normalizer)
+        # Convexly combine rolling statistics with collective statistics
+        # All stats are identical across outer axis 'p'
+        convex_update = lambda rolling_stat, minibatch_stat: \
+            (1-learning_rate) * rolling_stat + learning_rate * minibatch_stat
+        
+        p_updated_normalized_stats = tree_map(
+            convex_update, rolling_normalized_stats, collective_normalized_stats)
 
-    return map_params, (updated_normalized_stats, updated_normalizer), collective_lls
+        p_updated_normalizer = convex_update(rolling_normalizer, collective_normalizer)
 
+        p_updated_rolling_stats = (p_updated_normalized_stats, p_updated_normalizer)
+        
+        # Call M-step
+        p_updated_params = m_step(prior_params, p_updated_normalized_stats, p_updated_normalizer)
+
+        return p_updated_params, p_updated_rolling_stats, collective_lls
+
+    pbatch_params, pbatch_stats, pbatch_lls = _parallel_stochastic_em_step(
+            prior_params, params, rolling_stats, learning_rate, minibatch_emissions)
+
+    updated_params, updated_rolling_stats, minibatch_lls = tree_map(
+        lambda arr: arr[0], (pbatch_params, pbatch_stats, pbatch_lls))
+
+    return updated_params, updated_rolling_stats, minibatch_lls
 
 def fit_stochastic_em(initial_params, prior_params, emissions_generator,
-                      schedule=None, num_epochs=5, parallelize=False, verbose=True):
+                      schedule=None, num_epochs=5, parallelize=False,
+                      checkpoint_every=None, checkpoint_dir=None, num_checkpoints_to_keep=10,
+                      starting_epoch=0):
     """Estimate model parameters from emissions using stochastic Expectation-Maximization (StEM).
 
     Let the original dataset consists of N independent sequences of length T.
@@ -304,17 +347,30 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     Currently, this code assumes parallelization over multiple CPU cores on the
     same devices. This requires the user to set the environment flags
         XLA_FLAGS=--xla_force_host_platform_device_count=[p]
+
+    If checkpointing the training, must specify `checkpoint_every` and
+    `checkpoint_dir` parameters.
+    
+    In order to warm-start the training, user should pass in the warm-started
+    `initial_params`, `emissions_generator`, and `starting_epoch` at which the
+    training is being warm-started from. All other parameters remain static.
     
     Arguments
         initial_params (Parameters)
         prior_params (PriorParams)
-        emissions_generator (Generator->[m,t,d] OR -> [p,m,t,d] if parallelize=True):
+        emissions_generator (Generator->[m,t,d] OR -> [p,m,t,d] if parallelize):
             Produces minibatches of emissions. Automatically shuffles after each epoch.
         schedule (optax schedule, Callable: int -> [0, 1]): Learning rate
             schedule; defaults to exponential schedule.
         num_epochs (int): Number of StEM iterations to run over full dataset
         parallelize (bool): If True, parallelize across p devices.
-        verbose (bool): If true, print progress bar.
+        checkpoint_every (int): Number of epochs between checkpoints.
+        checkpoint_dir (str): Directory to store checkpoints.
+        checkpoints_to_keep (int): Number of recent checkpoints to keep.
+            Default: -1, keep all checkpoints.
+        starting_epoch (int): Epoch that the fitting algorithm is starting at.
+            Value will be non-zero (and must be explicitly specified) if user
+            is warm-starting the training. Default: 0.
     
     Returns
         fitted_params (Parameters)
@@ -325,7 +381,9 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     num_states = initial_params.initial_probs.shape[-1]
     emission_dim = initial_params.emission_means.shape[-1]
 
+    # =========================================================================
     # Set global training learning rates: shape (num_epochs, num_batches)
+    # =========================================================================
     if schedule is None:
         schedule = optax.exponential_decay(
             init_value=1., 
@@ -338,51 +396,85 @@ def fit_stochastic_em(initial_params, prior_params, emissions_generator,
     assert learning_rates[0] == 1.0, "Learning rate must start at 1."
     learning_rates = learning_rates.reshape(num_epochs, num_batches)
 
-    def _step_fn(params, rolling_stats, learning_rate, minibatch_emissions):
-        """Perform single stochastic EM step on minibatch of [m,t,d] emissions."""
-        # Returns: Parameters([k,...]), *Stats([k,...]), float
-        params, rolling_stats, minibatch_lls = _stochastic_em_step(
-            prior_params, params, rolling_stats, learning_rate, minibatch_emissions)
+    # =========================================================================
+    # Define which method (parallel vs. non-parallel) to use
+    # =========================================================================
+    step_fn = parallel_stochastic_em_step if parallelize else nonparallel_stochastic_em_step
 
-        return params, rolling_stats, minibatch_lls
-    
-    def _parallel_step_fn(params, rolling_stats, learning_rate, minibatch_emissions):
-        """Perform single parallelized stochastic EM step on minibatch of [p,m,t,d] emissions."""
-        # Returns: Parameters([p,k,...]), NormalizedEmissionStats([p,k,...]), ndarray[p,]
-        pbatch_params, pbatch_stats, pbatch_lls = _parallel_stochastic_em_step(
-            prior_params, params, rolling_stats, learning_rate, minibatch_emissions)
+    # =========================================================================
+    # Organize metadata
+    # =========================================================================
+    metadata = dict(
+        prior_params = prior_params,
+        schedule     = schedule,
+        num_epochs   = num_epochs,
+        parallelize  = parallelize,
+        num_batches  = num_batches,
+        num_states   = num_states,
+        emission_dim = emission_dim,
+    )
 
-        params, rolling_stats, minibatch_lls = tree_map(
-            lambda arr: arr[0], (pbatch_params, pbatch_stats, pbatch_lls))
-        
-        return params, rolling_stats, minibatch_lls
-
-
-    step_fn = _parallel_step_fn if parallelize else _step_fn
-
+    # =========================================================================
     # Initialize
+    # =========================================================================
     params = initial_params
     rolling_stats = initialize_statistics(num_states, emission_dim)
     expected_log_probs = jnp.empty((0, len(emissions_generator)))
 
+    # =========================================================================
     # Train
-    for epoch in range(num_epochs):
+    # =========================================================================
+    epoch = starting_epoch
+    
+    while epoch < num_epochs:
         epoch_expected_lps = []
 
-        # Does this work outside of pytest environment?
-        pbar = (enumerate(tqdm(emissions_generator, desc=f'epoch {epoch}/{num_epochs}'))
-                if verbose else enumerate(emissions_generator))
-        for minibatch, minibatch_emissions in pbar:
-            
+        pbar = tqdm(emissions_generator,
+                    desc=f'epoch {epoch}/{num_epochs}',
+                    postfix={'lp': -jnp.inf})
+
+        for minibatch, minibatch_emissions in enumerate(pbar):
             params, rolling_stats, minibatch_lls = step_fn(
-                params, rolling_stats, learning_rates[epoch][minibatch], minibatch_emissions
+                prior_params, params,
+                rolling_stats,
+                learning_rates[epoch][minibatch],
+                minibatch_emissions
             )
-                
+
+            # Store expected log probability, averaged across total number of emissions
             expected_lp = log_prior(params, prior_params) + num_batches * minibatch_lls
+            expected_lp /= emissions_generator.total_emissions
             epoch_expected_lps.append(expected_lp)
+
+            # Update progress bar
+            pbar.set_postfix({'lp': expected_lp})
+
+            # Check that M-step emission covariance is PSD
+            _eigvals = jnp.linalg.eigvals(params.emission_covariances)
+            if jnp.any(_eigvals < 0.):
+                print('!! `params.emission_covariances` is not PSD. !!')
+                for _i, _v in zip(jnp.atleast_2d(jnp.hstack(jnp.nonzero(_eigvals<0))), _eigvals[_eigvals<0]):
+                    print(f'Eigenvalue {_v:.2e} at index {_i}')
+                raise ValueError('`params.emission_covariances` is not PSD. Considering increasing emission_scale and emission_extra_df prior parameters')
+
+            # Check no NaNs in parameters
+            if any(tree_leaves(tree_map(lambda arr: jnp.any(jnp.isnan(arr)), (params, rolling_stats, minibatch_lls)))):
+                raise ValueError(f'Epoch {epoch}, minibatch {minibatch}: NaN detected.')
 
         # Save epoch mean of expected log probs
         expected_log_probs = jnp.vstack([expected_log_probs, jnp.asarray(epoch_expected_lps)])
+        
+        # Save results, if checkpointing
+        if (checkpoint_every is not None) and (checkpoint_dir is not None):
+            if (epoch % checkpoint_every == 0):    
+                tqdm.write(f"Saving checkpoint for epoch {epoch} at {checkpoint_dir}...", end="")
+                chk.save_checkpoint(
+                    ((params, rolling_stats, minibatch_lls), metadata), epoch,
+                    checkpoint_dir,
+                    num_checkpoints_to_keep)
+                tqdm.write("Done.")
+            
+        epoch += 1
 
     return params, jnp.asarray(expected_log_probs)
 
