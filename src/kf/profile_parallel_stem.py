@@ -159,7 +159,7 @@ def main():
         assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
         local_batch_size = batch_size // num_devices
         def collate_fn(sequences):
-            return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, seq_length, -1)
+            return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, *sequences[0].shape)
         
     else:
         assert num_devices == 1, f'Expected 1 device, but seeing {num_devices}. Reset XLA_FLAGS setting.'

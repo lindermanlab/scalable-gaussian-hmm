@@ -37,10 +37,12 @@ def _kmeans_init(seed, num_states, emissions_dim, dataloader,
     """
     
     # Get single batch from dataloader and pre-allocate array
-    # _batch = next(iter(dataloader))
     batch_size = dataloader.batch_size
     seq_length = dataloader.dataset.sequence_shape[0]
-    subsampled = onp.empty((len(dataloader), batch_size, seq_length//step_size, emissions_dim))
+    subsampled_length = seq_length // step_size
+
+    subsampled = dataloader.collate_fn([onp.empty((subsampled_length, emissions_dim))]*batch_size)
+    subsampled = onp.stack([subsampled] * len(dataloader))
 
     # Get data from dataloader, and reshape to (num_samples, emission_dim) array
     for i, batch_emissions in enumerate(dataloader):
