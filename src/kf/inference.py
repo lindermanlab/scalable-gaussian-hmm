@@ -147,7 +147,8 @@ def fit_stochastic_em(initial_params, prior_params,
     
     lp = expected_log_probs[epoch][minibatch] if len(expected_log_probs) > 1 else -jnp.inf
     while epoch < num_epochs:
-        expected_log_probs.append([])
+        if minibatch == 0:
+            expected_log_probs.append([])
         pbar = tqdm(desc=f'epoch {epoch+1}/{num_epochs}',
                     total=num_batches,
                     initial=minibatch,
