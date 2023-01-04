@@ -179,7 +179,7 @@ def main():
     print()
 
     # Initialize GaussianHMM model parameters based on specified method
-    init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim)
+    init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim, dataloader)
     
     # Set GaussianHMM prior parameters to non-informative values, except
     # boost the prior parameters associated with emission covariance matrices
