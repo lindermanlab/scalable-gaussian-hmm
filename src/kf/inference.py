@@ -117,10 +117,10 @@ def fit_stochastic_em(initial_params, prior_params,
     out = chk.load_latest_checkpoint(checkpoint_dir)
     if do_checkpoint and out[0] is not None:
         print("Warm-starting...", end="")
-        ((params, rolling_stats, expected_log_probs, iterator_state), metadata), global_id = out
-
+        ((params, rolling_stats, expected_log_probs, iterator_state), metadata), checkpoint_global_id = out
+        global_id = checkpoint_global_id + 1
         emissions_loader.state = iterator_state
-        print(f"Loaded checkpoint at step {global_id} from {checkpoint_dir}.")
+        print(f"Loaded checkpoint at step {checkpoint_global_id} from {checkpoint_dir}.")
     else:
         print("Cold-starting from passed-in parameters.")
         global_id = 0
@@ -168,7 +168,7 @@ def fit_stochastic_em(initial_params, prior_params,
             pbar.set_postfix({'lp': expected_lp})
             
             # Save results, if checkpointing
-            if do_checkpoint and (global_id % checkpoint_every == 0):    
+            if do_checkpoint and (global_id % checkpoint_every == 0) and (global_id != 0):    
                 tqdm.write(f"Saving checkpoint for epoch {epoch} at {checkpoint_dir}...", end="")
                 chk.save_checkpoint(
                     ((params, rolling_stats, expected_log_probs, emissions_loader.state), metadata),
