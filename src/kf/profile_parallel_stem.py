@@ -45,7 +45,7 @@ logger.addFilter(CheckTypesFilter())
 
 parser = argparse.ArgumentParser(description='Profile stochastic EM algorithms')
 parser.add_argument(
-    '--session_name', type=str, default=None,
+    '--session_prefix', type=str, default=None,
     help='Identifying token,. Used for log and checkpoint files')
 parser.add_argument(
     '--seed', type=int, required=True,
@@ -131,14 +131,15 @@ def main():
     parallelize = args.parallelize
     profile = args.profile
 
-    # Set timestamp based default args if none specified
-    timestamp = datetime.now().strftime("%y%m%d_%H%M")
-    
-    if args.session_name is None:
-        session_name = f'{timestamp}-{num_states}states'
+    # Set session name
+    if args.session_prefix is None:
+        timestamp = datetime.now().strftime("%y%m%d_%H%M")
+        session_prefix = f'{timestamp}'
     else:
-        session_name = args.session_name
-
+        session_prefix = args.session_prefix
+    _str_debug = args.debug_max_files if args.debug_max_files > 0 else 'all'
+    _str_parallel = '-parallel' if args.parallelize else ''
+    session_name = f'{session_prefix}-{num_states}_states-{init_method}_init-{_str_debug}_files-{init_method}_method{_str_parallel}'
     log_dir = os.path.join(TEMPDIR, session_name)
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
