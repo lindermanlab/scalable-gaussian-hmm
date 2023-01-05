@@ -114,13 +114,14 @@ def fit_stochastic_em(initial_params, prior_params,
     # TODO Why don't we avoid warm-starting in this functioni and allow user
     # to do that in their outer script???
     do_checkpoint = (checkpoint_every is not None) and (checkpoint_dir is not None)
-    out = chk.load_latest_checkpoint(checkpoint_dir)
-    if do_checkpoint and out[0] is not None:
-        print("Warm-starting...", end="")
-        ((params, rolling_stats, expected_log_probs, iterator_state), metadata), checkpoint_global_id = out
-        global_id = checkpoint_global_id + 1
-        emissions_loader.state = iterator_state
-        print(f"Loaded checkpoint at step {checkpoint_global_id} from {checkpoint_dir}.")
+    if do_checkpoint:
+        out = chk.load_latest_checkpoint(checkpoint_dir)
+        if out[0] is not None:
+            print("Warm-starting...", end="")
+            ((params, rolling_stats, expected_log_probs, iterator_state), metadata), checkpoint_global_id = out
+            global_id = checkpoint_global_id + 1
+            emissions_loader.state = iterator_state
+            print(f"Loaded checkpoint at step {checkpoint_global_id} from {checkpoint_dir}.")
     else:
         print("Cold-starting from passed-in parameters.")
         global_id = 0
