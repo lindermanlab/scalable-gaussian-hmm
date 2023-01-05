@@ -64,17 +64,11 @@ parser.add_argument(
     '--seq_length', type=int, default=72000,
     help='Number of consecutive frames per sequence.')
 parser.add_argument(
-    '--train', type=float, default=0.8,
-    help='If >=1, number of sequences of seq_length in dataset to train over. If [0, 1), fraction of sequences in dataset to train over.')
-parser.add_argument(
     '--epochs', type=int, default=10,
     help='Number of stochastic EM iterations to run')
 parser.add_argument(
     '--states', type=int, default=20,
     help='Number of HMM states to fit')
-parser.add_argument(
-    '--profile', action='store_true',
-    help='If specified, record and store memory profile.')
 
 parser.add_argument(
     '--debug_max_files', type=int, default=-1,
@@ -88,7 +82,7 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
             f.writelines('MEM {} {}\n'.format(res[0], res[1]))
     return
 
-def setup_dataset(seed, seq_length, train_size, debug_max_files):
+def setup_dataset(seed, seq_length, debug_max_files):
     """Setup dataset object, get sequence slices"""
 
     seed_slice, seed_debug, seed_split = jr.split(seed, 3)
@@ -102,10 +96,6 @@ def setup_dataset(seed, seq_length, train_size, debug_max_files):
         filepaths = [filepaths[i] for i in idxs]
 
     dataset = MultiessionDataset.init_from_paths(filepaths, seed_slice, seq_length)
-
-    # Split dataset into a training set and a test set.
-    # test_dl does not need to be shuffled since we use full E-step to evaluate
-    train_ds = random_split(seed_split, dataset, [train_size,])[0]
     
     return dataset
 
@@ -129,7 +119,6 @@ def main():
     num_epochs = args.epochs
 
     parallelize = args.parallelize
-    profile = args.profile
 
     # Set session name
     if args.session_prefix is None:
@@ -150,7 +139,7 @@ def main():
     # Setup dataset
     batch_size = args.batch_size
     seq_length = args.seq_length
-    train_ds = setup_dataset(seed_data, seq_length, args.train, args.debug_max_files)
+    train_ds = setup_dataset(seed_data, seq_length, args.debug_max_files)
     emission_dim = train_ds.datasets[0].sequence_shape[-1]
 
     # Define how a batch of emissions gets reshaped, depending on if using parallelization
@@ -200,29 +189,23 @@ def main():
     fn_kwargs = {
         'num_epochs': num_epochs,
         'parallelize': parallelize,
-        'checkpoint_every': 5,
-        'checkpoint_dir': log_dir,
-        'num_checkpoints_to_keep': 10
     }
     
-    if profile:
-        mem_usage, (fitted_params, lps) = memory_usage(
-                    proc=(fn, fn_args, fn_kwargs), retval=True,
-                    backend='psutil_pss',
-                    stream=False, timestamps=True, max_usage=False,
-                    include_children=True, multiprocess=True,
-            )
-        
-        # Save memory profiler results
-        _method = 'parallel' if parallelize else 'vmap'
-        f_mprof = os.path.join(log_dir, f'{session_name}-{_method}.mprof')
-        print(f"Writing memory profile to {f_mprof}...", end="")
-        write_mprof(f_mprof, mem_usage)
-        print("Done.")
+    mem_usage, (fitted_params, lps) = memory_usage(
+                proc=(fn, fn_args, fn_kwargs), retval=True,
+                backend='psutil_pss',
+                stream=False, timestamps=True, max_usage=False,
+                include_children=True, multiprocess=True,
+        )
     
-    else:
-        fitted_params, lps = fn(*fn_args, **fn_kwargs)
+    # Save memory profiler results
+    f_mprof = os.path.join(log_dir, f'{session_name}.mprof')
+    print(f"Writing memory profile to {f_mprof}...", end="")
+    write_mprof(f_mprof, mem_usage)
+    print("Done.")
 
+    print()
+    print('log probabilities')
     print(lps)
 
     return 
