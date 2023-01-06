@@ -39,6 +39,7 @@ __all__ = [
     'SubDataset',
     'random_split'
     'SessionDataset',
+    'MultisessionDataset',
 ]
 
 @dataclass
