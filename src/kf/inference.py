@@ -146,16 +146,21 @@ def fit_stochastic_em(initial_params, prior_params,
     epoch = global_id // num_batches
     minibatch = global_id % num_batches
     
-    lp = expected_log_probs[epoch][minibatch] if len(expected_log_probs) > 1 else -jnp.inf
     while epoch < num_epochs:
-        if minibatch == 0:
-            expected_log_probs.append([])
-        pbar = tqdm(desc=f'epoch {epoch+1}/{num_epochs}',
+        lp = (expected_log_probs[-1][-1]
+              if ((len(expected_log_probs) > 1) and (len(expected_log_probs[-1]) > 1))
+              else -jnp.inf
+        )
+        
+        pbar = tqdm(desc=f'epoch {epoch+1}/{num_epochs}', # Use 1-index
                     total=num_batches,
                     initial=minibatch,
                     postfix={'lp': lp})
 
-        for minibatch, minibatch_emissions in enumerate(emissions_loader):
+        if minibatch == 0:
+            expected_log_probs.append([])
+
+        for minibatch_emissions in emissions_loader:
             params, rolling_stats, minibatch_lls = step_fn(
                 prior_params, params, rolling_stats, learning_rates[epoch][minibatch],
                 minibatch_emissions)
@@ -163,6 +168,7 @@ def fit_stochastic_em(initial_params, prior_params,
             # Store expected log probability, averaged across total number of emissions
             expected_lp = gaussian_hmm.log_prior(params, prior_params) + num_batches * minibatch_lls
             expected_lp /= emissions_loader.dataset.total_samples
+            # expected_log_probs[epoch].append(expected_lp)
             expected_log_probs[epoch].append(expected_lp)
 
             # Update progress bar
@@ -188,6 +194,7 @@ def fit_stochastic_em(initial_params, prior_params,
             
             # Update counter
             global_id += 1
+            minibatch = global_id % num_batches
         
         epoch = global_id // num_batches
 
