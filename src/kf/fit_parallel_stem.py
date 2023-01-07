@@ -33,7 +33,6 @@ from kf.inference import fit_stochastic_em
 
 DATADIR = Path(os.environ['DATADIR'])
 TEMPDIR = Path(os.environ['TEMPDIR'])
-fish_id = 'fish0_137'
 
 # -------------------------------------
 # Suppress JAX/TFD warning: ...`check_dtypes` is deprecated... message
@@ -68,12 +67,6 @@ parser.add_argument(
     '--seq_length', type=int, default=72000,
     help='Number of consecutive frames per sequence.')
 parser.add_argument(
-    '--train', type=float, default=0.8,
-    help='If >=1, number of sequences of seq_length in dataset to train over. If [0, 1), fraction of sequences in dataset to train over.')
-parser.add_argument(
-    '--test', type=float, default=0.2,
-    help='If >=1, number of sequences of seq_length in dataset to train over. If [0, 1), fraction of sequences in dataset to train over.')
-parser.add_argument(
     '--epochs', type=int, default=10,
     help='Number of stochastic EM iterations to run')
 parser.add_argument(
@@ -96,48 +89,41 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
             f.writelines('MEM {} {}\n'.format(res[0], res[1]))
     return
 
-def setup_dataset(seed, train_test_size, debug_max_files, seq_length, dtype):
+def random_split(key, elements, sizes):
+    """Split sequence of elemtns into subsets of specified sizes."""
+    N = len(elements)
+
+    # Fractional sizes are given, convert into number of samples (int)
+    if all([(sz <= 1 for sz in sizes)]):
+        subset_sizes = [int(frac * N) for frac in sizes]
+
+        # If input sizes sum up to 1, make sure to distribute all samples
+        if jnp.isclose(sum(sizes), 1) and (sum(subset_sizes) < N):
+            remainder = N - sum(subset_sizes)
+            for i in range(remainder):
+                subset_sizes[i % len(sizes)] += 1
+        
+        sizes = subset_sizes
+    # Return list of lists: outer size has len(sizes), inner size according to 
+    indices = jr.permutation(key, N)[:sum(sizes)]
+    return [
+        [elements[i] for i in indices[(offset-size):offset]]
+        for offset, size in zip(onp.cumsum(sizes), sizes)
+    ]
+    
+def setup_dataset(seed, debug_max_files, seq_length, dtype):
     """Setup dataset object, get sequence slices"""
 
     seed_slice, seed_debug, seed_split = jr.split(seed, 3)
 
-    # TODO This is hard fixed to single subject for now
-    filepaths = sorted((DATADIR/fish_id).glob('*.h5'))
+    filepaths = sorted(DATADIR.glob('*.h5'))
 
     if debug_max_files > 0:
         print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.")
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
 
-    # Split filepaths into train and test sets
-    def random_split(key, elements, sizes):
-        N = len(elements)
-
-        # Fractional sizes are given, convert into number of samples (int)
-        if all([(sz <= 1 for sz in sizes)]):
-            subset_sizes = [int(frac * N) for frac in sizes]
-
-            # If input sizes sum up to 1, make sure to distribute all samples
-            if jnp.isclose(sum(sizes), 1) and (sum(subset_sizes) < N):
-                remainder = N - sum(subset_sizes)
-                for i in range(remainder):
-                    subset_sizes[i % len(sizes)] += 1
-            
-            sizes = subset_sizes
-
-        # Return list of lists: outer size has len(sizes), inner size according to 
-        indices = jr.permutation(key, N)[:sum(sizes)]
-        return [
-            [elements[i] for i in indices[(offset-size):offset]]
-            for offset, size in zip(onp.cumsum(sizes), sizes)
-        ]
-    train_filepaths, test_filepaths = random_split(seed_split, filepaths, train_test_size)
-    
-    # Construct train and test dataset objects
-    train_seq_key, test_seq_key = jr.split(seed_slice)
-    train_ds = MultiSessionDataset(train_filepaths, train_seq_key, seq_length, dtype=dtype)
-    test_ds = MultiSessionDataset(test_filepaths, test_seq_key, seq_length, dtype=dtype)
-    return train_ds, test_ds
+    return MultiSessionDataset(filepaths, seed_slice, seq_length, dtype=dtype)
 
 # -------------------------------------
 
@@ -179,10 +165,9 @@ def main():
     
     # Setup dataset
     batch_size = args.batch_size
-    train_test_size = (args.train, args.test)
     seq_length = args.seq_length
 
-    train_ds, test_ds = setup_dataset(seed_data, train_test_size, args.debug_max_files, seq_length, dtype)
+    train_ds = setup_dataset(seed_data, args.debug_max_files, seq_length, dtype)
     emission_dim = train_ds.sequence_shape[-1]
 
     # Define how a batch of emissions gets reshaped, depending on if using parallelization
