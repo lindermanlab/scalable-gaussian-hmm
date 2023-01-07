@@ -23,7 +23,11 @@ import numpy as onp
 import jax.numpy as jnp
 import jax.random as jr
 
-from kf.data import MultiessionDataset, random_split, RandomBatchDataloader, IteratorState
+from torch.utils.data import DataLoader
+from kf.data import (SingleSessionDataset,
+                     MultiSessionDataset,
+                     RandomBatchSampler,
+                     get_file_raw_shapes)
 import kf.gaussian_hmm as GaussianHMM
 from kf.inference import fit_stochastic_em
 
@@ -82,20 +86,21 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
             f.writelines('MEM {} {}\n'.format(res[0], res[1]))
     return
 
-def setup_dataset(seed, seq_length, debug_max_files):
+def setup_dataset(seed, debug_max_files, seq_length, dtype):
     """Setup dataset object, get sequence slices"""
 
     seed_slice, seed_debug, seed_split = jr.split(seed, 3)
 
     # TODO This is hard fixed to single subject for now
     filepaths = sorted((DATADIR/fish_id).glob('*.h5'))
+    filepaths, _ = get_file_raw_shapes(filepaths, min_frames_per_file=seq_length)
 
     if debug_max_files > 0:
         print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.")
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
 
-    dataset = MultiessionDataset.init_from_paths(filepaths, seed_slice, seq_length)
+    dataset = MultiSessionDataset(filepaths, seed_slice, seq_length, dtype=dtype)
     
     return dataset
 
@@ -110,7 +115,8 @@ def main():
     print(f"Setting user-specified seed: {args.seed}")
 
     # Print Jax precision
-    print(f"JAX using {jnp.array([1.2, 3.4]).dtype} precision\n")
+    dtype = jnp.array([1.2, 3.4]).dtype
+    print(f"JAX using {dtype} precision\n")
 
     # Algorithm parameters
     num_states = args.states
@@ -139,8 +145,8 @@ def main():
     # Setup dataset
     batch_size = args.batch_size
     seq_length = args.seq_length
-    train_ds = setup_dataset(seed_data, seq_length, args.debug_max_files)
-    emission_dim = train_ds.datasets[0].sequence_shape[-1]
+    train_ds = setup_dataset(seed_data, args.debug_max_files, seq_length, dtype)
+    emission_dim = train_ds.sequence_shape[-1]
 
     # Define how a batch of emissions gets reshaped, depending on if using parallelization
     num_devices = jax.local_device_count()
@@ -156,12 +162,8 @@ def main():
             return onp.stack(sequences, axis=0)
 
     # Construct dataloader
-    sample_fn = lambda key, ds: jr.permutation(key, len(ds))
-    dataloader = RandomBatchDataloader(train_ds,
-                                       batch_size,
-                                       seed_dl,
-                                       sample_fn,
-                                       collate_fn)
+    sampler = RandomBatchSampler(train_ds, batch_size, seed_dl)
+    dataloader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
     
     print("Initialized training dataset with "
             + f"{len(train_ds):3d} sets of {seq_length/72000:.1f} hr sequences; "
@@ -175,7 +177,7 @@ def main():
     # boost the prior parameters associated with emission covariance matrices
     # (i.e. emission_scale and emission_extra_df) to scale of minibatch size
     # to regularize covariance matrix to be PSD
-    total_emissions_per_batch = dataloader.dataset.total_samples // len(dataloader)
+    total_emissions_per_batch = dataloader.dataset.num_samples // len(dataloader)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(
         num_states,
         emission_dim,
@@ -183,7 +185,6 @@ def main():
         emission_extra_df=(1e-1)*total_emissions_per_batch,)
     
     # Setup function
-    # fn = GaussianHMM.fit_stochastic_em
     fn = fit_stochastic_em
     fn_args = (init_params, prior_params, dataloader)
     fn_kwargs = {

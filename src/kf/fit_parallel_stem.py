@@ -23,7 +23,11 @@ import numpy as onp
 import jax.numpy as jnp
 import jax.random as jr
 
-from kf.data import MultiessionDataset, random_split, RandomBatchDataloader, IteratorState
+from torch.utils.data import DataLoader
+from kf.data import (SingleSessionDataset,
+                     MultiSessionDataset,
+                     RandomBatchSampler,
+                     get_file_raw_shapes)
 import kf.gaussian_hmm as GaussianHMM
 from kf.inference import fit_stochastic_em
 
@@ -92,7 +96,7 @@ def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
             f.writelines('MEM {} {}\n'.format(res[0], res[1]))
     return
 
-def setup_dataset(seed, seq_length, train_test_size, debug_max_files):
+def setup_dataset(seed, train_test_size, debug_max_files, seq_length, dtype):
     """Setup dataset object, get sequence slices"""
 
     seed_slice, seed_debug, seed_split = jr.split(seed, 3)
@@ -105,10 +109,35 @@ def setup_dataset(seed, seq_length, train_test_size, debug_max_files):
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
 
-    dataset = MultiessionDataset.init_from_paths(filepaths, seed_slice, seq_length)
+    # Split filepaths into train and test sets
+    def random_split(key, elements, sizes):
+        N = len(elements)
 
-    # Split dataset into a training set and a test set.
-    return random_split(seed_split, dataset, train_test_size)
+        # Fractional sizes are given, convert into number of samples (int)
+        if all([(sz <= 1 for sz in sizes)]):
+            subset_sizes = [int(frac * N) for frac in sizes]
+
+            # If input sizes sum up to 1, make sure to distribute all samples
+            if jnp.isclose(sum(sizes), 1) and (sum(subset_sizes) < N):
+                remainder = N - sum(subset_sizes)
+                for i in range(remainder):
+                    subset_sizes[i % len(sizes)] += 1
+            
+            sizes = subset_sizes
+
+        # Return list of lists: outer size has len(sizes), inner size according to 
+        indices = jr.permutation(key, N)[:sum(sizes)]
+        return [
+            [elements[i] for i in indices[(offset-size):offset]]
+            for offset, size in zip(onp.cumsum(sizes), sizes)
+        ]
+    train_filepaths, test_filepaths = random_split(seed_split, filepaths, train_test_size)
+    
+    # Construct train and test dataset objects
+    train_seq_key, test_seq_key = jr.split(seed_slice)
+    train_ds = MultiSessionDataset(train_filepaths, train_seq_key, seq_length, dtype=dtype)
+    test_ds = MultiSessionDataset(test_filepaths, test_seq_key, seq_length, dtype=dtype)
+    return train_ds, test_ds
 
 # -------------------------------------
 
@@ -121,7 +150,8 @@ def main():
     print(f"Setting user-specified seed: {args.seed}")
 
     # Print Jax precision
-    print(f"JAX using {jnp.array([1.2, 3.4]).dtype} precision\n")
+    dtype = jnp.array([1.2, 3.4]).dtype
+    print(f"JAX using {dtype} precision\n")
 
     # Algorithm parameters
     num_states = args.states
@@ -149,9 +179,11 @@ def main():
     
     # Setup dataset
     batch_size = args.batch_size
+    train_test_size = (args.train, args.test)
     seq_length = args.seq_length
-    train_ds, test_ds = setup_dataset(seed_data, seq_length, (args.train, args.test), args.debug_max_files)
-    emission_dim = train_ds.datasets[0].sequence_shape[-1]
+
+    train_ds, test_ds = setup_dataset(seed_data, train_test_size, args.debug_max_files, seq_length, dtype)
+    emission_dim = train_ds.sequence_shape[-1]
 
     # Define how a batch of emissions gets reshaped, depending on if using parallelization
     num_devices = jax.local_device_count()
@@ -167,26 +199,22 @@ def main():
             return onp.stack(sequences, axis=0)
 
     # Construct dataloader
-    sample_fn = lambda key, ds: jr.permutation(key, len(ds))
-    dataloader = RandomBatchDataloader(train_ds,
-                                       batch_size,
-                                       seed_dl,
-                                       sample_fn,
-                                       collate_fn)
+    sampler = RandomBatchSampler(train_ds, batch_size, seed_dl)
+    train_dataloader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
     
     print("Initialized training dataset with "
             + f"{len(train_ds):3d} sets of {seq_length/72000:.1f} hr sequences; "
-            + f"{len(dataloader):3d} batches of {batch_size} sequences per batch")
+            + f"{len(train_dataloader):3d} batches of {batch_size} sequences per batch")
     print()
 
     # Initialize GaussianHMM model parameters based on specified method
-    init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim, dataloader)
+    init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim, train_dataloader)
     
     # Set GaussianHMM prior parameters to non-informative values, except
     # boost the prior parameters associated with emission covariance matrices
     # (i.e. emission_scale and emission_extra_df) to scale of minibatch size
     # to regularize covariance matrix to be PSD
-    total_emissions_per_batch = dataloader.dataset.total_samples // len(dataloader)
+    total_emissions_per_batch = train_dataloader.dataset.num_samples // len(train_dataloader)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(
         num_states,
         emission_dim,
@@ -201,7 +229,7 @@ def main():
         'checkpoint_dir': log_dir,
         'num_checkpoints_to_keep': 10
     }
-    fitted_params, lps = fit_stochastic_em(init_params, prior_params, dataloader, **fn_kwargs)
+    fitted_params, lps = fit_stochastic_em(init_params, prior_params, train_dataloader, **fn_kwargs)
 
     print(lps)
 

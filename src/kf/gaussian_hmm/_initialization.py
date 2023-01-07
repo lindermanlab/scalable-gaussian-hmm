@@ -37,7 +37,7 @@ def _kmeans_init(seed, num_states, emissions_dim, dataloader,
     """
     
     # Get single batch from dataloader and pre-allocate array
-    batch_size = dataloader.batch_size
+    batch_size = dataloader.batch_sampler.batch_size
     seq_length = dataloader.dataset.sequence_shape[0]
     subsampled_length = seq_length // step_size
 

@@ -29,7 +29,7 @@ def check_psd(covs):
         raise ValueError('`params.emission_covariances` is not PSD. Considering increasing emission_scale and emission_extra_df prior parameters')
 
 def fit_stochastic_em(initial_params, prior_params,
-                      emissions_loader,
+                      dataloader,
                       schedule=None, num_epochs=5, parallelize=False,
                       checkpoint_every=None, checkpoint_dir=None, num_checkpoints_to_keep=10):
     """Estimate model parameters from emissions using stochastic Expectation-Maximization (StEM).
@@ -42,7 +42,7 @@ def fit_stochastic_em(initial_params, prior_params,
     If a schedule is not specified, an exponentially decaying model is used
     such that the learning rate which decreases by 5% at each epoch.
 
-    NB: This algorithm assumes that the `emissions_loader` object automatically
+    NB: This algorithm assumes that the `dataloader` object automatically
     shuffles minibatch sequences before each epoch. It is up to the user to
     correctly instantiate this object to exhibit this property. For example,
     `torch.utils.data.DataLoader` objects implement such a functionality.
@@ -50,7 +50,7 @@ def fit_stochastic_em(initial_params, prior_params,
     If `parallelize=True`, then this algorithm makes use of JAX's pmap and
     collective all-reduce operationsto perform the expensive E-steps in parallel.
     It assumes that there are 'p' devices, which must EXACTLY match the 'p' in
-    the minibatch shape returned by the emissions_loader iterable.
+    the minibatch shape returned by the dataloader iterable.
 
     Currently, this code assumes parallelization over multiple CPU cores on the
     same devices. This requires the user to set the environment flags
@@ -59,7 +59,7 @@ def fit_stochastic_em(initial_params, prior_params,
     Arguments
         initial_params (Parameters)
         prior_params (PriorParams)
-        emissions_loader (Generator->[m,t,d] OR -> [p,m,t,d] if parallelize):
+        dataloader (Generator->[m,t,d] OR -> [p,m,t,d] if parallelize):
             Produces minibatches of emissions. Automatically shuffles after each epoch.
         schedule (optax schedule, Callable: int -> [0, 1]): Learning rate
             schedule; defaults to exponential schedule.
@@ -80,7 +80,7 @@ def fit_stochastic_em(initial_params, prior_params,
         log_probs [num_epochs, num_batches]
     """
     
-    num_batches = len(emissions_loader)
+    num_batches = len(dataloader)
     num_states = initial_params.initial_probs.shape[-1]
     emission_dim = initial_params.emission_means.shape[-1]
 
@@ -110,22 +110,19 @@ def fit_stochastic_em(initial_params, prior_params,
     # =========================================================================
     # Initialize / Warm-start
     # =========================================================================
-    
-    # TODO Why don't we avoid warm-starting in this functioni and allow user
-    # to do that in their outer script???
+            
     do_checkpoint = (checkpoint_every is not None) and (checkpoint_dir is not None)
-    if do_checkpoint:
-        out = chk.load_latest_checkpoint(checkpoint_dir)
-        if out[0] is not None:
-            print("Warm-starting...", end="")
-            ((params, rolling_stats, expected_log_probs, iterator_state), metadata), checkpoint_global_id = out
-            global_id = checkpoint_global_id + 1
-            emissions_loader.state = iterator_state
-            print(f"Loaded checkpoint at step {checkpoint_global_id} from {checkpoint_dir}.")
+    out = chk.load_latest_checkpoint(checkpoint_dir) if do_checkpoint else [None]
+    if do_checkpoint and out[0] is not None:
+        print("Warm-starting...", end="")
+        ((params, rolling_stats, expected_log_probs, iterator_state), metadata), checkpoint_global_id = out
+        global_id = checkpoint_global_id + 1
+        dataloader.batch_sampler_state = iterator_state
+        print(f"Loaded checkpoint at step {checkpoint_global_id} from {checkpoint_dir}.")
     else:
         print("Cold-starting from passed-in parameters.")
-        global_id = 0
 
+        global_id = 0
         params = initial_params
         rolling_stats = gaussian_hmm.initialize_statistics(num_states, emission_dim)
         expected_log_probs = []
@@ -160,15 +157,14 @@ def fit_stochastic_em(initial_params, prior_params,
         if minibatch == 0:
             expected_log_probs.append([])
 
-        for minibatch_emissions in emissions_loader:
+        for minibatch_emissions in dataloader:
             params, rolling_stats, minibatch_lls = step_fn(
                 prior_params, params, rolling_stats, learning_rates[epoch][minibatch],
                 minibatch_emissions)
 
             # Store expected log probability, averaged across total number of emissions
             expected_lp = gaussian_hmm.log_prior(params, prior_params) + num_batches * minibatch_lls
-            expected_lp /= emissions_loader.dataset.total_samples
-            # expected_log_probs[epoch].append(expected_lp)
+            expected_lp /= dataloader.dataset.num_samples
             expected_log_probs[epoch].append(expected_lp)
 
             # Update progress bar
@@ -179,7 +175,7 @@ def fit_stochastic_em(initial_params, prior_params,
             if do_checkpoint and (global_id % checkpoint_every == 0) and (global_id != 0):    
                 tqdm.write(f"Saving checkpoint for epoch {epoch} at {checkpoint_dir}...", end="")
                 chk.save_checkpoint(
-                    ((params, rolling_stats, expected_log_probs, emissions_loader.state), metadata),
+                    ((params, rolling_stats, expected_log_probs, dataloader.batch_sampler.state), metadata),
                     global_id,
                     checkpoint_dir,
                     num_checkpoints_to_keep)
