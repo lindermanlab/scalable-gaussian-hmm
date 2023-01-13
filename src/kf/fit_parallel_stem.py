@@ -172,6 +172,7 @@ def main():
 
     # Define how a batch of emissions gets reshaped, depending on if using parallelization
     num_devices = jax.local_device_count()
+    assert batch_size >= num_devices, f'Expected batch_size >= num_devices, got batch size of {batch_size} for {num_devices} number of devices.'
     if parallelize:
         assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
         local_batch_size = batch_size // num_devices
