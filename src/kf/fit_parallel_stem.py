@@ -61,8 +61,8 @@ parser.add_argument(
     choices=['random', 'kmeans'],
     help='HMM initialization method in the first epoch.')
 parser.add_argument(
-    '--batch_size', type=int, default=1,
-    help='Number of batches loaded per iteration.')
+    '--batch_size_per_device', type=int, default=1,
+    help='Number of batches loaded per device per iteration.')
 parser.add_argument(
     '--seq_length', type=int, default=72000,
     help='Number of consecutive frames per sequence.')
@@ -163,19 +163,22 @@ def main():
     
     # ==========================================================================
     
+    num_devices = jax.local_device_count()
+    
     # Setup dataset
-    batch_size = args.batch_size
+    # batch_size = args.batch_size
+    local_batch_size = args.batch_size_per_device
+    batch_size = local_batch_size * num_devices
+
     seq_length = args.seq_length
 
     train_ds = setup_dataset(seed_data, args.debug_max_files, seq_length, dtype)
     emission_dim = train_ds.sequence_shape[-1]
 
     # Define how a batch of emissions gets reshaped, depending on if using parallelization
-    num_devices = jax.local_device_count()
-    assert batch_size >= num_devices, f'Expected batch_size >= num_devices, got batch size of {batch_size} for {num_devices} number of devices.'
     if parallelize:
         assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
-        local_batch_size = batch_size // num_devices
+        # local_batch_size = batch_size // num_devices
         def collate_fn(sequences):
             return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, *sequences[0].shape)
         
@@ -187,12 +190,13 @@ def main():
     # Construct dataloader
     sampler = RandomBatchSampler(train_ds, batch_size, seed_dl)
     train_dataloader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
-    
+   
+    print(f'num_devices {num_devices}, local_batch_size {local_batch_size}, batch_size {batch_size}') 
     print("Initialized training dataset with "
             + f"{len(train_ds):3d} sets of {seq_length/72000:.1f} hr sequences; "
             + f"{len(train_dataloader):3d} batches of {batch_size} sequences per batch")
     print()
-
+    
     # Initialize GaussianHMM model parameters based on specified method
     init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim, train_dataloader)
     
