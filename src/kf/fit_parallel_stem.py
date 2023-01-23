@@ -118,6 +118,13 @@ def setup_dataset(seed, debug_max_files, seq_length, dtype):
 
     filepaths = sorted(DATADIR.glob('*.h5'))
 
+    # If no .h5 files found, search recursively
+    if len(filepaths) == 0:
+        print(f'No *.h5 files found in {DATADIR}, searching recursively.')
+        filepaths = sorted(DATADIR.rglob('*.h5'))
+    
+    assert len(filepaths) > 0, f'Expected to find *.h5 files in {DATADIR}, no files found.'
+
     if debug_max_files > 0:
         print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.")
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
