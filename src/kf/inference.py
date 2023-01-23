@@ -173,7 +173,7 @@ def fit_stochastic_em(initial_params, prior_params,
             
             # Save results, if checkpointing
             if do_checkpoint and (global_id % checkpoint_every == 0) and (global_id != 0):    
-                tqdm.write(f"Saving checkpoint for epoch {epoch} at {checkpoint_dir}...", end="")
+                tqdm.write(f"Saving checkpoint for epoch {epoch}:{minibatch}/{len(dataloader)} at {checkpoint_dir}...", end="")
                 chk.save_checkpoint(
                     ((params, rolling_stats, expected_log_probs, dataloader.batch_sampler.state), metadata),
                     global_id,

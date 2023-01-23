@@ -155,7 +155,7 @@ def initialize_training_data(
     filepaths, _ = filter_min_frames(filepaths, em_seq_length)
 
     if debug_max_files > 0:
-        print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.")
+        print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.\n")
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
 
@@ -185,9 +185,9 @@ def initialize_training_data(
 
     if verbose: 
         print(f'num_devices {num_devices}, local_batch_size {em_local_batch_size}, batch_size {em_batch_size}') 
-        print("Initialized training dataset with "
-                + f"{len(train_ds):3d} sets of {em_seq_length/72000:.1f} hr sequences; "
-                + f"{len(train_dl):3d} batches of {em_batch_size} sequences per batch")
+        print("Initialized training dataset...")
+        print(f"\t{len(train_ds):3d} sets of {em_seq_length/72000:.1f} hr sequences")
+        print(f"\t{len(train_dl):3d} batches of {em_batch_size} sequences")
         print()
 
     return train_ds, train_dl
