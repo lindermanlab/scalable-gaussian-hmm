@@ -31,7 +31,9 @@ def _kmeans_init(seed, num_states, data, emission_covs_scale=1.,):
     emissions_dim = data.shape[-1]
 
     # Set emission means and covariances based on fitted k-means clusters
-    kmeans = KMeans(num_states, random_state=int(seed[-1])).fit(data)
+    kmeans = KMeans(num_states,
+                    init='k-means++', n_init=5,
+                    random_state=int(seed[-1])).fit(data)
     emission_means = jnp.asarray(kmeans.cluster_centers_)
 
     if emission_covs_scale is None:
