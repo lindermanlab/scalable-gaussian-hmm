@@ -26,7 +26,8 @@ import jax.random as jr
 
 from torch.utils.data import DataLoader
 from kf.data import (MultiSessionDataset,
-                     RandomBatchSampler,)
+                     RandomBatchSampler,
+                     filter_min_frames)
 import kf.gaussian_hmm as GaussianHMM
 from kf.inference import fit_stochastic_em
 
@@ -141,11 +142,17 @@ def initialize_training_data(
     filepaths = sorted(DATADIR.glob('*.h5'))
 
     # If no .h5 files found, search recursively
-    if len(filepaths) == 0:
-        print(f'No *.h5 files found in {DATADIR}, searching recursively.')
+    if len(filepaths) > 0:
+        print(f'Found {len(filepaths)} files.')
+    else:
+        print(f'No *.h5 files found in {DATADIR}, searching recursively...', end="")
         filepaths = sorted(DATADIR.rglob('*.h5'))
+        print(f'Found {len(filepaths)} files.')
     
     assert len(filepaths) > 0, f'Expected to find *.h5 files in {DATADIR}, no files found.'
+
+    # Remove files that do not have enough minumum frames
+    filepaths, _ = filter_min_frames(filepaths, em_seq_length)
 
     if debug_max_files > 0:
         print(f"!!! WARNING !!! Limiting total number of files loaded to {debug_max_files}.")

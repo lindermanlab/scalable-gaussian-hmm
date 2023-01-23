@@ -38,6 +38,7 @@ Slice = TypeVar('Slice') # python slice-like object
 # ============================================================================
 
 __all__ = [
+    'filter_min_frames',
     'SingleSessionDataset',
     'MultiSessionDataset',
     'SubDataset',
@@ -46,9 +47,9 @@ __all__ = [
     'MultisessionDataset',
 ]
 
-def get_file_raw_shapes(filepaths: Sequence[Pathlike],
-                        min_frames_per_file: int) -> Tuple[List[Pathlike], List[Tuple]]:
-    """Get number of frames for each file. Remove files without enough frames."""
+def filter_min_frames(filepaths: Sequence[Pathlike],
+                      min_frames_per_file: int) -> Tuple[List[Pathlike], List[Tuple]]:
+    """Filters files for minimum number of frames."""
 
     # Get the (num_frames, data_dim) for each file
     raw_shapes = [
