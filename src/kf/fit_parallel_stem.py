@@ -17,6 +17,7 @@ from pathlib import Path
 import argparse
 from datetime import datetime
 from memory_profiler import memory_usage
+import h5py
 
 import jax
 import numpy as onp
@@ -111,11 +112,34 @@ def random_split(key, elements, sizes):
         for offset, size in zip(onp.cumsum(sizes), sizes)
     ]
     
-def setup_dataset(seed, debug_max_files, seq_length, dtype):
-    """Setup dataset object, get sequence slices"""
+def initialize_training_data(
+        seed,
+        em_seq_length,
+        em_local_batch_size,
+        em_parallelize,
+        debug_max_files=-1,
+        verbose=True,
+    ):
+    """Initialize dataset and dataloader for training via stochastic EM.
 
-    seed_slice, seed_debug, seed_split = jr.split(seed, 3)
+    Arguments
+        seed (jr.PRNGKey)
+        em_seq_length (int): Number of frames in a sequence, for training.
+        em_local_batch_size(int): Number of sequences to load per minibatch, for training.
+        em_parallelize (bool): If True, using parallel algorithm
+        debug_max_files (int): Maximum number of files to use in the dataset.
+            Default: -1, use all files found in data directory.
+        verbose (bool): If True, print status and shape messages.
+    """
 
+    seed_debug, seed_slice, seed_batch, seed_init_hmm = jr.split(seed, 4)
+    # Print Jax precision
+    dtype = jnp.array([1.2, 3.4]).dtype
+    if verbose: print(f"JAX using {dtype} precision\n")
+
+    # =====================
+    # Initialize filepaths
+    # =====================
     filepaths = sorted(DATADIR.glob('*.h5'))
 
     # If no .h5 files found, search recursively
@@ -130,7 +154,83 @@ def setup_dataset(seed, debug_max_files, seq_length, dtype):
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
 
-    return MultiSessionDataset(filepaths, seed_slice, seq_length, dtype=dtype)
+    # ============================
+    # Initialize training dataset
+    # ============================
+    train_ds = MultiSessionDataset(filepaths, seed_slice, em_seq_length, dtype=dtype)
+    emissions_dim = train_ds.sequence_shape[-1]
+
+    # Define how to load a batch of emissions gets reshaped
+    num_devices = jax.local_device_count()
+    em_batch_size = em_local_batch_size * num_devices
+    if em_parallelize:
+        assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
+        # local_batch_size = batch_size // num_devices
+        def collate_fn(sequences):
+            return onp.stack(sequences, axis=0).reshape(num_devices, em_local_batch_size, *sequences[0].shape)
+        
+    else:
+        assert num_devices == 1, f'Expected 1 device, but seeing {num_devices}. Reset XLA_FLAGS setting.'
+        def collate_fn(sequences):
+            return onp.stack(sequences, axis=0)
+
+    # Construct dataloader for EM fitting
+    sampler = RandomBatchSampler(train_ds, em_batch_size, seed_batch)
+    train_dl = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
+
+    if verbose: 
+        print(f'num_devices {num_devices}, local_batch_size {em_local_batch_size}, batch_size {em_batch_size}') 
+        print("Initialized training dataset with "
+                + f"{len(train_ds):3d} sets of {em_seq_length/72000:.1f} hr sequences; "
+                + f"{len(train_dl):3d} batches of {em_batch_size} sequences per batch")
+        print()
+
+    return train_ds, train_dl
+
+def initialize_hmm(seed, method, num_states, train_ds,
+                   subsample_step_size=1_200, verbose=True):
+    """
+    Arguments
+        seed (jr.PRNGKey)
+        method (str): Specifies HMM initialization method; either 'kmeans' or 'random'.
+        num_states (int): Number of states to initialize HMM with
+        train_ds (MultiSessionDataset):
+        subsample_step_size (int): Number of frames to subsample training data.
+            Used to prepare data for k-means. Choose value to be large enough
+            that we get a meaningful reduction in data, but not so small that
+            kmeans takes too long. Default: 1200, corresponding to 1 fr/min @ 20 Hz.
+    
+    """
+    emissions_dim = train_ds.sequence_shape[-1]
+    
+    # Subsample from training dataset manually, if using k-means
+    subsampled_dataset = []
+    if method == 'kmeans':
+        for ds in train_ds.datasets:
+            subsampled_slice = slice(
+                ds.sequence_slices[0].start,
+                ds.sequence_slices[-1].stop,
+                subsample_step_size
+                )
+
+            with h5py.File(ds.filepath, 'r') as f:
+                subsampled_dataset.append(
+                    jnp.asarray(f['stage/block0_values'][subsampled_slice])
+                )
+        
+        subsampled_dataset = jnp.concatenate(subsampled_dataset)
+
+        if verbose:
+            num_subsampled = len(subsampled_dataset)
+            num_total = train_ds.num_samples
+            print(f'Fitting k-means with {num_subsampled}/{num_total} frames, ' + \
+                f'{num_subsampled/num_total*100:.2f}% of training data...' + \
+                f'Subsampled at {subsample_step_size / 60 / 20:.2f} frames / min.')
+    
+    init_params = GaussianHMM.initialize_model(
+        seed, method, num_states, emissions_dim, subsampled_dataset)
+    
+    return init_params
 
 # -------------------------------------
 
@@ -142,16 +242,13 @@ def main():
     seed_data, seed_dl, seed_init = jr.split(seed, 3)
     print(f"Setting user-specified seed: {args.seed}")
 
-    # Print Jax precision
-    dtype = jnp.array([1.2, 3.4]).dtype
-    print(f"JAX using {dtype} precision\n")
-
     # Algorithm parameters
     num_states = args.states
     init_method = args.hmm_init_method
+    seq_length = args.seq_length
+    local_batch_size = args.batch_size_per_device
 
     num_epochs = args.epochs
-
     parallelize = args.parallelize
 
     # Set session name
@@ -161,7 +258,7 @@ def main():
     else:
         session_prefix = args.session_prefix
     _str_debug = args.debug_max_files if args.debug_max_files > 0 else 'all'
-    _str_parallel = '-parallel' if args.parallelize else ''
+    _str_parallel = '-parallel' if parallelize else ''
     session_name = f'{session_prefix}-{num_states}_states-{init_method}_init-{_str_debug}_files-{init_method}_init{_str_parallel}'
     log_dir = os.path.join(TEMPDIR, session_name)
     if not os.path.exists(log_dir):
@@ -169,52 +266,28 @@ def main():
     print(f"Output files will be logged to: {log_dir}\n")
     
     # ==========================================================================
-    
-    num_devices = jax.local_device_count()
-    
-    # Setup dataset
-    # batch_size = args.batch_size
-    local_batch_size = args.batch_size_per_device
-    batch_size = local_batch_size * num_devices
-
-    seq_length = args.seq_length
-
-    train_ds = setup_dataset(seed_data, args.debug_max_files, seq_length, dtype)
-    emission_dim = train_ds.sequence_shape[-1]
-
-    # Define how a batch of emissions gets reshaped, depending on if using parallelization
-    if parallelize:
-        assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
-        # local_batch_size = batch_size // num_devices
-        def collate_fn(sequences):
-            return onp.stack(sequences, axis=0).reshape(num_devices, local_batch_size, *sequences[0].shape)
         
-    else:
-        assert num_devices == 1, f'Expected 1 device, but seeing {num_devices}. Reset XLA_FLAGS setting.'
-        def collate_fn(sequences):
-            return onp.stack(sequences, axis=0)
+    # Set-up training dataset
+    train_ds, train_dl = initialize_training_data(
+                    seed_data,
+                    seq_length, local_batch_size, parallelize,
+                    debug_max_files=args.debug_max_files)
+    emissions_dim = train_ds.sequence_shape[-1]
 
-    # Construct dataloader
-    sampler = RandomBatchSampler(train_ds, batch_size, seed_dl)
-    train_dataloader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
-   
-    print(f'num_devices {num_devices}, local_batch_size {local_batch_size}, batch_size {batch_size}') 
-    print("Initialized training dataset with "
-            + f"{len(train_ds):3d} sets of {seq_length/72000:.1f} hr sequences; "
-            + f"{len(train_dataloader):3d} batches of {batch_size} sequences per batch")
-    print()
-    
-    # Initialize GaussianHMM model parameters based on specified method
-    init_params = GaussianHMM.initialize_model(init_method, seed_init, num_states, emission_dim, train_dataloader)
-    
+    # Initialize GaussianHMM parameters via 'random' or 'kmeans'
+    init_params = initialize_hmm(
+        seed_init, init_method, num_states, train_ds,
+        subsample_step_size=1_200, verbose=True,
+    )
+
     # Set GaussianHMM prior parameters to non-informative values, except
     # boost the prior parameters associated with emission covariance matrices
     # (i.e. emission_scale and emission_extra_df) to scale of minibatch size
     # to regularize covariance matrix to be PSD
-    total_emissions_per_batch = train_dataloader.dataset.num_samples // len(train_dataloader)
+    total_emissions_per_batch = train_dl.dataset.num_samples // len(train_dl)
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(
         num_states,
-        emission_dim,
+        emissions_dim,
         emission_scale=(1e-4)*total_emissions_per_batch,
         emission_extra_df=(1e-1)*total_emissions_per_batch,)
     
@@ -226,11 +299,11 @@ def main():
         'checkpoint_dir': log_dir,
         'num_checkpoints_to_keep': 10
     }
-    fitted_params, lps = fit_stochastic_em(init_params, prior_params, train_dataloader, **fn_kwargs)
+    fitted_params, lps = fit_stochastic_em(init_params, prior_params, train_dl, **fn_kwargs)
 
     print(lps)
 
-    return 
+    return fitted_params, lps
 
 if __name__ == '__main__':
     main()

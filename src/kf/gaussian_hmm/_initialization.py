@@ -17,72 +17,44 @@ def _random_init(seed, num_states, emission_dim):
 
     return emission_means, emission_covs
 
-def _kmeans_init(seed, num_states, emissions_dim, dataloader,
-                 step_size=1200, emission_covs_scale=1.,):
+def _kmeans_init(seed, num_states, data, emission_covs_scale=1.,):
     """Initialize GaussianHMM emission parameters from data via k-means algorithm.
     
     Args:
         seed (jr.PRNGKey):
         num_states (int): Number of clusters to fit
-        emissions_dim (int): Dimension of emissions
-        dataloader (torch.utils.data.Dataloader):
-        step_size (int): Number of frames between selected frames of a sequence,
-            a larger value results in greater subsampling. Choose large enough
-            that we get meaninful data reduction but not so small that kmeans
-            fit takes too long. Default: 1200, corresponding to 1 fr/min @ 20 Hz
-            (assuming that dataloader sequences are NOT subsampled)
+        data (jnp.array): Data to fit on, shape (N, emissions_dim)
         emission_covs_scale (float or None): Scale of emission covariances
             initialized to block identity matrices. If None, bootstrap emission
             covariances from kmeans labels. TODO
     """
-    
-    # Get single batch from dataloader and pre-allocate array
-    batch_size = dataloader.batch_sampler.batch_size
-    seq_length = dataloader.dataset.sequence_shape[0]
-    subsampled_length = seq_length // step_size
-
-    subsampled = dataloader.collate_fn([onp.empty((subsampled_length, emissions_dim))]*batch_size)
-    subsampled = onp.stack([subsampled] * len(dataloader))
-
-    # Get data from dataloader, and reshape to (num_samples, emission_dim) array
-    for i, batch_emissions in enumerate(dataloader):
-        subsampled[i] = batch_emissions[...,::step_size,:]
-    subsampled = subsampled.reshape(-1, emissions_dim)
-
-    # Print out some stats
-    train_emissions = len(dataloader) * batch_size * seq_length
-    print(f'Fitting k-means with {len(subsampled)}/{train_emissions} frames, ' + \
-          f'{len(subsampled)/train_emissions*100:.2f}% of training data...' + \
-          f'Subsampled at {step_size / 60 / 20:.2f} frames / min.')
+    emissions_dim = data.shape[-1]
 
     # Set emission means and covariances based on fitted k-means clusters
-    kmeans = KMeans(num_states, random_state=int(seed[-1])).fit(subsampled)
+    kmeans = KMeans(num_states, random_state=int(seed[-1])).fit(data)
     emission_means = jnp.asarray(kmeans.cluster_centers_)
 
     if emission_covs_scale is None:
         labels = kmeans.labels_
         emission_covs = onp.stack([
-            jnp.cov(subsampled[labels==state], rowvar=False) for state in range(num_states)
+            jnp.cov(data[labels==state], rowvar=False) for state in range(num_states)
         ])
     else: 
-        emission_covs = jnp.tile(jnp.eye(emissions_dim) * emission_covs_scale, (num_states, 1, 1))
+        emission_covs = jnp.tile(
+            jnp.eye(emissions_dim) * emission_covs_scale, (num_states, 1, 1))
 
     return emission_means, emission_covs
 
-def initialize_model(method, seed, num_states, emissions_dim,
-                     dataloader=None, step_size=1200):
+def initialize_model(seed, method, num_states, emissions_dim=None, data=None):
     """Initialize a Gaussian HMM via random or k-means initialization.
 
     Arguments
-        method (str): Initialization method, either 'random' or 'kmeans'
         seed (jr.PRNGKey)
-        num_states (int)
-        emissions_dim (int)
-        dataloader (torch.utils.data.Dataloader): Training dataset that
-            k-means algorithm should fit to. Only used if method == 'kmeans'.
-        step_size (int): Training dataset subsampling rate. See description
-            in `_kmeans_init`. Only used if method == 'kmeans'.
-    
+        method (str): Initialization method, either 'random' or 'kmeans'
+        num_states (int): Number of states to initialize 
+        emissions_dim (int): Used for 'random' method
+        data (jnp.array): Used for 'kmenas' method.
+        
     Return
         Parameters
     """
@@ -97,8 +69,7 @@ def initialize_model(method, seed, num_states, emissions_dim,
                         = _random_init(seed_emissions, num_states, emissions_dim)
     elif method == 'kmeans':
         emission_means, emission_covs \
-                        = _kmeans_init(seed_emissions, num_states, emissions_dim,
-                                       dataloader, step_size)
+                        = _kmeans_init(seed_emissions, num_states, data)
     else:
         raise ValueError(f"Expected method to be one of 'random' or 'kmeans', received {method}.")
 
