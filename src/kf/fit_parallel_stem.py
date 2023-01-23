@@ -1,4 +1,4 @@
-"""Script for profiling CPU memory usage during stochastic EM fit of HMM to kf data.
+"""Script for fitting HMM to kf data via stochastic EM.
 
 Flags to set in environment
 ---------------------------
@@ -25,10 +25,8 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from torch.utils.data import DataLoader
-from kf.data import (SingleSessionDataset,
-                     MultiSessionDataset,
-                     RandomBatchSampler,
-                     get_file_raw_shapes)
+from kf.data import (MultiSessionDataset,
+                     RandomBatchSampler,)
 import kf.gaussian_hmm as GaussianHMM
 from kf.inference import fit_stochastic_em
 
@@ -132,7 +130,7 @@ def initialize_training_data(
         verbose (bool): If True, print status and shape messages.
     """
 
-    seed_debug, seed_slice, seed_batch, seed_init_hmm = jr.split(seed, 4)
+    seed_debug, seed_slice, seed_batch = jr.split(seed, 3)
     # Print Jax precision
     dtype = jnp.array([1.2, 3.4]).dtype
     if verbose: print(f"JAX using {dtype} precision\n")
@@ -239,7 +237,7 @@ def main():
 
     # Set user-specified seed
     seed = jr.PRNGKey(args.seed)
-    seed_data, seed_dl, seed_init = jr.split(seed, 3)
+    seed_data, seed_init = jr.split(seed, 2)
     print(f"Setting user-specified seed: {args.seed}")
 
     # Algorithm parameters
@@ -264,14 +262,19 @@ def main():
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     print(f"Output files will be logged to: {log_dir}\n")
+
+    # Checkpointing parameters
+    checkpoint_every = args.checkpoint_every
+    checkpoint_dir = log_dir
+    num_checkpoints_to_keep = 10
     
     # ==========================================================================
         
     # Set-up training dataset
     train_ds, train_dl = initialize_training_data(
-                    seed_data,
-                    seq_length, local_batch_size, parallelize,
-                    debug_max_files=args.debug_max_files)
+                            seed_data,
+                            seq_length, local_batch_size, parallelize,
+                            debug_max_files=args.debug_max_files)
     emissions_dim = train_ds.sequence_shape[-1]
 
     # Initialize GaussianHMM parameters via 'random' or 'kmeans'
@@ -295,9 +298,9 @@ def main():
     fn_kwargs = {
         'num_epochs': num_epochs,
         'parallelize': parallelize,
-        'checkpoint_every': args.checkpoint_every,
-        'checkpoint_dir': log_dir,
-        'num_checkpoints_to_keep': 10
+        'checkpoint_every': checkpoint_every,
+        'checkpoint_dir': checkpoint_dir,
+        'num_checkpoints_to_keep': num_checkpoints_to_keep
     }
     fitted_params, lps = fit_stochastic_em(init_params, prior_params, train_dl, **fn_kwargs)
 
