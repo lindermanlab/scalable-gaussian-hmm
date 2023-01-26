@@ -159,6 +159,9 @@ def initialize_training_data(
         idxs = jr.permutation(seed_debug, len(filepaths))[:debug_max_files]
         filepaths = [filepaths[i] for i in idxs]
 
+    if verbose:
+        print(f'Loaded {len(filepaths)} files.')
+
     # ============================
     # Initialize training dataset
     # ============================
