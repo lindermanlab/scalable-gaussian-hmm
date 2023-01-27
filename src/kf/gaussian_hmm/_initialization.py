@@ -26,7 +26,7 @@ def _kmeans_init(seed, num_states, data, emission_covs_scale=1.,):
         data (jnp.array): Data to fit on, shape (N, emissions_dim)
         emission_covs_scale (float or None): Scale of emission covariances
             initialized to block identity matrices. If None, bootstrap emission
-            covariances from kmeans labels. TODO
+            covariances from kmeans labels. Useful when data is not normalized.
     """
     emissions_dim = data.shape[-1]
 
@@ -36,11 +36,20 @@ def _kmeans_init(seed, num_states, data, emission_covs_scale=1.,):
                     random_state=int(seed[-1])).fit(data)
     emission_means = jnp.asarray(kmeans.cluster_centers_)
 
+    # If no covariance scale provided, bootstrap from cluster assignments
     if emission_covs_scale is None:
         labels = kmeans.labels_
-        emission_covs = onp.stack([
-            jnp.cov(data[labels==state], rowvar=False) for state in range(num_states)
-        ])
+        emission_covs = []
+        for state in range(num_states):
+            _assgns = (labels==state)
+
+            if _assgns.sum() > 1:
+                emission_covs.append(jnp.cov(data[_assgns], rowvar=False))
+            else: # If states only have 1 assignment, set arbitrary covariance
+                emission_covs.append(jnp.eye(emissions_dim))
+        emission_covs = jnp.stack(emission_covs)
+        
+    # Otherwise, set covariance to scaled identity
     else: 
         emission_covs = jnp.tile(
             jnp.eye(emissions_dim) * emission_covs_scale, (num_states, 1, 1))
