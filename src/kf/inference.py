@@ -194,4 +194,14 @@ def fit_stochastic_em(initial_params, prior_params,
         
         epoch = global_id // num_batches
 
+    # Save latest parameters
+    if chk.step_from_path(chk.get_latest_checkpoint_path(checkpoint_dir)) < global_id-1:
+        tqdm.write(f"Saving last checkpoint for epoch {epoch}:{minibatch}/{len(dataloader)} at {checkpoint_dir}...", end="")
+        chk.save_checkpoint(
+            ((params, rolling_stats, expected_log_probs, dataloader.batch_sampler.state), metadata),
+            global_id-1,
+            checkpoint_dir,
+            num_checkpoints_to_keep)
+        tqdm.write("Done.")
+
     return params, jnp.asarray(expected_log_probs)
