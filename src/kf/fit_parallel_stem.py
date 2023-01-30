@@ -72,6 +72,14 @@ parser.add_argument(
 parser.add_argument(
     '--states', type=int, default=20,
     help='Number of HMM states to fit')
+
+parser.add_argument(
+    '--prior_scale', type=float, default=0.0001,
+    help='Scale of prior NIW distribution')
+parser.add_argument(
+    '--prior_extra_df', type=float, default=0.1,
+    help='Extra DOF of prior NIW distribution')
+
 parser.add_argument(
     '--checkpoint_every', type=int, default=50,
     help='Number of iterations between which to checkpoint'
@@ -259,6 +267,10 @@ def main():
     num_epochs = args.epochs
     parallelize = args.parallelize
 
+    # Prior parameters
+    prior_scale = args.prior_scale
+    prior_extra_df = args.prior_extra_df
+
     # Set session name
     if args.session_prefix is None:
         timestamp = datetime.now().strftime("%y%m%d_%H%M")
@@ -301,8 +313,8 @@ def main():
     prior_params = GaussianHMM.initialize_prior_from_scalar_values(
         num_states,
         emissions_dim,
-        emission_scale=(1e-4)*total_emissions_per_batch,
-        emission_extra_df=(1e-1)*total_emissions_per_batch,)
+        emission_scale=prior_scale*total_emissions_per_batch,
+        emission_extra_df=prior_extra_df*total_emissions_per_batch,)
     
     # Run function
     fn_kwargs = {
