@@ -283,7 +283,7 @@ def main():
         session_prefix = args.session_prefix
     _str_debug = args.debug_max_files if args.debug_max_files > 0 else 'all'
     _str_parallel = '-parallel' if parallelize else ''
-    session_name = f'{session_prefix}-{num_states}_states-{init_method}_init-{_str_debug}_files-{init_method}_init{_str_parallel}'
+    session_name = f'{session_prefix}-{num_states}_states-{init_method}_init-{_str_debug}_files{_str_parallel}'
     log_dir = os.path.join(TEMPDIR, session_name)
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
