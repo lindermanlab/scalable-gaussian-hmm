@@ -84,6 +84,10 @@ parser.add_argument(
     '--checkpoint_every', type=int, default=50,
     help='Number of iterations between which to checkpoint'
 )
+parser.add_argument(
+    '--checkpoints_to_keep', type=int, default=0,
+    help='Number of checkpoints to keep. If 0, keep all.'
+)
 
 parser.add_argument(
     '--debug_max_files', type=int, default=-1,
@@ -288,8 +292,7 @@ def main():
     # Checkpointing parameters
     checkpoint_every = args.checkpoint_every
     checkpoint_dir = log_dir
-    num_checkpoints_to_keep = 10
-    
+    num_checkpoints_to_keep = args.checkpoints_to_keep
     # ==========================================================================
         
     # Set-up training dataset
@@ -316,6 +319,10 @@ def main():
         emission_scale=prior_scale*total_emissions_per_batch,
         emission_extra_df=prior_extra_df*total_emissions_per_batch,)
     
+    # If num_checkpoints_to_keep is not positive int, keep all checkpoints
+    if num_checkpoints_to_keep < 1:
+        num_checkpoints_to_keep = num_epochs * len(train_dl) + 1
+
     # Run function
     fn_kwargs = {
         'num_epochs': num_epochs,
