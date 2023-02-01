@@ -61,6 +61,9 @@ parser.add_argument(
     choices=['random', 'kmeans'],
     help='HMM initialization method in the first epoch.')
 parser.add_argument(
+    '--hmm_init_subsample', type=int, default=600,
+    help='1 sample / N frames, to create subsampled dataset for k-means initialization.')
+parser.add_argument(
     '--batch_size_per_device', type=int, default=1,
     help='Number of batches loaded per device per iteration.')
 parser.add_argument(
@@ -280,6 +283,7 @@ def main():
     # Algorithm parameters
     num_states = args.states
     init_method = args.hmm_init_method
+    subsample_step_size = args.hmm_init_subsample
     seq_length = args.seq_length
     local_batch_size = args.batch_size_per_device
 
@@ -324,7 +328,7 @@ def main():
     # Initialize GaussianHMM parameters via 'random' or 'kmeans'
     init_params, _ = initialize_hmm(
         seed_init, init_method, num_states, train_ds,
-        subsample_step_size=1_200, verbose=True,
+        subsample_step_size=subsample_step_size, verbose=True,
     )
 
     # Set GaussianHMM prior parameters to non-informative values, except
