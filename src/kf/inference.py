@@ -96,7 +96,7 @@ def fit_stochastic_em(initial_params, prior_params,
         )
 
     learning_rates = schedule(jnp.arange(num_epochs * num_batches))
-    assert learning_rates[0] <= 1.0, "Learning rate start at 1 or less."
+    assert learning_rates[0] == 1.0, "Learning rate must start at 1."
     learning_rates = learning_rates.reshape(num_epochs, num_batches)
 
     # =========================================================================

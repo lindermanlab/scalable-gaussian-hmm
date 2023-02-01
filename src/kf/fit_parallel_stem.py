@@ -85,10 +85,6 @@ parser.add_argument(
     help='Extra DOF of prior NIW distribution')
 
 parser.add_argument(
-    '--schedule_init', type=float, default=1.0,
-    help='Initial learning rate for stochastic EM. Initialized values are given 1-schedule_init_value. Must be value between 0 and 1.'
-)
-parser.add_argument(
     '--schedule_decay', type=float, default=0.95,
     help='Decay rate of exponential learning schedule for stochastic EM annealing.'
 )
@@ -296,7 +292,6 @@ def main():
     prior_extra_df = args.prior_extra_df
 
     # Schedule parameters
-    schedule_init = args.schedule_init
     schedule_decay = args.schedule_decay
 
     # Set session name
@@ -352,7 +347,7 @@ def main():
 
     # Run function
     schedule = optax.exponential_decay(
-            init_value=schedule_init,
+            init_value=1.,
             end_value=0.,
             transition_steps=len(train_dl),
             decay_rate=schedule_decay,
