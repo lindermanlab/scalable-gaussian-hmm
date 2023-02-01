@@ -9,26 +9,31 @@ from kf.gaussian_hmm._model import (Parameters,
                                    NormalizedGaussianHMMStatistics) 
 
 
-def _random_init(seed, num_states, emission_dim):
+def _random_init(seed, num_states, dim, covs_scale=1.,):
     """Randomly initialize GaussianHMM emissions parameters."""
    
-    emission_means = jr.normal(seed, (num_states, emission_dim))
-    emission_covs = jnp.tile(jnp.eye(emission_dim), (num_states, 1, 1))
+    emission_means = jr.normal(seed, (num_states, dim))
+    emission_covs = jnp.tile(jnp.eye(dim)*covs_scale, (num_states, 1, 1))
 
     return emission_means, emission_covs
 
-def _kmeans_init(seed, num_states, data, emission_covs_scale=1.,):
+def _kmeans_init(seed, num_states, data, covs_scale=1., emission_covs_method='scale'):
     """Initialize GaussianHMM emission parameters from data via k-means algorithm.
     
     Args:
         seed (jr.PRNGKey):
         num_states (int): Number of clusters to fit
         data (jnp.array): Data to fit on, shape (N, emissions_dim)
-        emission_covs_scale (float or None): Scale of emission covariances
+        covs_scale (float): Scale of emission covariances
             initialized to block identity matrices. If None, bootstrap emission
             covariances from kmeans labels. Useful when data is not normalized.
+        emissions_covs_method (str): If 'bootstrap', calculate
+            empirical covariances from data points assigned to each state. If
+            number of assigned datapoints for is fewer than the number of dimensions,
+            set to default scaled identity matrix. If 'scale' (default), set
+            covariances to be identity matrices scaled by `covs_scale`. 
     """
-    emissions_dim = data.shape[-1]
+    dim = data.shape[-1]
 
     # Set emission means and covariances based on fitted k-means clusters
     n_init = onp.maximum(1, int(onp.ceil(onp.log(num_states))))
@@ -37,27 +42,30 @@ def _kmeans_init(seed, num_states, data, emission_covs_scale=1.,):
                     random_state=int(seed[-1])).fit(data)
     emission_means = jnp.asarray(kmeans.cluster_centers_)
 
-    # If no covariance scale provided, bootstrap from cluster assignments
-    if emission_covs_scale is None:
+    if emission_covs_method == 'bootstrap':
+        # Estimate covariance from datapoints assigned to selected cluster.
+        # If fewer assignments than dimensions, then you cannot actually
+        # estimate covariance so default to scaled identity matrix
         labels = kmeans.labels_
         emission_covs = []
         for state in range(num_states):
             _assgns = (labels==state)
 
-            if _assgns.sum() > 1:
+            if _assgns.sum() > dim:
                 emission_covs.append(jnp.cov(data[_assgns], rowvar=False))
-            else: # If states only have 1 assignment, set arbitrary covariance
-                emission_covs.append(jnp.eye(emissions_dim))
+            else:
+                emission_covs.append(jnp.eye(dim) * covs_scale)
         emission_covs = jnp.stack(emission_covs)
         
-    # Otherwise, set covariance to scaled identity
     else: 
+        # Set covariances to scaled identity matrix
         emission_covs = jnp.tile(
-            jnp.eye(emissions_dim) * emission_covs_scale, (num_states, 1, 1))
+            jnp.eye(dim) * covs_scale, (num_states, 1, 1))
 
     return emission_means, emission_covs
 
-def initialize_model(seed, method, num_states, emissions_dim=None, data=None):
+def initialize_model(seed, method, num_states, emissions_dim=None, data=None,
+                     emission_covs_scale=1., emission_covs_method='scale'):
     """Initialize a Gaussian HMM via random or k-means initialization.
 
     Arguments
@@ -78,10 +86,10 @@ def initialize_model(seed, method, num_states, emissions_dim=None, data=None):
     
     if method == 'random':
         emission_means, emission_covs \
-                        = _random_init(seed_emissions, num_states, emissions_dim)
+            = _random_init(seed_emissions, num_states, emissions_dim, emission_covs_scale)
     elif method == 'kmeans':
         emission_means, emission_covs \
-                        = _kmeans_init(seed_emissions, num_states, data)
+            = _kmeans_init(seed_emissions, num_states, data, emission_covs_scale, emission_covs_method)
     else:
         raise ValueError(f"Expected method to be one of 'random' or 'kmeans', received {method}.")
 

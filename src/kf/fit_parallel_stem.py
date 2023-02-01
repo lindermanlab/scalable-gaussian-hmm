@@ -248,7 +248,8 @@ def initialize_hmm(seed, method, num_states, train_ds,
                 f'Subsampled at {subsample_step_size / 60 / 20:.2f} frames / min.')
     
     init_params = GaussianHMM.initialize_model(
-        seed, method, num_states, emissions_dim, subsampled_dataset)
+        seed, method, num_states, emissions_dim, subsampled_dataset,
+        emission_covs_scale=1., emission_covs_method='bootstrap')
     
     return init_params
 
