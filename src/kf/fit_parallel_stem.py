@@ -229,6 +229,11 @@ def initialize_hmm(seed, method, num_states, train_ds,
             that we get a meaningful reduction in data, but not so small that
             kmeans takes too long. Default: 1200, corresponding to 1 fr/min @ 20 Hz.
     
+    Returns
+        init_params (GaussianHMM.Parameters)
+        subsampled_dataset (list or ndarray): If method=='kmeans', array with
+            shape (n,d) subsampled from training dataset. If method=='random',
+            empty list. Convenience function for re-evaluating k-means inits.
     """
     emissions_dim = train_ds.sequence_shape[-1]
     
@@ -260,7 +265,7 @@ def initialize_hmm(seed, method, num_states, train_ds,
         seed, method, num_states, emissions_dim, subsampled_dataset,
         emission_covs_scale=1., emission_covs_method='bootstrap')
     
-    return init_params
+    return init_params, subsampled_dataset
 
 # -------------------------------------
 
@@ -317,7 +322,7 @@ def main():
     emissions_dim = train_ds.sequence_shape[-1]
 
     # Initialize GaussianHMM parameters via 'random' or 'kmeans'
-    init_params = initialize_hmm(
+    init_params, _ = initialize_hmm(
         seed_init, init_method, num_states, train_ds,
         subsample_step_size=1_200, verbose=True,
     )
