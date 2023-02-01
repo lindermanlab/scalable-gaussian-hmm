@@ -23,6 +23,7 @@ import jax
 import numpy as onp
 import jax.numpy as jnp
 import jax.random as jr
+import optax
 
 from torch.utils.data import DataLoader
 from kf.data import (MultiSessionDataset,
@@ -341,6 +342,9 @@ def main():
         emissions_dim,
         emission_scale=prior_scale*total_emissions_per_batch,
         emission_extra_df=prior_extra_df*total_emissions_per_batch,)
+    
+    print(f'total emissions per batch {total_emissions_per_batch:.1e}')
+    print(f'prior scale {prior_scale*total_emissions_per_batch:.1e}, extra_df {prior_extra_df*total_emissions_per_batch:.1e}')
     
     # If num_checkpoints_to_keep is not positive int, keep all checkpoints
     if num_checkpoints_to_keep < 1:
