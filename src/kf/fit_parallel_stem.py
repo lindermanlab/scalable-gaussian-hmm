@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import argparse
 from datetime import datetime
-from memory_profiler import memory_usage
 import h5py
 
 import jax
@@ -45,70 +44,7 @@ class CheckTypesFilter(logging.Filter):
 logger = logging.getLogger()
 logger.addFilter(CheckTypesFilter())
 
-# -------------------------------------
-
-parser = argparse.ArgumentParser(description='Profile stochastic EM algorithms')
-parser.add_argument(
-    '--session_prefix', type=str, default=None,
-    help='Identifying token,. Used for log and checkpoint files')
-parser.add_argument(
-    '--seed', type=int, required=True,
-    help='Initial RNG seed, for splitting data and intializing HMM.')
-parser.add_argument(
-    '--parallelize', action='store_true',
-    help='If specified, run parallel stochastic EM algorithm over multiple cores.')
-parser.add_argument(
-    '--hmm_init_method', type=str, default='kmeans',
-    choices=['random', 'kmeans'],
-    help='HMM initialization method in the first epoch.')
-parser.add_argument(
-    '--hmm_init_subsample', type=int, default=600,
-    help='1 sample / N frames, to create subsampled dataset for k-means initialization.')
-parser.add_argument(
-    '--batch_size_per_device', type=int, default=1,
-    help='Number of batches loaded per device per iteration.')
-parser.add_argument(
-    '--seq_length', type=int, default=72000,
-    help='Number of consecutive frames per sequence.')
-parser.add_argument(
-    '--epochs', type=int, default=10,
-    help='Number of stochastic EM iterations to run')
-parser.add_argument(
-    '--states', type=int, default=20,
-    help='Number of HMM states to fit')
-
-parser.add_argument(
-    '--prior_scale', type=float, default=0.0001,
-    help='Scale of prior NIW distribution')
-parser.add_argument(
-    '--prior_extra_df', type=float, default=0.1,
-    help='Extra DOF of prior NIW distribution')
-
-parser.add_argument(
-    '--schedule_decay', type=float, default=0.95,
-    help='Decay rate of exponential learning schedule for stochastic EM annealing.'
-)
-
-parser.add_argument(
-    '--checkpoint_every', type=int, default=50,
-    help='Number of iterations between which to checkpoint'
-)
-parser.add_argument(
-    '--checkpoints_to_keep', type=int, default=0,
-    help='Number of checkpoints to keep. If 0, keep all.'
-)
-
-parser.add_argument(
-    '--debug_max_files', type=int, default=-1,
-    help='FOR DEBUGGING: Maximum number of files (~days of recording) in directory to expose. Default: -1, expose all.')
-
 # ------------------------------------------------------------------------------
-def write_mprof(path: str, mem_usage: list, mode: str='w+') -> None:
-    """Writes time-based memory profiler results to file."""
-    with open(path, mode) as f:
-        for res in mem_usage:
-            f.writelines('MEM {} {}\n'.format(res[0], res[1]))
-    return
 
 def random_split(key, elements, sizes):
     """Split sequence of elemtns into subsets of specified sizes."""
@@ -269,9 +205,8 @@ def initialize_hmm(seed, method, num_states, train_ds,
 
 # -------------------------------------
 
-def main():
-    args = parser.parse_args()
-
+def main(args):
+    
     # Set user-specified seed
     seed = jr.PRNGKey(args.seed)
     seed_data, seed_init = jr.split(seed, 2)
@@ -368,4 +303,62 @@ def main():
     return fitted_params, lps
 
 if __name__ == '__main__':
-    main()
+
+    parser = argparse.ArgumentParser(description='Profile stochastic EM algorithms')
+    parser.add_argument(
+        '--session_prefix', type=str, default=None,
+        help='Identifying token,. Used for log and checkpoint files')
+    parser.add_argument(
+        '--seed', type=int, required=True,
+        help='Initial RNG seed, for splitting data and intializing HMM.')
+    parser.add_argument(
+        '--parallelize', action='store_true',
+        help='If specified, run parallel stochastic EM algorithm over multiple cores.')
+    parser.add_argument(
+        '--hmm_init_method', type=str, default='kmeans',
+        choices=['random', 'kmeans'],
+        help='HMM initialization method in the first epoch.')
+    parser.add_argument(
+        '--hmm_init_subsample', type=int, default=600,
+        help='1 sample / N frames, to create subsampled dataset for k-means initialization.')
+    parser.add_argument(
+        '--batch_size_per_device', type=int, default=1,
+        help='Number of batches loaded per device per iteration.')
+    parser.add_argument(
+        '--seq_length', type=int, default=72000,
+        help='Number of consecutive frames per sequence.')
+    parser.add_argument(
+        '--epochs', type=int, default=10,
+        help='Number of stochastic EM iterations to run')
+    parser.add_argument(
+        '--states', type=int, default=20,
+        help='Number of HMM states to fit')
+
+    parser.add_argument(
+        '--prior_scale', type=float, default=0.0001,
+        help='Scale of prior NIW distribution')
+    parser.add_argument(
+        '--prior_extra_df', type=float, default=0.1,
+        help='Extra DOF of prior NIW distribution')
+
+    parser.add_argument(
+        '--schedule_decay', type=float, default=0.95,
+        help='Decay rate of exponential learning schedule for stochastic EM annealing.'
+    )
+
+    parser.add_argument(
+        '--checkpoint_every', type=int, default=50,
+        help='Number of iterations between which to checkpoint'
+    )
+    parser.add_argument(
+        '--checkpoints_to_keep', type=int, default=0,
+        help='Number of checkpoints to keep. If 0, keep all.'
+    )
+
+    parser.add_argument(
+        '--debug_max_files', type=int, default=-1,
+        help='FOR DEBUGGING: Maximum number of files (~days of recording) in directory to expose. Default: -1, expose all.')
+
+    args = parser.parse_args()
+
+    main(args)
