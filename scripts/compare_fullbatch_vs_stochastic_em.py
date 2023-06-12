@@ -240,8 +240,8 @@ def main(args):
         # def init_fn():
         #     return prior_params, init_params, init_stats, []
 
-        def run_one_epoch():
-            params, _, _ = GaussianHMM.streaming_em_step(prior_params, init_params, init_stats, train_dl)
+        def run_one_epoch(params, stats):
+            params, _, _ = GaussianHMM.streaming_em_step(prior_params, params, stats, train_dl)
             params.emission_covariances.block_until_ready()
             return
 
@@ -264,7 +264,7 @@ def main(args):
         elif algorithm == 'stochastic':
             step_fn = GaussianHMM.nonparallel_stochastic_em_step
 
-        def run_one_epoch():
+        def run_one_epoch(params, rolling_stats,):
             for minibatch, minibatch_emissions in enumerate(train_dl):
                 params, rolling_stats, _ = step_fn(
                     prior_params, params, rolling_stats,
@@ -273,7 +273,7 @@ def main(args):
             return
                 
     prof = Profile()
-    prof.runcall(run_one_epoch)
+    prof.runcall(run_one_epoch, init_params, init_stats)
 
     # Write results to file
     s = io.StringIO()
