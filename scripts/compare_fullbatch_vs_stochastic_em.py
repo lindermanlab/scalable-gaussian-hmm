@@ -275,14 +275,18 @@ def main(args):
     prof = Profile()
     prof.runcall(run_one_epoch, init_params, init_stats)
 
-    # Write results to file
+    # Print stats to an IO stream, then save
     s = io.StringIO()
-    ps = pstats.Stats(prof, stream=s).sort_stats('cumtime')
+    ps = pstats.Stats(prof, stream=s)
+    ps.sort_stats('cumtime')
+    ps.print_stats()
     
     n_batches = len(train_dl) * train_dl.batch_sampler.batch_size
-    session_name = f'{algorithm}-{args.seed_data}_datarng-{n_batches}_batches'
+    session_name = f'{algorithm}-{n_batches}_batches-{args.seed_data}_seed_data'
     with open(outdir/f'{session_name}.prof', 'w+') as f:
         f.write(s.getvalue())
+    
+    return
 
 if __name__ == '__main__':
 
