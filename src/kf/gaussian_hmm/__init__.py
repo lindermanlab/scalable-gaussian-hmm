@@ -12,7 +12,7 @@ in the Dynmax codebase are also stripped away for clarity and simplicity.
 from ._model import(
     Parameters,
     PriorParameters,
-    NormalizedGaussianHMMStatistics,
+    NormalizedStatistics,
     initial_distribution,
     transition_distribution,
     emission_distribution,

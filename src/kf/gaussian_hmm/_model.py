@@ -10,7 +10,7 @@ from dynamax.utils.distributions import NormalInverseWishart
 __all__ = [
     'Parameters',
     'PriorParameters',
-    'NormalizedGaussianHMMStatistics',
+    'NormalizedStatistics',
     'initial_distribution',
     'transition_distribution',
     'emission_distribution',
@@ -40,7 +40,7 @@ class PriorParameters():
     emission_df: jnp.ndarray
 
 @dataclass
-class NormalizedGaussianHMMStatistics():
+class NormalizedStatistics():
     initial_pseudocounts: jnp.ndarray
     transition_pseudocounts: jnp.ndarray
     emission_weights: jnp.ndarray
