@@ -28,7 +28,6 @@ __all__ = [
 # EXPECTATION FUNCTIONS
 # ==============================================================================
 
-@partial(profiler.annotate_function, name="E-step")
 def e_step(params, batched_emissions):
     """Compute normalized expected sufficient statistics under the posterior.    
 
@@ -102,7 +101,6 @@ def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
     df = eta_1 - dim - 2
     return loc, conc, df, scale
 
-@partial(profiler.annotate_function, name="M-step")
 def m_step(prior_params, normalized_stats, normalizer):
     """Compute MAP estimate of Gaussian HMM parameters.
 
@@ -303,7 +301,6 @@ def nonparallel_stochastic_em_step(prior_params, params, rolling_stats,
 
     return updated_params, updated_rolling_stats, minibatch_lls
 
-@partial(profiler.annotate_function, name="parallel_stochastic_em_step")
 def parallel_stochastic_em_step(prior_params, params, rolling_stats,
                                 learning_rate, minibatch_emissions):
     """Perform single step of stochastic EM using multiple cores.
