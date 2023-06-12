@@ -1,5 +1,5 @@
 import jax.numpy as jnp
-from jax import jit, vmap, lax, pmap
+from jax import jit, vmap, lax, pmap, profiler
 from jax.tree_util import tree_map, tree_flatten, tree_leaves
 from functools import partial
 import optax
@@ -16,6 +16,7 @@ from kf.gaussian_hmm._model import *
 __all__ = [
     'e_step',
     'm_step',
+    'streaming_em_step',
     'fit_em',
     'nonparallel_stochastic_em_step',
     'parallel_stochastic_em_step',
@@ -27,6 +28,7 @@ __all__ = [
 # EXPECTATION FUNCTIONS
 # ==============================================================================
 
+@partial(profiler.annotate_function, name="E-step")
 def e_step(params, batched_emissions):
     """Compute normalized expected sufficient statistics under the posterior.    
 
@@ -35,7 +37,7 @@ def e_step(params, batched_emissions):
         batched_emissions[b,t,d]
 
     Returns
-        reduced_normd_stats (NormalizedGaussianHMMStatistics([k,...]))
+        reduced_normd_stats (NormalizedStatistics([k,...]))
         reduced_normalizer (ndarray[k,])
         reduced_marginal_loglik (float)
     """
@@ -48,7 +50,7 @@ def e_step(params, batched_emissions):
 
         # Compute summed Gaussian HMM statististics
         weights = posterior.smoothed_probs
-        summed_stats = NormalizedGaussianHMMStatistics(
+        summed_stats = NormalizedStatistics(
             initial_pseudocounts = posterior.initial_probs,
             transition_pseudocounts = compute_transition_probs(params.transition_probs, posterior),
             emission_weights=jnp.sum(weights, axis=0),
@@ -100,6 +102,7 @@ def niw_convert_natural_to_mean(eta_1, eta_2, eta_3, eta_4):
     df = eta_1 - dim - 2
     return loc, conc, df, scale
 
+@partial(profiler.annotate_function, name="M-step")
 def m_step(prior_params, normalized_stats, normalizer):
     """Compute MAP estimate of Gaussian HMM parameters.
 
@@ -107,7 +110,7 @@ def m_step(prior_params, normalized_stats, normalizer):
 
     Arguments
         prior_params (PriorParameters): Parameter values of prior distributions
-        normalized_stats (NormalizedGaussianHMMStatistics([k,...]))
+        normalized_stats (NormalizedStatistics([k,...]))
         normalizer (ndarray([k,]))
     
     Returns
@@ -183,6 +186,39 @@ def m_step(prior_params, normalized_stats, normalizer):
 #
 # ==============================================================================
 
+def streaming_em_step(prior_params, params, init_stats, dataloader):
+    """Perform single full-batch EM step, given a dataloader."""
+
+    lls = 0
+
+    normalized_stats, normalizer = init_stats
+
+    # E-step: Continuously accumulate statistcis from data
+    jitted_e_step = jit(e_step)
+    for minibatch_emissions in dataloader:
+        minibatch_normalized_stats, minibatch_normalizer, minibatch_lls \
+                                        = jitted_e_step(params, minibatch_emissions)
+        
+        # Update running sums
+        lls += minibatch_lls
+        normalizer += minibatch_normalizer
+        
+        # Combine recent statistics. `normalizer` is a vector of shape (batch_dim,)
+        # and constant value `N_minibatch <- minibatch_emissions[...,0].size`,`
+        # So just use scalar value to avoid broadcasting complexity.
+        alpha = (minibatch_normalizer/normalizer)[0]
+        _weighted_mean = lambda running_stat, minibatch_stat: \
+                            (1-alpha) * running_stat + alpha * minibatch_stat
+        
+        normalized_stats = tree_map(
+                _weighted_mean, normalized_stats, minibatch_normalized_stats)
+
+    # Call M-step
+    normalizer = jnp.ones_like(minibatch_normalizer) * normalizer
+    updated_params = m_step(prior_params, normalized_stats, normalizer)
+    
+    return updated_params, (normalized_stats, normalizer), lls
+    
 def fit_em(initial_params, prior_params, batched_emissions, num_epochs=50, verbose=True):
     """Estimate model parameters from emissions using Expectation-Maximization (EM).
     
@@ -234,13 +270,13 @@ def nonparallel_stochastic_em_step(prior_params, params, rolling_stats,
     Arguments:
         prior_params (PriorParameters)
         params (Parameters)
-        rolling_stats (NormalizedGaussianHMMStatistics)
+        rolling_stats (NormalizedStatistics)
         learning_rate (float)
         minibatch_emissions (jnp.ndarray): shape [m,t,d]
     
     Returns:
         updated_params (Parameters)
-        updated_rolling_stats (NormalizedGaussianHMMStatistics)
+        updated_rolling_stats (NormalizedStatistics)
         minibatch_lls (float): Expected log-likelihood of minibatch
     """
     # Returns: Parameters([k,...]), *Stats([k,...]), float
@@ -267,6 +303,7 @@ def nonparallel_stochastic_em_step(prior_params, params, rolling_stats,
 
     return updated_params, updated_rolling_stats, minibatch_lls
 
+@partial(profiler.annotate_function, name="parallel_stochastic_em_step")
 def parallel_stochastic_em_step(prior_params, params, rolling_stats,
                                 learning_rate, minibatch_emissions):
     """Perform single step of stochastic EM using multiple cores.

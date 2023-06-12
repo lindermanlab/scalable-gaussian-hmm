@@ -25,6 +25,7 @@ from ._model import(
 from ._algorithms import (
     e_step,
     m_step,
+    streaming_em_step,
     fit_em,
     nonparallel_stochastic_em_step,
     parallel_stochastic_em_step,
