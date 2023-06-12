@@ -4,12 +4,13 @@ import h5py
 
 import bisect
 import itertools
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 from chex import dataclass
 
 import numpy as onp
-from torch.utils.data import Dataset, ConcatDataset, Sampler
+from torch.utils.data import Dataset, ConcatDataset, Sampler, DataLoader
 
 # Typing
 from chex import Scalar, Array, ArrayTree, PRNGKey, Scalar, Shape
@@ -39,6 +40,7 @@ Slice = TypeVar('Slice') # python slice-like object
 
 __all__ = [
     'filter_min_frames',
+    'create_dataset_and_iterator',
     'SingleSessionDataset',
     'MultiSessionDataset',
     'SubDataset',
@@ -307,3 +309,59 @@ class RandomBatchSampler(Sampler[int]):
 
 #     return [SubDataset(dataset, indices[offset-size:offset])
 #             for offset, size in zip(jnp.cumsum(jnp.asarray(sizes)), sizes)]
+
+def create_dataset_and_iterator(
+        seed,
+        filepaths,
+        em_seq_length,
+        em_local_batch_size,
+        em_parallelize,
+        verbose=True,
+    ):
+    """Create dataset and its dataloader from specified filepaths.
+
+    Arguments
+        seed (jr.PRNGKey)
+        em_seq_length (int): Number of frames in a sequence, for training.
+        em_local_batch_size(int): Number of sequences to load per minibatch, for training.
+        em_parallelize (bool): If True, using parallel algorithm
+        debug_max_files (int): Maximum number of files to use in the dataset.
+            Default: -1, use all files found in data directory.
+        verbose (bool): If True, print status and shape messages.
+    """
+
+    seed_slice, seed_batch = jr.split(seed, 2)
+
+    # ============================
+    # Initialize training dataset
+    # ============================
+    dtype = jnp.array([1.2, 3.4]).dtype
+    train_ds = MultiSessionDataset(filepaths, seed_slice, em_seq_length, dtype=dtype)
+    emissions_dim = train_ds.sequence_shape[-1]
+
+    # Define how to load a batch of emissions gets reshaped
+    num_devices = jax.local_device_count()
+    em_batch_size = em_local_batch_size * num_devices
+    if em_parallelize:
+        assert num_devices > 1, f'Expected >1 device to parallelize, only see {num_devices}. Double-check XLA_FLAGS setting.'
+        # local_batch_size = batch_size // num_devices
+        def collate_fn(sequences):
+            return onp.stack(sequences, axis=0).reshape(num_devices, em_local_batch_size, *sequences[0].shape)
+        
+    else:
+        assert num_devices == 1, f'Expected 1 device, but seeing {num_devices}. Reset XLA_FLAGS setting.'
+        def collate_fn(sequences):
+            return onp.stack(sequences, axis=0)
+
+    # Construct dataloader for EM fitting
+    sampler = RandomBatchSampler(train_ds, em_batch_size, seed_batch)
+    train_dl = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
+
+    if verbose: 
+        print(f'num_devices {num_devices}, local_batch_size {em_local_batch_size}, batch_size {em_batch_size}') 
+        print("Initialized training dataset...")
+        print(f"\t{len(train_ds):3d} sets of {em_seq_length/72000:.1f} hr sequences")
+        print(f"\t{len(train_dl):3d} batches of {em_batch_size} sequences")
+        print()
+
+    return train_ds, train_dl
