@@ -1,7 +1,4 @@
-"""Compare full-batch vs. stochastic EM algorithms for HMM parameter inference.
-Evaluate with respect to
-    - Per epoch run time
-    - Convergence rate
+"""Compare per epoch run time of full-batch vs. stochastic EM algorithms.
 
 The following three algorithms are compared:
     - `streaming_fullbatch_em_step`
@@ -22,21 +19,6 @@ Script is similar to `kf/fit_parallel_stem.py`, but with minor changes:
 from cProfile import Profile
 import pstats
 import io
-
-
-"""Script for fitting HMM to kf data via stochastic EM.
-
-Flags to set in environment
----------------------------
-REQUIRED
-    DATADIR - Folder path to where data folder (specified by `fish_id`) resides
-    TEMPDIR - Folder path to store output and log files
-
-OPTIONAL
-    JAX_ENABLE_X64 - True or False. If True, all computations performed in x64.
-    XLA_FLAGS=--xla_force_host_platform_device_count=[num_devices]
-        - Number of CPUs to make visible to JAX. Set if pmap-ing
-"""
 
 import os
 from pathlib import Path
