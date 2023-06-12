@@ -280,11 +280,9 @@ def main(args):
     ps = pstats.Stats(prof, stream=s).sort_stats('cumtime')
     
     n_batches = len(train_dl) * train_dl.batch_sampler.batch_size
-    session_name = f'{algorithm}-{args.seed_data}_datarng-{n_batches}_batches.prof'
+    session_name = f'{algorithm}-{args.seed_data}_datarng-{n_batches}_batches'
     with open(outdir/f'{session_name}.prof', 'w+') as f:
         f.write(s.getvalue())
-
-    import pdb; pdb.set_trace()
 
 if __name__ == '__main__':
 
