@@ -18,6 +18,10 @@ import snax.checkpoint as chk
 
 import kf.gaussian_hmm as gaussian_hmm
 
+from typing import Any, Callable, Iterable, Optional, TypeVar
+ModelState = TypeVar("ModelState")
+WnbInstance = TypeVar("WnbInstance")
+
 def check_psd(covs):
     """Raise ValueError if covariance matrices are not positive semi-definite."""
     _eigvals = jnp.linalg.eigvals(covs)
@@ -117,7 +121,7 @@ def fit_stochastic_em(initial_params, prior_params,
         print("Warm-starting...", end="")
         ((params, rolling_stats, expected_log_probs, iterator_state), metadata), checkpoint_global_id = out
         global_id = checkpoint_global_id + 1
-        dataloader.batch_sampler_state = iterator_state
+        dataloader.batch_sampler.state = iterator_state
         print(f"Loaded checkpoint at step {checkpoint_global_id} from {checkpoint_dir}.")
     else:
         print("Cold-starting from passed-in parameters.")
@@ -205,3 +209,172 @@ def fit_stochastic_em(initial_params, prior_params,
         tqdm.write("Done.")
 
     return params, jnp.asarray(expected_log_probs)
+
+def stochastic_train(init_fn,
+                     step_fn,
+                     dataloader: Iterable,
+                     schedule: Optional[optax.Schedule]=None, 
+                     n_epochs: int=10,
+                     metadata: dict={},
+                     check_every: int=-1, 
+                     metric_name: str='minibatch lp',
+                     checkpoint_dir: Optional[str]=None,
+                     n_checkpoints_to_keep: int=-1,
+                     wnb: Optional[WnbInstance]=None,
+                     ):
+    """Generic training function, given minibatches of dataload.
+    
+    Parameters
+        check_every
+            Number of (inner/dataloader/sub-epoch) iterations to check metrics.
+            Value between [1, len(dataloader)]. Default: -1 -> len(dataloader),
+            i.e. check once an epoch.
+    
+    """
+
+    n_minibatches = len(dataloader)
+
+    # =========================================================================
+    # Set global training learning rates: shape (n_epochs, n_minibatches)
+    # =========================================================================
+    if schedule is None:
+        schedule = optax.exponential_decay(
+            init_value=1., 
+            end_value=0.,
+            transition_steps=n_minibatches,
+            decay_rate=.95,
+        )
+
+    learning_rates = schedule(jnp.arange(n_epochs * n_minibatches))
+    assert learning_rates[0] == 1.0, "Learning rate must start at 1."
+    learning_rates = learning_rates.reshape(n_epochs, n_minibatches)
+
+    # =========================================================================
+    # Initialize model
+    # =========================================================================
+    # check_every must be a value between [1, n_minibatches]
+    if (check_every <= 0) or (check_every > n_minibatches):
+        check_every = n_minibatches
+
+    # n_checkpoints_to_keep must be a value between [1, n_epochs*n_minibatches+1]
+    n_checkpoints_to_keep = n_checkpoints_to_keep if n_checkpoints_to_keep > 0 \
+                            else n_epochs * n_minibatches + 1
+
+    # Warm-start from latest checkpoint, if applicable
+    do_checkpoint = (check_every is not None) and (checkpoint_dir is not None)
+    out = chk.load_latest_checkpoint(checkpoint_dir) if do_checkpoint else [None]
+    if do_checkpoint and (out[0] is not None):
+        print(f"Warm-starting from {checkpoint_dir}...")
+        (prior_params, params, rolling_stats, expected_lps, iterator_state, *_), _global_itr = out
+        dataloader.batch_sampler.state = iterator_state
+        global_itr = _global_itr + 1
+        print(f"Loaded checkpoint at step {_global_itr}.")
+    
+    # Else, cold-start from passed-in model
+    else:
+        print("Cold-starting from passed-in model.")
+        prior_params, params, rolling_stats, expected_lps, iterator_state = init_fn()
+        metadata.update({'schedule': schedule})
+        global_itr = 0
+
+        if do_checkpoint:
+            print(f'Saving checkpoints to {checkpoint_dir}')
+
+    # =========================================================================
+    # Train
+    # =========================================================================
+    epoch = global_itr // n_minibatches
+    minibatch = global_itr % n_minibatches
+    
+    while epoch < n_epochs:
+        # Current iteration `lp`
+        lp = (expected_lps[-1][-1]
+              if ((len(expected_lps) > 1) and (len(expected_lps[-1]) > 1))
+              else -jnp.inf
+        )
+        
+        # Per `check_every`
+        these_lps = []
+
+        # Set up progress bar
+        pbar = tqdm(desc=f'epoch {epoch+1}/{n_epochs}', # Use 1-index
+                    total=n_minibatches,
+                    initial=minibatch,
+                    postfix={metric_name: lp})
+
+        if minibatch == 0:
+            expected_lps.append([])
+
+        for minibatch_emissions in dataloader:
+            params, rolling_stats, minibatch_lls = step_fn(
+                prior_params, params, rolling_stats,
+                learning_rates[epoch][minibatch], minibatch_emissions)
+
+            # Store expected log probability, averaged across total number of emissions
+            lp = gaussian_hmm.log_prior(params, prior_params) + n_minibatches * minibatch_lls
+            lp /= dataloader.dataset.num_samples
+            these_lps.append(lp)
+            # expected_lps[epoch].append(lp)
+
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix({metric_name: lp})
+            
+            # ------------------------------------------------------------------
+            # If checkpoint, save results and locally and/or to WandB
+            # ------------------------------------------------------------------
+            # Save results, if checkpointing
+            if (global_itr % check_every == 0) and (global_itr != 0):
+                expected_lps[epoch].extend(these_lps)
+
+                if do_checkpoint:
+                    # tqdm.write(f"{epoch}:{minibatch}/{n_minibatches}: Saving checkpoint to {checkpoint_dir}...", end="")
+                    chk.save_checkpoint(
+                        (prior_params, params, rolling_stats, expected_lps, dataloader.batch_sampler.state, metadata),
+                        global_itr,
+                        checkpoint_dir,
+                        n_checkpoints_to_keep)
+                    # tqdm.write("Done.")
+                
+                # If using WandB, save all training lps values
+                if wnb is not None:
+                    for i in range(check_every):
+                        wnb.log({metric_name: these_lps[i]}, step=global_itr + i, commit=False)
+                        
+                    # Push logs all at once
+                    wnb.log({}, commit=True)
+
+                these_lps = []
+
+            # ------------------------------------------------------------------
+            # Check parameters
+            # ------------------------------------------------------------------
+            # M-step emission covariance is PSD
+            check_psd(params.emission_covariances)
+            
+            # No NaNs in parameters
+            if any(tree_leaves(tree_map(lambda arr: jnp.any(jnp.isnan(arr)), (params, rolling_stats, minibatch_lls)))):
+                raise ValueError(f'Epoch {epoch}, minibatch {minibatch}: NaN detected in parameters.')
+            
+            # ------------------------------------------------------------------
+            # Update global counter and continue
+            # ------------------------------------------------------------------
+            global_itr += 1
+            minibatch = global_itr % n_minibatches
+        
+        # ------------------------------------------------------------------
+        # Update epoch counter
+        # ------------------------------------------------------------------
+        epoch = global_itr // n_minibatches
+
+    # Save latest parameters
+    if chk.step_from_path(chk.get_latest_checkpoint_path(checkpoint_dir)) < global_itr-1:
+        tqdm.write(f"{epoch}:{minibatch}/{len(dataloader)}: Saving last iteration!...", end="")
+        chk.save_checkpoint(
+            (params, rolling_stats, dataloader.batch_sampler.state, expected_lps, metadata),
+            global_itr-1,
+            checkpoint_dir,
+            n_checkpoints_to_keep)
+        tqdm.write("Done.")
+
+    return params, expected_lps
