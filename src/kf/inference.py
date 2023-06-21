@@ -165,7 +165,17 @@ def fit_stochastic_em(initial_params, prior_params,
             # Store expected log probability, averaged across total number of emissions
             expected_lp = gaussian_hmm.log_prior(params, prior_params) + num_batches * minibatch_lls
             expected_lp /= dataloader.dataset.num_samples
-            expected_log_probs[epoch].append(expected_lp)
+
+            # TODO Remove this try-except block after identifying issue.
+            # This should techcnially be caught in L157-158, but unclear why not.
+            try:
+                expected_log_probs[epoch].append(expected_lp)
+            except IndexError:
+                print(f'global_id={global_id}: (epoch: {epoch}, minibatch={minibatch}/{num_batches}):')
+                print('\tWARNING: Caught `IndexError: list index out of range`. Adding empty list rows.')
+                while len(expected_log_probs) <= epoch:
+                    expected_log_probs.append([])
+                expected_log_probs[epoch].append(expected_lp)
 
             # Update progress bar
             pbar.update(1)
@@ -204,4 +214,10 @@ def fit_stochastic_em(initial_params, prior_params,
             num_checkpoints_to_keep)
         tqdm.write("Done.")
 
-    return params, jnp.asarray(expected_log_probs)
+    try:
+        expected_log_probs = jnp.asarray(expected_log_probs)
+    except:
+        print('WARNING: Could not convert list of lists `expected_log_probs` to an ndarray. May be due to previous IndexErrors.')
+        print('Returning possibly ragged list of lists.')
+        
+    return params, expected_log_probs
