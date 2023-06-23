@@ -211,7 +211,7 @@ def main(args):
     seed = jr.PRNGKey(args.seed)
 
     seed_data, seed_init, seed_redundant = jr.split(seed, 3)
-    if args.keep_redundant_states:
+    if args.dont_check_state_collapse:
         seed_redundant = None
 
     print(f"Setting user-specified seed: {args.seed}")
@@ -361,7 +361,7 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
-        '--keep_redundant_states', action='store_true',
+        '--dont_check_state_collapse', action='store_true',
         help='If specified, does not check if EM states collapse and force unique states.'
     )
 
