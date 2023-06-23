@@ -8,6 +8,7 @@ dataset.
 """
 
 import jax.numpy as jnp
+import jax.random as jr
 from jax import jit, vmap, lax, pmap
 from jax.tree_util import tree_map, tree_flatten, tree_leaves
 from functools import partial
@@ -17,6 +18,7 @@ from tqdm.auto import trange, tqdm
 import snax.checkpoint as chk
 
 import kf.gaussian_hmm as gaussian_hmm
+from kf.utils import pdist_symmetric_kl, get_redundant_states, quick_kmeans_plusplus
 
 def check_psd(covs):
     """Raise ValueError if covariance matrices are not positive semi-definite."""
@@ -28,10 +30,31 @@ def check_psd(covs):
             print(f'Eigenvalue {_v:.2e} at index {_i}')
         raise ValueError('`params.emission_covariances` is not PSD. Considering increasing emission_scale and emission_extra_df prior parameters')
 
-def fit_stochastic_em(initial_params, prior_params,
-                      dataloader,
+def randomize_redundant_states(seed, params, data, atol=1):
+    """Find redundant states and replace means using k-means++ algorithm."""
+
+    n_states, n_dims = params.emission_means.shape
+
+    # Find states whose Gaussian emission parameters are too close
+    kl_dists = pdist_symmetric_kl(params.emission_means, params.emission_covs)
+    i_redundant = get_redundant_states(kl_dists, atol=atol)
+
+    # Choose new centroids from data and update parameters
+    mask_unique = jnp.ones((n_states,), dtype=bool).at[i_redundant].set(False)
+    unique_means = params.emission_means[mask_unique]
+    random_centroids = quick_kmeans_plusplus(seed, len(i_redundant), unique_means, data)
+    params.emission_means = params.emission_means.at[i_redundant].set(random_centroids)
+
+    # Reset covariance and transition parameters
+    params.emission_covariances = params.emission_covariances.at[i_redundant].set(jnp.eye(n_dims))
+    params.transition_probs = params.transition_probs.at[i_redundant].set(jnp.ones(n_states)/n_states)
+
+    return params, i_redundant
+
+def fit_stochastic_em(initial_params, prior_params, dataloader,
                       schedule=None, num_epochs=5, parallelize=False,
-                      checkpoint_every=None, checkpoint_dir=None, num_checkpoints_to_keep=10):
+                      checkpoint_every=None, checkpoint_dir=None, num_checkpoints_to_keep=10,
+                      seed=None):
     """Estimate model parameters from emissions using stochastic Expectation-Maximization (StEM).
 
     Let the original dataset consists of N independent sequences of length T.
@@ -198,6 +221,11 @@ def fit_stochastic_em(initial_params, prior_params,
             if any(tree_leaves(tree_map(lambda arr: jnp.any(jnp.isnan(arr)), (params, rolling_stats, minibatch_lls)))):
                 raise ValueError(f'Epoch {epoch}, minibatch {minibatch}: NaN detected in parameters.')
             
+            # Check that there are no redundant states
+            if seed is not None:
+                params, i_redundant = randomize_redundant_states(jr.foldin(seed, global_id), params, minibatch_emissions)
+                tqdm.write(f"Found {len(i_redundant)} redundant states: {i_redundant}.\nResetting...")
+
             # Update counter
             global_id += 1
             minibatch = global_id % num_batches

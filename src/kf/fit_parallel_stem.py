@@ -209,7 +209,11 @@ def main(args):
     
     # Set user-specified seed
     seed = jr.PRNGKey(args.seed)
-    seed_data, seed_init = jr.split(seed, 2)
+
+    seed_data, seed_init, seed_redundant = jr.split(seed, 3)
+    if args.keep_redundant_states:
+        seed_redundant = None
+
     print(f"Setting user-specified seed: {args.seed}")
 
     # Algorithm parameters
@@ -295,6 +299,7 @@ def main(args):
         'checkpoint_dir': checkpoint_dir,
         'num_checkpoints_to_keep': num_checkpoints_to_keep,
         'schedule': schedule,
+        'seed': seed_redundant,
     }
     fitted_params, lps = fit_stochastic_em(init_params, prior_params, train_dl, **fn_kwargs)
     
@@ -353,6 +358,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--checkpoints_to_keep', type=int, default=0,
         help='Number of checkpoints to keep. If 0, keep all.'
+    )
+
+    parser.add_argument(
+        '--keep_redundant_states', action='store_true',
+        help='If specified, does not check if EM states collapse and force unique states.'
     )
 
     parser.add_argument(
