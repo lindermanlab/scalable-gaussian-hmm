@@ -39,15 +39,16 @@ def randomize_redundant_states(seed, params, data, atol=1):
     kl_dists = pdist_symmetric_kl(params.emission_means, params.emission_covs)
     i_redundant = get_redundant_states(kl_dists, atol=atol)
 
-    # Choose new centroids from data and update parameters
-    mask_unique = jnp.ones((n_states,), dtype=bool).at[i_redundant].set(False)
-    unique_means = params.emission_means[mask_unique]
-    random_centroids = quick_kmeans_plusplus(seed, len(i_redundant), unique_means, data)
-    params.emission_means = params.emission_means.at[i_redundant].set(random_centroids)
+    if len(i_redundant) > 0:
+        # Choose new centroids from data and update parameters
+        mask_unique = jnp.ones((n_states,), dtype=bool).at[i_redundant].set(False)
+        unique_means = params.emission_means[mask_unique]
+        random_centroids = quick_kmeans_plusplus(seed, len(i_redundant), unique_means, data)
+        params.emission_means = params.emission_means.at[i_redundant].set(random_centroids)
 
-    # Reset covariance and transition parameters
-    params.emission_covariances = params.emission_covariances.at[i_redundant].set(jnp.eye(n_dims))
-    params.transition_probs = params.transition_probs.at[i_redundant].set(jnp.ones(n_states)/n_states)
+        # Reset covariance and transition parameters
+        params.emission_covariances = params.emission_covariances.at[i_redundant].set(jnp.eye(n_dims))
+        params.transition_probs = params.transition_probs.at[i_redundant].set(jnp.ones(n_states)/n_states)
 
     return params, i_redundant
 
